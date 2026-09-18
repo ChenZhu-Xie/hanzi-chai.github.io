@@ -5,6 +5,7 @@ import { listCharacters, listGlyphs } from "~/api";
 import { 可编辑字形列表原子, 可编辑字符列表原子 } from "~/atoms";
 import CharacterTable from "~/components/CharacterTable";
 import GlyphTable from "~/components/GlyphTable";
+import UnihanSourceRecommendation from "~/components/UnihanSourceRecommendation";
 import { EditorColumn, EditorRow } from "~/components/Utils";
 import { useChaifenTitle } from "~/utils";
 
@@ -24,8 +25,9 @@ export default function AdminLayout() {
 
   return (
     <Layout className="h-screen">
-      <Layout.Content className="h-full overflow-y-auto">
-        <EditorRow>
+      <Layout.Content className="h-full overflow-hidden flex flex-col">
+        <UnihanSourceRecommendation />
+        <EditorRow className="min-h-0 flex-1">
           <EditorColumn span={10}>
             <CharacterTable />
           </EditorColumn>

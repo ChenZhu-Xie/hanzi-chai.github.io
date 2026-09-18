@@ -28,6 +28,9 @@ const { get, post, put, del } = createClient(() => {
 
 export const listCharacters = () => get<字符数据[]>("/characters");
 
+export const getCharacter = (unicode: number) =>
+  get<字符数据>(`/characters/${unicode}`);
+
 export const remoteCreateWithoutUnicode = (payload: 字符数据) =>
   post<number>("/characters", payload);
 
