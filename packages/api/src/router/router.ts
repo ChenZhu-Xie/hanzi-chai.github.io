@@ -3,6 +3,7 @@ import { Login } from "../controller/users";
 import { routerCharacters } from "./characters";
 import { routerEquivalence } from "./equivalence";
 import { routerGlyphs } from "./glyphs";
+import { routerGlyphRelations } from "./glyph-relations";
 import { routerRepertoire } from "./repertoire";
 import { routerUsers } from "./users";
 
@@ -18,5 +19,6 @@ export const routerApi = Router()
   .all("/characters/*", routerCharacters.fetch)
   // 字形子路由
   .all("/glyphs/*", routerGlyphs.fetch)
+  .all("/glyph-relations/*", routerGlyphRelations.fetch)
   // 当量子路由
   .all("/equivalence/*", routerEquivalence.fetch);

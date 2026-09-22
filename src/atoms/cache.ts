@@ -9,6 +9,7 @@ import {
   type 原始词典,
   合并拼写运算,
   type 基本字形数据,
+  type 字形关系数据,
   字库,
   type 字形,
   字形库,
@@ -78,7 +79,9 @@ import { 位置原子, 配置原子 } from "./config";
 
 export const 远程原子 = atom((get) => {
   const location = get(位置原子);
-  return ["admin", "algorithm"].some(x => location.pathname === `/${x}` || location.hash === `#/${x}`);
+  return ["admin", "algorithm"].some(
+    (x) => location.pathname === `/${x}` || location.hash === `#/${x}`,
+  );
 });
 
 export const 字符列表原子 = atom((): 字符数据[] => get预加载数据().字符列表);
@@ -90,6 +93,8 @@ export const 字形列表原子 = atom(
 export const 可编辑字符列表原子 = atom([] as 字符数据[]);
 
 export const 可编辑字形列表原子 = atom([] as 基本字形数据[]);
+
+export const 字形关系列表原子 = atom([] as 字形关系数据[]);
 
 export const 默认原始词典原子 = atom((): 原始词典 => get预加载数据().原始词典);
 
@@ -153,6 +158,11 @@ export const 统一字形列表原子 = atom((get) => {
   if (!远程) return get(字形列表原子);
   const 可编辑字形列表 = get(可编辑字形列表原子);
   return 可编辑字形列表;
+});
+
+export const 统一字符列表原子 = atom((get) => {
+  const 远程 = get(远程原子);
+  return 远程 ? get(可编辑字符列表原子) : get(字符列表原子);
 });
 
 export const 字形库原子 = atom((get) => {

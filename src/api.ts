@@ -1,4 +1,4 @@
-import type { 字符数据, 基本字形数据 } from "hanzi-chai";
+import type { 字形关系数据, 字符数据, 基本字形数据 } from "hanzi-chai";
 import { createClient } from "@chai-api/client";
 import { EquivalenceData } from "./equivalence";
 export { endpoint, type 后端错误 } from "@chai-api/client";
@@ -58,6 +58,15 @@ export const replaceGlyph = (payload: { oldId: number; newId: number }) =>
   put<boolean>("/glyphs", payload);
 
 export const removeGlyph = (id: number) => del<boolean>(`/glyphs/${id}`);
+
+export const listGlyphRelations = () =>
+  get<字形关系数据[]>("/glyph-relations");
+
+export const createGlyphRelation = (payload: 字形关系数据) =>
+  post<字形关系数据>("/glyph-relations", payload);
+
+export const removeGlyphRelation = (id: number) =>
+  del<boolean>(`/glyph-relations/${id}`);
 
 export const listEquivalence = () => get<EquivalenceData[]>("/equivalence");
 
