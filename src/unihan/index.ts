@@ -51,6 +51,7 @@ export interface RecommendationEvidence {
   replacementId?: number;
   count: number;
   reliable: boolean;
+  reviewed?: boolean;
   alternatives: { id: number; count: number; examples: number[] }[];
   /** Nested evidence used to resolve this top-level reference recursively. */
   basis?: RecommendationEvidence[];
@@ -481,6 +482,7 @@ function makeRecommendationEvidence(
   replacements: EvidenceExamples | undefined,
   minimumEvidence: number,
   minimumDominance: number,
+  reviewedDecision?: ReviewedSourceDecision,
 ): RecommendationEvidence {
   const alternatives = [...(replacements ?? [])]
     .map(([id, examples]) => ({
@@ -489,6 +491,29 @@ function makeRecommendationEvidence(
       examples: [...examples].sort((a, b) => a - b),
     }))
     .sort((a, b) => b.count - a.count || a.id - b.id);
+  if (
+    reviewedDecision &&
+    !alternatives.some(({ id }) => id === reviewedDecision.replacementId)
+  ) {
+    alternatives.push({
+      id: reviewedDecision.replacementId,
+      count: 1,
+      examples: [reviewedDecision.unicode],
+    });
+  }
+  if (reviewedDecision) {
+    const reviewedAlternative = alternatives.find(
+      ({ id }) => id === reviewedDecision.replacementId,
+    )!;
+    return {
+      referenceId,
+      replacementId: reviewedDecision.replacementId,
+      count: reviewedAlternative.count,
+      reliable: true,
+      reviewed: true,
+      alternatives,
+    };
+  }
   const winner = alternatives[0];
   const runnerUp = alternatives[1];
   const reliable =
@@ -512,6 +537,7 @@ function resolveReferenceRecursively(
   evidenceIndex: SourceEvidenceIndex,
   minimumEvidence: number,
   minimumDominance: number,
+  reviewedDecisions: ReadonlyMap<number, ReviewedSourceDecision>,
   depth = 0,
   seen = new Set<number>(),
 ): { id: number; evidence: RecommendationEvidence } | undefined {
@@ -522,6 +548,7 @@ function resolveReferenceRecursively(
     evidenceIndex.get(source)?.get(referenceId),
     minimumEvidence,
     minimumDominance,
+    reviewedDecisions.get(referenceId),
   );
   if (
     direct.reliable &&
@@ -540,6 +567,7 @@ function resolveReferenceRecursively(
       evidenceIndex,
       minimumEvidence,
       minimumDominance,
+      reviewedDecisions,
       depth + 1,
       nextSeen,
     ),
@@ -577,6 +605,9 @@ function resolveReferenceRecursively(
       replacementId: existingId,
       count: reliableCounts.length > 0 ? Math.min(...reliableCounts) : 0,
       reliable: true,
+      reviewed: basis.some(
+        (item) => item.reviewed || item.basis?.some((child) => child.reviewed),
+      ),
       alternatives: [
         {
           id: existingId,
@@ -598,6 +629,7 @@ export function recommendMissingSources(
   minimumDominance = DEFAULT_MINIMUM_DOMINANCE,
   existingGlyphIndex?: GlyphIndex,
   glyphEvidenceIndex = buildGlyphEvidenceIndex([character], glyphs),
+  reviewedDecisions: ReviewedSourceDecision[] = [],
 ): {
   proposals: UnihanGlyphProposal[];
   unresolvedSources: string[];
@@ -616,14 +648,26 @@ export function recommendMissingSources(
   const proposals: UnihanGlyphProposal[] = [];
   const unresolvedSources: string[] = [];
   const unresolved: UnihanUnresolvedSource[] = [];
+  const reviewedBySource = new Map<
+    string,
+    Map<number, ReviewedSourceDecision>
+  >();
+  for (const decision of reviewedDecisions) {
+    if (decision.unicode !== character.unicode) continue;
+    const byReference = reviewedBySource.get(decision.source) ?? new Map();
+    byReference.set(decision.referenceId, decision);
+    reviewedBySource.set(decision.source, byReference);
+  }
 
   for (const source of missingSources) {
+    const sourceReviews = reviewedBySource.get(source) ?? new Map();
     if (referenceGlyph.type === "component") {
       const evidence = makeRecommendationEvidence(
         referenceGlyph.id,
         glyphEvidenceIndex.get(source)?.get(referenceGlyph.id),
         minimumEvidence,
         minimumDominance,
+        sourceReviews.get(referenceGlyph.id),
       );
       const winner = evidence.replacementId
         ? glyphIndex.byId.get(evidence.replacementId)
@@ -653,6 +697,7 @@ export function recommendMissingSources(
         sourceIndex?.get(reference.id),
         minimumEvidence,
         minimumDominance,
+        sourceReviews.get(reference.id),
       );
       const recursive = componentEvidence.reliable
         ? undefined
@@ -663,6 +708,7 @@ export function recommendMissingSources(
             evidenceIndex,
             minimumEvidence,
             minimumDominance,
+            sourceReviews,
           );
       if (recursive) {
         evidence.push(recursive.evidence);
@@ -873,6 +919,7 @@ export function auditUnihanSources(
         minimumDominance,
         glyphIndex,
         glyphEvidenceIndex,
+        options.reviewedDecisions ?? [],
       );
       proposals = recommendation.proposals;
       unresolved = recommendation.unresolved;
@@ -891,7 +938,7 @@ export function auditUnihanSources(
           missingSources.length > 0
         ) {
           status = "safe-candidate";
-          reason = `每个目标来源的完整拆分都可由已完成区间推导：每个候选至少有 ${minimumEvidence} 个独立字符证据，且第一名至少是第二名的 ${minimumDominance} 倍。`;
+          reason = `每个目标来源的完整拆分都可由已完成区间或当前字符的维护者确认推导；统计项至少有 ${minimumEvidence} 个独立字符证据，且第一名至少是第二名的 ${minimumDominance} 倍。`;
         } else {
           status = "already-complete";
           reason =

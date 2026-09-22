@@ -315,6 +315,69 @@ describe("recommendation safety", () => {
     );
   });
 
+  test("keeps source-specific reviewed identity and sibling decisions separate", () => {
+    const sourceSpecific = augmentSourceEvidenceWithReviews(
+      new Map(),
+      [
+        { unicode: 0x7ca6, source: "H", referenceId: 10, replacementId: 10 },
+        { unicode: 0x7ca6, source: "J", referenceId: 10, replacementId: 11 },
+      ],
+      [
+        ...glyphs,
+        {
+          id: 10,
+          type: "compound",
+          operator: "⿰",
+          references: [{ id: 1 }, { id: 2 }],
+          ambiguous: false,
+        },
+        {
+          id: 11,
+          type: "compound",
+          operator: "⿰",
+          references: [{ id: 1 }, { id: 3 }],
+          ambiguous: false,
+        },
+      ],
+    );
+    expect(sourceSpecific.get("H")?.get(10)?.get(10)).toEqual(
+      new Set([0x7ca6]),
+    );
+    expect(sourceSpecific.get("J")?.get(10)?.get(11)).toEqual(
+      new Set([0x7ca6]),
+    );
+    expect(sourceSpecific.get("H")?.get(2)?.get(3)).toBeUndefined();
+    expect(sourceSpecific.get("J")?.get(2)?.get(3)).toEqual(
+      new Set([0x7ca6]),
+    );
+
+    const exactCharacterDecision = recommendMissingSources(
+      { unicode: 0x6404, glyphs: [{ id: 1, sources: ["G", "H"] }] },
+      ["H"],
+      glyphs,
+      new Map(),
+      3,
+      2,
+      undefined,
+      undefined,
+      [
+        {
+          unicode: 0x6404,
+          source: "H",
+          referenceId: 1,
+          replacementId: 2,
+        },
+      ],
+    );
+    expect(exactCharacterDecision.unresolvedSources).toEqual([]);
+    expect(exactCharacterDecision.proposals[0]).toMatchObject({
+      source: "H",
+      existingGlyphId: 2,
+      requiresChange: true,
+      evidence: [{ reviewed: true, count: 1, reliable: true }],
+    });
+  });
+
   test("uses reviewed same-glyph source assignments as identity evidence", () => {
     const reviewedIdentitySamples: 字符数据[] = [0x4e30, 0x4e31, 0x4e32].map(
       (unicode) => ({
