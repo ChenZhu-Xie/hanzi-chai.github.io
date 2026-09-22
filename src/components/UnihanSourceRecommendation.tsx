@@ -508,7 +508,8 @@ export default function UnihanSourceRecommendation() {
                         </Typography.Text>
                         {entry.reliable && entry.replacementId !== undefined ? (
                           <Typography.Text>
-                            {formatGlyphTree(entry.replacementId)}（统计已定）
+                            {formatGlyphTree(entry.replacementId)}（
+                            {entry.reviewed ? "人工已确认" : "统计已定"}）
                           </Typography.Text>
                         ) : entry.alternatives.length > 0 ? (
                           <Select

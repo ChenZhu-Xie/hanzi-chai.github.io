@@ -7,6 +7,23 @@ import type { ReviewedSourceDecision } from "./index";
  * compatible parent without declaring an entire IRG source globally equal.
  */
 export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
+  // U+7CA6 粦: G/H/T/KP(N) keep 4161 (leaf 255); J/K use 126982 (leaf 438).
+  { unicode: 0x7ca6, source: "H", referenceId: 4161, replacementId: 4161 },
+  { unicode: 0x7ca6, source: "T", referenceId: 4161, replacementId: 4161 },
+  {
+    unicode: 0x7ca6,
+    source: "J",
+    referenceId: 4161,
+    replacementId: 126982,
+  },
+  {
+    unicode: 0x7ca6,
+    source: "K",
+    referenceId: 4161,
+    replacementId: 126982,
+  },
+  { unicode: 0x7ca6, source: "N", referenceId: 4161, replacementId: 4161 },
+
   // U+65B4 斴: G/T use 4726 (ultimately leaf 255); J/K use 127075 (leaf 438).
   { unicode: 0x65b4, source: "T", referenceId: 4726, replacementId: 4726 },
   {
