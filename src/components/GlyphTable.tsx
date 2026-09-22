@@ -1,7 +1,24 @@
-import { Button, Checkbox, Flex, Popconfirm, Space, Tooltip } from "antd";
+import {
+  Button,
+  Checkbox,
+  Flex,
+  InputNumber,
+  notification,
+  Popconfirm,
+  Space,
+  Tag,
+  Tooltip,
+} from "antd";
 import type { ColumnsType } from "antd/es/table";
 import Table from "antd/es/table";
-import type { 基本字形数据, 基本部件数据, 复合体数据, 字形 } from "hanzi-chai";
+import type {
+  基本字形数据,
+  基本部件数据,
+  复合体数据,
+  字形,
+  字形关系数据,
+  字符,
+} from "hanzi-chai";
 import {
   isVectorStroke,
   复合体,
@@ -11,17 +28,28 @@ import {
 } from "hanzi-chai";
 import { useAtom, useAtomValue } from "jotai";
 import { type ReactElement, useMemo, useState } from "react";
-import { createGlyph, removeGlyph, replaceGlyph, updateGlyph } from "~/api";
+import {
+  createGlyph,
+  createGlyphRelation,
+  listGlyphRelations,
+  removeGlyph,
+  removeGlyphRelation,
+  replaceGlyph,
+  updateGlyph,
+} from "~/api";
 import {
   下一个用户字形ID原子,
-  可编辑字形列表原子,
   可编辑字符列表原子,
+  可编辑字形列表原子,
+  字形关系列表原子,
   字库原子,
   字形字符映射原子,
   用户字形列表原子,
+  统一字符列表原子,
   统一字形列表原子,
   远程原子,
 } from "~/atoms";
+import { buildReviewedGlyphSiblingIndex } from "~/unihan";
 import { errorFeedback, 字符字形过滤器, type 过滤器参数 } from "~/utils";
 import BorderItem from "./BorderItem";
 import CharacterGlyphSwitcher from "./CharacterGlyphSwitcher";
@@ -84,6 +112,154 @@ const CreateGlyph = ({ type }: { type: "component" | "compound" }) => {
         return true;
       }}
     />
+  );
+};
+
+const ConfirmSibling = ({ id }: { id: number }) => {
+  const [relations, setRelations] = useAtom(字形关系列表原子);
+  const [siblingId, setSiblingId] = useState<number>();
+  const glyphs = useAtomValue(统一字形列表原子);
+  const sibling = glyphs.find((glyph) => glyph.id === siblingId);
+  return (
+    <Popconfirm
+      title={`确认字形 ${id} 的兄弟部件`}
+      description={
+        <Flex vertical gap={4}>
+          <InputNumber
+            value={siblingId}
+            onChange={(value) => setSiblingId(value ?? undefined)}
+            placeholder="输入字形 ID"
+            min={0}
+            precision={0}
+            style={{ width: 180 }}
+          />
+          {siblingId !== undefined && (
+            <span>
+              {sibling
+                ? `已找到${sibling.type === "component" ? "部件" : "复合体"}`
+                : "未找到该字形"}{" "}
+              {siblingId}
+            </span>
+          )}
+        </Flex>
+      }
+      okButtonProps={{
+        disabled: siblingId === undefined || siblingId === id || !sibling,
+      }}
+      onCancel={() => setSiblingId(undefined)}
+      onConfirm={async () => {
+        if (siblingId === undefined || siblingId === id) return;
+        const relation: 字形关系数据 = {
+          leftId: Math.min(id, siblingId),
+          rightId: Math.max(id, siblingId),
+          kind: "visual-sibling",
+          status: "confirmed",
+          provenance: "manual",
+          sources: [],
+          evidence: [],
+        };
+        const response = await createGlyphRelation(relation);
+        if ("err" in response) {
+          notification.error({
+            message: `保存兄弟关系失败 ${response.err}`,
+            description: response.msg,
+          });
+          return;
+        }
+        setRelations([
+          ...relations.filter(
+            (item) =>
+              !(
+                item.leftId === response.leftId &&
+                item.rightId === response.rightId &&
+                item.kind === response.kind
+              ),
+          ),
+          response,
+        ]);
+        setSiblingId(undefined);
+        notification.success({ message: "兄弟部件关系已确认" });
+      }}
+    >
+      <Button size="small">确认兄弟</Button>
+    </Popconfirm>
+  );
+};
+
+const LoadGlyphRelations = () => {
+  const [relations, setRelations] = useAtom(字形关系列表原子);
+  const [loading, setLoading] = useState(false);
+  return (
+    <Button
+      loading={loading}
+      onClick={async () => {
+        setLoading(true);
+        const response = await listGlyphRelations();
+        setLoading(false);
+        if ("err" in response) {
+          notification.error({
+            message: `载入兄弟关系失败 ${response.err}`,
+            description: "请先部署本次 API migration 与后端路由。",
+          });
+          return;
+        }
+        setRelations(response);
+        notification.success({
+          message: `已载入 ${response.length} 条人工字形关系`,
+        });
+      }}
+    >
+      载入人工兄弟（{relations.length}）
+    </Button>
+  );
+};
+
+const RemoveGlyphRelation = ({ relation }: { relation: 字形关系数据 }) => {
+  const [relations, setRelations] = useAtom(字形关系列表原子);
+  if (relation.id === undefined) return null;
+  return (
+    <Popconfirm
+      title="删除这条人工兄弟关系？"
+      onConfirm={async () => {
+        const response = await removeGlyphRelation(relation.id!);
+        if (typeof response !== "boolean") {
+          notification.error({
+            message: `删除兄弟关系失败 ${response.err}`,
+            description: response.msg,
+          });
+          return;
+        }
+        setRelations(relations.filter((item) => item.id !== relation.id));
+        notification.success({ message: "兄弟关系已删除" });
+      }}
+    >
+      <Button danger size="small" aria-label="删除兄弟关系">
+        ×
+      </Button>
+    </Popconfirm>
+  );
+};
+
+const CharacterUsagePreview = ({ characters }: { characters: 字符[] }) => {
+  const visible = characters.slice(0, 12);
+  const remaining = characters.length - visible.length;
+  return (
+    <Flex wrap gap={2} className="min-w-32 max-w-56">
+      {visible.map((character) => (
+        <Tooltip key={character.toNumber()} title={character.十六进制()}>
+          <BorderItem
+            onClick={() => navigator.clipboard.writeText(character.获取名称())}
+          >
+            <CharacterDisplay character={character} />
+          </BorderItem>
+        </Tooltip>
+      ))}
+      {remaining > 0 && (
+        <Tooltip title={`另有 ${remaining} 个字符；用字形 ID 筛选后可逐项查看`}>
+          <Tag>+{remaining}</Tag>
+        </Tooltip>
+      )}
+    </Flex>
   );
 };
 
@@ -206,6 +382,53 @@ export default function GlyphTable() {
   const [filter, setFilter] = useState<过滤器参数>({});
   const 字形字符映射 = useAtomValue(字形字符映射原子);
   const 远程 = useAtomValue(远程原子);
+  const 统一字符列表 = useAtomValue(统一字符列表原子);
+  const 字形关系列表 = useAtomValue(字形关系列表原子);
+
+  const 兄弟字形映射 = useMemo(
+    () => buildReviewedGlyphSiblingIndex(统一字符列表, 统一字形列表),
+    [统一字符列表, 统一字形列表],
+  );
+
+  const 持久兄弟字形映射 = useMemo(() => {
+    const result = new Map<number, 字形关系数据[]>();
+    for (const relation of 字形关系列表) {
+      if (relation.status === "rejected") continue;
+      const left = result.get(relation.leftId) ?? [];
+      left.push(relation);
+      result.set(relation.leftId, left);
+      const right = result.get(relation.rightId) ?? [];
+      right.push(relation);
+      result.set(relation.rightId, right);
+    }
+    return result;
+  }, [字形关系列表]);
+
+  const 递归字形字符映射 = useMemo(() => {
+    const 字形数据映射 = new Map(
+      统一字形列表.map((glyph) => [glyph.id, glyph]),
+    );
+    const result = new Map<number, Set<字符>>();
+    for (const [rootId, characters] of 字形字符映射) {
+      const visited = new Set<number>();
+      const stack = [rootId];
+      while (stack.length > 0) {
+        const id = stack.pop()!;
+        if (visited.has(id)) continue;
+        visited.add(id);
+        if (id !== rootId) {
+          const current = result.get(id) ?? new Set<字符>();
+          for (const character of characters) current.add(character);
+          result.set(id, current);
+        }
+        const glyph = 字形数据映射.get(id);
+        if (glyph?.type === "compound") {
+          for (const reference of glyph.references) stack.push(reference.id);
+        }
+      }
+    }
+    return result;
+  }, [统一字形列表, 字形字符映射]);
 
   const gf0014set = new Set(
     Array(514)
@@ -340,20 +563,93 @@ export default function GlyphTable() {
       title: "涉及到字符",
       render: (_, record) => {
         const 字符列表 = 字形字符映射.get(record.id) ?? new Set();
+        return <CharacterUsagePreview characters={Array.from(字符列表)} />;
+      },
+      width: 240,
+    },
+    {
+      title: "递归涉及字符",
+      render: (_, record) => {
+        const 字符列表 = 递归字形字符映射.get(record.id) ?? new Set<字符>();
+        return <CharacterUsagePreview characters={Array.from(字符列表)} />;
+      },
+      width: 240,
+    },
+    {
+      title: "兄弟字形/部件",
+      render: (_, record) => {
+        const derived = 兄弟字形映射.get(record.id) ?? [];
+        const persisted = 持久兄弟字形映射.get(record.id) ?? [];
+        const persistedIds = new Set(
+          persisted.map((relation) =>
+            relation.leftId === record.id ? relation.rightId : relation.leftId,
+          ),
+        );
         return (
-          <span>
-            {Array.from(字符列表).map((x) => (
-              <Tooltip key={x.toNumber()} title={x.十六进制()}>
-                <BorderItem
-                  onClick={() => navigator.clipboard.writeText(x.获取名称())}
-                >
-                  <CharacterDisplay character={x} />
-                </BorderItem>
-              </Tooltip>
-            ))}
-          </span>
+          <Flex vertical gap={4}>
+            <Flex wrap gap={4}>
+              {persisted.map((relation) => {
+                const siblingId =
+                  relation.leftId === record.id
+                    ? relation.rightId
+                    : relation.leftId;
+                const glyph = 字库.获取字形(siblingId);
+                if (!glyph) return null;
+                return (
+                  <Tooltip
+                    key={`saved:${relation.kind}:${siblingId}`}
+                    title={`${relation.status === "confirmed" ? "已确认" : "候选"}；${relation.provenance}`}
+                  >
+                    <BorderItem>
+                      <Flex className="items-center gap-1">
+                        <GlyphView glyph={glyph.图形盒子} />
+                        {siblingId}
+                        <Tag
+                          color={
+                            relation.status === "confirmed" ? "green" : "blue"
+                          }
+                        >
+                          {relation.status === "confirmed" ? "已确认" : "候选"}
+                        </Tag>
+                        <RemoveGlyphRelation relation={relation} />
+                      </Flex>
+                    </BorderItem>
+                  </Tooltip>
+                );
+              })}
+              {derived
+                .filter((sibling) => !persistedIds.has(sibling.id))
+                .map((sibling) => {
+                  const glyph = 字库.获取字形(sibling.id);
+                  if (!glyph) return null;
+                  const examples = sibling.examples
+                    .slice(0, 8)
+                    .map(
+                      ({ unicode, source }) =>
+                        `U+${unicode.toString(16).toUpperCase()} ${source}`,
+                    )
+                    .join("、");
+                  return (
+                    <Tooltip
+                      key={`derived:${sibling.id}`}
+                      title={`${sibling.count} 个已完成字符；来源 ${sibling.sources.join(" ")}；${examples}`}
+                    >
+                      <BorderItem>
+                        <Flex className="items-center gap-1">
+                          <GlyphView glyph={glyph.图形盒子} />
+                          {sibling.id}
+                          <Tag>推断</Tag>
+                        </Flex>
+                      </BorderItem>
+                    </Tooltip>
+                  );
+                })}
+            </Flex>
+            {远程 && <ConfirmSibling id={record.id} />}
+          </Flex>
         );
       },
+      width: 280,
     },
     {
       title: "歧义",
@@ -404,6 +700,7 @@ export default function GlyphTable() {
         <CreateGlyph type="component" />
         <CreateGlyph type="compound" />
         <CreateGlyph type="compound" />
+        {远程 && <LoadGlyphRelations />}
       </Flex>
       <Table<字形>
         dataSource={dataSource}

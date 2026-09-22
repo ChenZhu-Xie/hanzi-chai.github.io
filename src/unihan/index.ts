@@ -38,6 +38,7 @@ export const RECOMMENDATION_SAMPLE_RANGES = [
 export type UnihanSourceMap = Map<number, string[]>;
 
 export type UnihanAuditStatus =
+  | "reviewed-reference"
   | "already-complete"
   | "safe-candidate"
   | "needs-review"
@@ -47,18 +48,28 @@ export type UnihanAuditStatus =
 
 export interface RecommendationEvidence {
   referenceId: number;
-  replacementId: number;
+  replacementId?: number;
   count: number;
-  alternatives: { id: number; count: number }[];
+  reliable: boolean;
+  alternatives: { id: number; count: number; examples: number[] }[];
+  /** Nested evidence used to resolve this top-level reference recursively. */
+  basis?: RecommendationEvidence[];
 }
 
 export interface UnihanGlyphProposal {
   source: string;
   existingGlyphId?: number;
   requiresChange: boolean;
-  glyph: 复合体数据;
+  glyph: 基本字形数据;
   evidence: RecommendationEvidence[];
 }
+
+export interface UnihanUnresolvedSource {
+  source: string;
+  evidence: RecommendationEvidence[];
+}
+
+export type ManualSourceChoices = ReadonlyMap<number, number>;
 
 export interface UnihanAuditItem {
   unicode: number;
@@ -72,11 +83,13 @@ export interface UnihanAuditItem {
   status: UnihanAuditStatus;
   reason: string;
   proposals: UnihanGlyphProposal[];
+  unresolved: UnihanUnresolvedSource[];
 }
 
 export interface UnihanAuditSummary {
   scanned: number;
   hasNonG: number;
+  reviewedReferences: number;
   alreadyComplete: number;
   safeCandidates: number;
   needsReview: number;
@@ -93,12 +106,39 @@ export interface UnihanAudit {
     generatedAt: string;
     minimumEvidence: number;
     minimumDominance: number;
+    reviewedDecisions: ReviewedSourceDecision[];
   };
   summary: UnihanAuditSummary;
   items: UnihanAuditItem[];
 }
 
-type SourceEvidenceIndex = Map<string, Map<number, Map<number, number>>>;
+type EvidenceExamples = Map<number, Set<number>>;
+
+export type SourceEvidenceIndex = Map<string, Map<number, EvidenceExamples>>;
+
+export type GlyphEvidenceIndex = Map<string, Map<number, EvidenceExamples>>;
+
+export interface ReviewedSourceDecision {
+  unicode: number;
+  source: string;
+  referenceId: number;
+  replacementId: number;
+  provenance?: "manual" | "reviewed-data";
+}
+
+export interface GlyphSiblingExample {
+  unicode: number;
+  source: string;
+  parentGlyphId: number;
+  position: number;
+}
+
+export interface GlyphSiblingCandidate {
+  id: number;
+  count: number;
+  sources: string[];
+  examples: GlyphSiblingExample[];
+}
 
 interface GlyphIndex {
   byId: Map<number, 基本字形数据>;
@@ -148,7 +188,7 @@ export function readUnihanVersion(text: string): string | undefined {
   return /^# Unicode Version ([0-9]+(?:\.[0-9]+){1,2})\s*$/m.exec(text)?.[1];
 }
 
-function isRecommendationSample(unicode: number): boolean {
+export function isRecommendationSample(unicode: number): boolean {
   return RECOMMENDATION_SAMPLE_RANGES.some(
     ({ start, end }) => unicode >= start && unicode <= end,
   );
@@ -162,7 +202,6 @@ export function buildSourceEvidenceIndex(
   const index: SourceEvidenceIndex = new Map();
   for (const character of characters) {
     if (!isRecommendationSample(character.unicode)) continue;
-    if (character.glyphs.length < 2) continue;
     const gEntry = character.glyphs.find((entry) =>
       entry.sources.includes("G"),
     );
@@ -202,10 +241,9 @@ export function buildSourceEvidenceIndex(
             replacements = new Map();
             sourceIndex.set(referenceId, replacements);
           }
-          replacements.set(
-            replacementId,
-            (replacements.get(replacementId) ?? 0) + 1,
-          );
+          const examples = replacements.get(replacementId) ?? new Set<number>();
+          examples.add(character.unicode);
+          replacements.set(replacementId, examples);
         }
       }
     }
@@ -213,24 +251,341 @@ export function buildSourceEvidenceIndex(
   return index;
 }
 
-export function glyphShapeKey(glyph: 复合体数据): string {
-  return JSON.stringify({
-    type: glyph.type,
-    operator: glyph.operator,
-    references: glyph.references,
-    strokes: glyph.strokes,
-    ambiguous: glyph.ambiguous,
-  });
+/**
+ * Add a maintainer decision at the smallest known differing subtree and also
+ * propagate it down structurally compatible descendants. This makes one
+ * reviewed sibling decision reusable without treating all forms from the same
+ * IRG source as globally identical.
+ */
+export function augmentSourceEvidenceWithReviews(
+  index: SourceEvidenceIndex,
+  decisions: ReviewedSourceDecision[],
+  glyphs: 基本字形数据[],
+): SourceEvidenceIndex {
+  const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
+  const add = (
+    source: string,
+    referenceId: number,
+    replacementId: number,
+    unicode: number,
+    depth = 0,
+  ) => {
+    if (depth > 10) return;
+    let sourceIndex = index.get(source);
+    if (!sourceIndex) {
+      sourceIndex = new Map();
+      index.set(source, sourceIndex);
+    }
+    let replacements = sourceIndex.get(referenceId);
+    if (!replacements) {
+      replacements = new Map();
+      sourceIndex.set(referenceId, replacements);
+    }
+    const examples = replacements.get(replacementId) ?? new Set<number>();
+    examples.add(unicode);
+    replacements.set(replacementId, examples);
+
+    const reference = glyphById.get(referenceId);
+    const replacement = glyphById.get(replacementId);
+    if (
+      reference?.type !== "compound" ||
+      replacement?.type !== "compound" ||
+      reference.operator !== replacement.operator ||
+      reference.references.length !== replacement.references.length
+    ) {
+      return;
+    }
+    for (let index = 0; index < reference.references.length; index++) {
+      add(
+        source,
+        reference.references[index]!.id,
+        replacement.references[index]!.id,
+        unicode,
+        depth + 1,
+      );
+    }
+  };
+  for (const decision of decisions) {
+    if (
+      !glyphById.has(decision.referenceId) ||
+      !glyphById.has(decision.replacementId)
+    ) {
+      continue;
+    }
+    add(
+      decision.source,
+      decision.referenceId,
+      decision.replacementId,
+      decision.unicode,
+    );
+  }
+  return index;
+}
+
+export function buildGlyphEvidenceIndex(
+  characters: 字符数据[],
+  glyphs: 基本字形数据[],
+): GlyphEvidenceIndex {
+  const glyphIds = new Set(glyphs.map(({ id }) => id));
+  const index: GlyphEvidenceIndex = new Map();
+  for (const character of characters) {
+    if (!isRecommendationSample(character.unicode)) continue;
+    const gEntry = character.glyphs.find((entry) =>
+      entry.sources.includes("G"),
+    );
+    if (!gEntry || !glyphIds.has(gEntry.id)) continue;
+    for (const targetEntry of character.glyphs) {
+      if (!glyphIds.has(targetEntry.id)) continue;
+      for (const source of targetEntry.sources) {
+        if (source === "G") continue;
+        let byReference = index.get(source);
+        if (!byReference) {
+          byReference = new Map();
+          index.set(source, byReference);
+        }
+        let replacements = byReference.get(gEntry.id);
+        if (!replacements) {
+          replacements = new Map();
+          byReference.set(gEntry.id, replacements);
+        }
+        const examples = replacements.get(targetEntry.id) ?? new Set<number>();
+        examples.add(character.unicode);
+        replacements.set(targetEntry.id, examples);
+      }
+    }
+  }
+  return index;
+}
+
+function addSiblingExample(
+  raw: Map<number, Map<number, GlyphSiblingExample[]>>,
+  left: number,
+  right: number,
+  example: GlyphSiblingExample,
+) {
+  if (left === right) return;
+  const siblings = raw.get(left) ?? new Map<number, GlyphSiblingExample[]>();
+  const examples = siblings.get(right) ?? [];
+  if (
+    !examples.some(
+      (item) =>
+        item.unicode === example.unicode &&
+        item.source === example.source &&
+        item.position === example.position,
+    )
+  ) {
+    examples.push(example);
+  }
+  siblings.set(right, examples);
+  raw.set(left, siblings);
+}
+
+/**
+ * Derive candidate sibling glyphs only from the maintainer-reviewed ranges.
+ * The relation is symmetric, but each example retains the source direction
+ * that produced it.
+ */
+export function buildReviewedGlyphSiblingIndex(
+  characters: 字符数据[],
+  glyphs: 基本字形数据[],
+): Map<number, GlyphSiblingCandidate[]> {
+  const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
+  const raw = new Map<number, Map<number, GlyphSiblingExample[]>>();
+  for (const character of characters) {
+    if (!isRecommendationSample(character.unicode)) continue;
+    const gEntry = character.glyphs.find((entry) =>
+      entry.sources.includes("G"),
+    );
+    const gGlyph = gEntry ? glyphById.get(gEntry.id) : undefined;
+    if (!gEntry || !gGlyph) continue;
+    for (const targetEntry of character.glyphs) {
+      const targetGlyph = glyphById.get(targetEntry.id);
+      if (!targetGlyph) continue;
+      for (const source of targetEntry.sources) {
+        if (source === "G") continue;
+        if (gGlyph.type === "component" && targetGlyph.type === "component") {
+          const example = {
+            unicode: character.unicode,
+            source,
+            parentGlyphId: gEntry.id,
+            position: -1,
+          };
+          addSiblingExample(raw, gEntry.id, targetEntry.id, example);
+          addSiblingExample(raw, targetEntry.id, gEntry.id, example);
+          continue;
+        }
+        if (
+          gGlyph.type !== "compound" ||
+          targetGlyph.type !== "compound" ||
+          gGlyph.operator !== targetGlyph.operator ||
+          gGlyph.references.length !== targetGlyph.references.length
+        ) {
+          continue;
+        }
+        for (
+          let position = 0;
+          position < gGlyph.references.length;
+          position++
+        ) {
+          const left = gGlyph.references[position]!.id;
+          const right = targetGlyph.references[position]!.id;
+          const example = {
+            unicode: character.unicode,
+            source,
+            parentGlyphId: targetEntry.id,
+            position,
+          };
+          addSiblingExample(raw, left, right, example);
+          addSiblingExample(raw, right, left, example);
+        }
+      }
+    }
+  }
+  return new Map(
+    [...raw].map(([id, siblings]) => [
+      id,
+      [...siblings]
+        .map(([siblingId, examples]) => ({
+          id: siblingId,
+          count: new Set(examples.map(({ unicode }) => unicode)).size,
+          sources: sortSources(examples.map(({ source }) => source)),
+          examples: examples.sort(
+            (a, b) => a.unicode - b.unicode || a.source.localeCompare(b.source),
+          ),
+        }))
+        .sort((a, b) => b.count - a.count || a.id - b.id),
+    ]),
+  );
+}
+
+export function glyphShapeKey(glyph: 基本字形数据): string {
+  const {
+    id: _id,
+    name: _name,
+    gf0014_id: _gf0014,
+    gf3001_id: _gf3001,
+    ...shape
+  } = glyph;
+  return JSON.stringify(shape);
 }
 
 function buildGlyphIndex(glyphs: 基本字形数据[]): GlyphIndex {
   return {
     byId: new Map(glyphs.map((glyph) => [glyph.id, glyph])),
-    byShape: new Map(
-      glyphs
-        .filter((glyph): glyph is 复合体数据 => glyph.type === "compound")
-        .map((glyph) => [glyphShapeKey(glyph), glyph.id]),
+    byShape: new Map(glyphs.map((glyph) => [glyphShapeKey(glyph), glyph.id])),
+  };
+}
+
+function makeRecommendationEvidence(
+  referenceId: number,
+  replacements: EvidenceExamples | undefined,
+  minimumEvidence: number,
+  minimumDominance: number,
+): RecommendationEvidence {
+  const alternatives = [...(replacements ?? [])]
+    .map(([id, examples]) => ({
+      id,
+      count: examples.size,
+      examples: [...examples].sort((a, b) => a - b),
+    }))
+    .sort((a, b) => b.count - a.count || a.id - b.id);
+  const winner = alternatives[0];
+  const runnerUp = alternatives[1];
+  const reliable =
+    winner !== undefined &&
+    winner.count >= minimumEvidence &&
+    (runnerUp === undefined ||
+      winner.count >= runnerUp.count * minimumDominance);
+  return {
+    referenceId,
+    replacementId: winner?.id,
+    count: winner?.count ?? 0,
+    reliable,
+    alternatives,
+  };
+}
+
+function resolveReferenceRecursively(
+  referenceId: number,
+  source: string,
+  glyphIndex: GlyphIndex,
+  evidenceIndex: SourceEvidenceIndex,
+  minimumEvidence: number,
+  minimumDominance: number,
+  depth = 0,
+  seen = new Set<number>(),
+): { id: number; evidence: RecommendationEvidence } | undefined {
+  if (depth > 10 || seen.has(referenceId)) return undefined;
+  const nextSeen = new Set(seen).add(referenceId);
+  const direct = makeRecommendationEvidence(
+    referenceId,
+    evidenceIndex.get(source)?.get(referenceId),
+    minimumEvidence,
+    minimumDominance,
+  );
+  if (
+    direct.reliable &&
+    direct.replacementId !== undefined &&
+    glyphIndex.byId.has(direct.replacementId)
+  ) {
+    return { id: direct.replacementId, evidence: direct };
+  }
+  const glyph = glyphIndex.byId.get(referenceId);
+  if (glyph?.type !== "compound") return undefined;
+  const resolved = glyph.references.map((reference) =>
+    resolveReferenceRecursively(
+      reference.id,
+      source,
+      glyphIndex,
+      evidenceIndex,
+      minimumEvidence,
+      minimumDominance,
+      depth + 1,
+      nextSeen,
     ),
+  );
+  if (resolved.some((result) => result === undefined)) return undefined;
+  const candidate: 复合体数据 = {
+    ...glyph,
+    id: 0,
+    references: glyph.references.map((reference, index) => ({
+      ...reference,
+      id: resolved[index]!.id,
+    })),
+  };
+  const existingId = glyphIndex.byShape.get(glyphShapeKey(candidate));
+  if (existingId === undefined) return undefined;
+  const basis = [
+    ...(direct.alternatives.length > 0 ? [direct] : []),
+    ...resolved.map((result) => result!.evidence),
+  ];
+  const reliableCounts = basis
+    .flatMap((item) => (item.basis ? item.basis : [item]))
+    .filter((item) => item.reliable)
+    .map((item) => item.count);
+  const examples = new Set(
+    basis.flatMap((item) =>
+      item.alternatives
+        .filter(({ id }) => id === item.replacementId)
+        .flatMap((alternative) => alternative.examples),
+    ),
+  );
+  return {
+    id: existingId,
+    evidence: {
+      referenceId,
+      replacementId: existingId,
+      count: reliableCounts.length > 0 ? Math.min(...reliableCounts) : 0,
+      reliable: true,
+      alternatives: [
+        {
+          id: existingId,
+          count: reliableCounts.length > 0 ? Math.min(...reliableCounts) : 0,
+          examples: [...examples].sort((left, right) => left - right),
+        },
+      ],
+      basis,
+    },
   };
 }
 
@@ -242,46 +597,90 @@ export function recommendMissingSources(
   minimumEvidence = DEFAULT_MINIMUM_EVIDENCE,
   minimumDominance = DEFAULT_MINIMUM_DOMINANCE,
   existingGlyphIndex?: GlyphIndex,
-): { proposals: UnihanGlyphProposal[]; unresolvedSources: string[] } {
+  glyphEvidenceIndex = buildGlyphEvidenceIndex([character], glyphs),
+): {
+  proposals: UnihanGlyphProposal[];
+  unresolvedSources: string[];
+  unresolved: UnihanUnresolvedSource[];
+} {
   const gEntry = character.glyphs.find((entry) => entry.sources.includes("G"));
   const glyphIndex = existingGlyphIndex ?? buildGlyphIndex(glyphs);
   const referenceGlyph = gEntry ? glyphIndex.byId.get(gEntry.id) : undefined;
-  if (!gEntry || !referenceGlyph || referenceGlyph.type !== "compound") {
-    return { proposals: [], unresolvedSources: missingSources };
+  if (!gEntry || !referenceGlyph) {
+    return {
+      proposals: [],
+      unresolvedSources: missingSources,
+      unresolved: missingSources.map((source) => ({ source, evidence: [] })),
+    };
   }
   const proposals: UnihanGlyphProposal[] = [];
   const unresolvedSources: string[] = [];
+  const unresolved: UnihanUnresolvedSource[] = [];
 
   for (const source of missingSources) {
+    if (referenceGlyph.type === "component") {
+      const evidence = makeRecommendationEvidence(
+        referenceGlyph.id,
+        glyphEvidenceIndex.get(source)?.get(referenceGlyph.id),
+        minimumEvidence,
+        minimumDominance,
+      );
+      const winner = evidence.replacementId
+        ? glyphIndex.byId.get(evidence.replacementId)
+        : undefined;
+      if (!evidence.reliable || winner?.type !== "component") {
+        unresolvedSources.push(source);
+        unresolved.push({ source, evidence: [evidence] });
+        continue;
+      }
+      proposals.push({
+        source,
+        existingGlyphId: winner.id,
+        requiresChange: winner.id !== referenceGlyph.id,
+        glyph: { ...winner, id: 0 },
+        evidence: [evidence],
+      });
+      continue;
+    }
+
     const sourceIndex = evidenceIndex.get(source);
     const evidence: RecommendationEvidence[] = [];
     const replacements: number[] = [];
     let reliable = true;
     for (const reference of referenceGlyph.references) {
-      const alternatives = [...(sourceIndex?.get(reference.id) ?? [])]
-        .map(([id, count]) => ({ id, count }))
-        .sort((a, b) => b.count - a.count || a.id - b.id);
-      const winner = alternatives[0];
-      const runnerUp = alternatives[1];
-      if (
-        !winner ||
-        winner.count < minimumEvidence ||
-        (runnerUp !== undefined &&
-          winner.count < runnerUp.count * minimumDominance)
+      const componentEvidence = makeRecommendationEvidence(
+        reference.id,
+        sourceIndex?.get(reference.id),
+        minimumEvidence,
+        minimumDominance,
+      );
+      const recursive = componentEvidence.reliable
+        ? undefined
+        : resolveReferenceRecursively(
+            reference.id,
+            source,
+            glyphIndex,
+            evidenceIndex,
+            minimumEvidence,
+            minimumDominance,
+          );
+      if (recursive) {
+        evidence.push(recursive.evidence);
+        replacements.push(recursive.id);
+      } else if (
+        componentEvidence.reliable &&
+        componentEvidence.replacementId !== undefined
       ) {
+        evidence.push(componentEvidence);
+        replacements.push(componentEvidence.replacementId);
+      } else {
+        evidence.push(componentEvidence);
         reliable = false;
-        break;
       }
-      replacements.push(winner.id);
-      evidence.push({
-        referenceId: reference.id,
-        replacementId: winner.id,
-        count: winner.count,
-        alternatives,
-      });
     }
     if (!reliable) {
       unresolvedSources.push(source);
+      unresolved.push({ source, evidence });
       continue;
     }
     const glyph: 复合体数据 = {
@@ -308,7 +707,76 @@ export function recommendMissingSources(
       evidence,
     });
   }
-  return { proposals, unresolvedSources };
+  return { proposals, unresolvedSources, unresolved };
+}
+
+/**
+ * Turn one maintainer-reviewed set of component choices into a proposal.
+ * Every manual replacement must still be one of the alternatives produced by
+ * the fresh audit, so a stale UI choice cannot silently bypass revalidation.
+ */
+export function resolveUnresolvedSourceProposal(
+  character: 字符数据,
+  glyphs: 基本字形数据[],
+  unresolved: UnihanUnresolvedSource,
+  choices: ManualSourceChoices,
+): UnihanGlyphProposal | undefined {
+  const glyphIndex = buildGlyphIndex(glyphs);
+  const gEntry = character.glyphs.find((entry) => entry.sources.includes("G"));
+  const referenceGlyph = gEntry ? glyphIndex.byId.get(gEntry.id) : undefined;
+  if (!referenceGlyph) return undefined;
+
+  const replacements = unresolved.evidence.map((evidence) => {
+    const replacementId = evidence.reliable
+      ? evidence.replacementId
+      : choices.get(evidence.referenceId);
+    if (
+      replacementId === undefined ||
+      !evidence.alternatives.some(({ id }) => id === replacementId) ||
+      !glyphIndex.byId.has(replacementId)
+    ) {
+      return undefined;
+    }
+    return replacementId;
+  });
+  if (replacements.some((id) => id === undefined)) return undefined;
+
+  if (referenceGlyph.type === "component") {
+    const replacement = glyphIndex.byId.get(replacements[0]!);
+    if (replacement?.type !== "component") return undefined;
+    return {
+      source: unresolved.source,
+      existingGlyphId: replacement.id,
+      requiresChange: replacement.id !== referenceGlyph.id,
+      glyph: { ...replacement, id: 0 },
+      evidence: unresolved.evidence,
+    };
+  }
+  if (replacements.length !== referenceGlyph.references.length) {
+    return undefined;
+  }
+  const glyph: 复合体数据 = {
+    id: 0,
+    type: "compound",
+    operator: referenceGlyph.operator,
+    references: referenceGlyph.references.map((reference, index) => ({
+      ...reference,
+      id: replacements[index]!,
+    })),
+    strokes: referenceGlyph.strokes,
+    ambiguous: referenceGlyph.ambiguous,
+  };
+  const shapeKey = glyphShapeKey(glyph);
+  const requiresChange = shapeKey !== glyphShapeKey(referenceGlyph);
+  return {
+    source: unresolved.source,
+    existingGlyphId: requiresChange
+      ? glyphIndex.byShape.get(shapeKey)
+      : referenceGlyph.id,
+    requiresChange,
+    glyph,
+    evidence: unresolved.evidence,
+  };
 }
 
 function codepoint(unicode: number): string {
@@ -324,6 +792,7 @@ export function auditUnihanSources(
     to?: number;
     minimumEvidence?: number;
     minimumDominance?: number;
+    reviewedDecisions?: ReviewedSourceDecision[];
   } = {},
 ): UnihanAudit {
   const from = options.from ?? CJK_UNIFIED_START;
@@ -334,12 +803,18 @@ export function auditUnihanSources(
   const charactersByUnicode = new Map(
     characters.map((character) => [character.unicode, character]),
   );
-  const glyphsById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
   const glyphIndex = buildGlyphIndex(glyphs);
   const evidenceIndex = buildSourceEvidenceIndex(characters, glyphs);
+  augmentSourceEvidenceWithReviews(
+    evidenceIndex,
+    options.reviewedDecisions ?? [],
+    glyphs,
+  );
+  const glyphEvidenceIndex = buildGlyphEvidenceIndex(characters, glyphs);
   const summary: UnihanAuditSummary = {
     scanned: 0,
     hasNonG: 0,
+    reviewedReferences: 0,
     alreadyComplete: 0,
     safeCandidates: 0,
     needsReview: 0,
@@ -369,6 +844,7 @@ export function auditUnihanSources(
     let status: UnihanAuditStatus;
     let reason: string;
     let proposals: UnihanGlyphProposal[] = [];
+    let unresolved: UnihanUnresolvedSource[] = [];
 
     const hasExistingNonGData =
       character !== undefined &&
@@ -380,21 +856,12 @@ export function auditUnihanSources(
     if (!character) {
       status = "unsupported";
       reason = "当前 hanzi-chai 数据中没有这个字符。";
-    } else if (hasExistingNonGData) {
-      status = "existing-non-g-data";
-      reason = "已存在多个字形和人工整理的非 G 来源数据，自动流程跳过。";
+    } else if (isRecommendationSample(unicode)) {
+      status = "reviewed-reference";
+      reason = "属于维护者已完成区间；只作为推荐训练样本，不进入自动写入。";
     } else if (!expectedSet.has("G") || !existingSet.has("G")) {
       status = "needs-review";
       reason = "缺少可作为参考的 G 来源字形。";
-    } else if (
-      character.glyphs.length !== 1 ||
-      !character.glyphs[0]!.sources.includes("G")
-    ) {
-      status = "needs-review";
-      reason = "当前字符不是含 G 来源的单一字形。";
-    } else if (glyphsById.get(character.glyphs[0]!.id)?.type !== "compound") {
-      status = "insufficient-evidence";
-      reason = "G 字形不是可按 component 推断的复合体。";
     } else {
       const expectedNonG = expectedSources.filter((source) => source !== "G");
       const recommendation = recommendMissingSources(
@@ -405,9 +872,15 @@ export function auditUnihanSources(
         minimumEvidence,
         minimumDominance,
         glyphIndex,
+        glyphEvidenceIndex,
       );
       proposals = recommendation.proposals;
-      if (
+      unresolved = recommendation.unresolved;
+      if (hasExistingNonGData) {
+        status = "existing-non-g-data";
+        reason =
+          "区间外已存在多个来源字形；展示完整 source 建议供复核，但不会自动覆盖。";
+      } else if (
         expectedNonG.length > 0 &&
         recommendation.unresolvedSources.length === 0 &&
         proposals.length === expectedNonG.length &&
@@ -418,10 +891,11 @@ export function auditUnihanSources(
           missingSources.length > 0
         ) {
           status = "safe-candidate";
-          reason = `每个目标来源的每个 component 都有至少 ${minimumEvidence} 个独立字符的证据，且第一名至少是第二名的 ${minimumDominance} 倍。`;
+          reason = `每个目标来源的完整拆分都可由已完成区间推导：每个候选至少有 ${minimumEvidence} 个独立字符证据，且第一名至少是第二名的 ${minimumDominance} 倍。`;
         } else {
           status = "already-complete";
-          reason = "来源已完整，且可靠证据表明非 G 来源与当前字形相同。";
+          reason =
+            "来源标签已完整，且已完成区间的统计证据推断其完整拆分与当前分组相同；这不等于已通过 PDF 人工视觉核验。";
         }
       } else {
         status = "insufficient-evidence";
@@ -429,18 +903,13 @@ export function auditUnihanSources(
       }
     }
 
+    if (status === "reviewed-reference") summary.reviewedReferences++;
     if (status === "already-complete") summary.alreadyComplete++;
     if (status === "safe-candidate") summary.safeCandidates++;
     if (status === "existing-non-g-data") summary.skippedExistingNonG++;
     if (status === "insufficient-evidence") summary.insufficientEvidence++;
     if (status === "unsupported") summary.unsupported++;
-    if (
-      status === "needs-review" ||
-      status === "insufficient-evidence" ||
-      status === "unsupported"
-    ) {
-      summary.needsReview++;
-    }
+    if (status === "needs-review") summary.needsReview++;
     items.push({
       unicode,
       codepoint: codepoint(unicode),
@@ -453,6 +922,7 @@ export function auditUnihanSources(
       status,
       reason,
       proposals,
+      unresolved,
     });
   }
 
@@ -464,6 +934,9 @@ export function auditUnihanSources(
       generatedAt: new Date().toISOString(),
       minimumEvidence,
       minimumDominance,
+      reviewedDecisions: (options.reviewedDecisions ?? []).map((decision) => ({
+        ...decision,
+      })),
     },
     summary,
     items,

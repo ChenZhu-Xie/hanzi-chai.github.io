@@ -70,6 +70,33 @@ export type 矢量图形数据 = 矢量笔画数据[];
 
 export type 字形来源数据 = { id: number; sources: string[] };
 
+export type 字形关系种类 = "source-variant" | "visual-sibling" | "manual";
+export type 字形关系状态 = "candidate" | "confirmed" | "rejected";
+export type 字形关系来源 = "reviewed-range" | "manual" | "algorithm";
+
+export interface 字形关系证据 {
+  unicode: number;
+  source: string;
+  parentGlyphId: number;
+  position: number;
+}
+
+/**
+ * A symmetric relationship between two glyphs. This records that the glyphs
+ * are alternatives worth comparing; it does not make them interchangeable in
+ * every character or source context.
+ */
+export interface 字形关系数据 {
+  id?: number;
+  leftId: number;
+  rightId: number;
+  kind: 字形关系种类;
+  status: 字形关系状态;
+  provenance: 字形关系来源;
+  sources: string[];
+  evidence: 字形关系证据[];
+}
+
 export interface 字符数据 {
   unicode: number;
   glyphs: 字形来源数据[];
