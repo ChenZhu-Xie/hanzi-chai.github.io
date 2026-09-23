@@ -2,6 +2,7 @@ import { parseArgs } from "node:util";
 import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import {
   auditUnihanSources,
+  parseSourceVisualEvidence,
   parseUnihanIRGSources,
   type ReviewedSourceDecision,
 } from "../src/unihan";
@@ -13,13 +14,12 @@ const { values } = parseArgs({
     glyphs: { type: "string" },
     unihan: { type: "string" },
     decisions: { type: "string" },
+    visualEvidence: { type: "string" },
     output: { type: "string" },
   },
 });
 if (!values.characters || !values.glyphs || !values.unihan || !values.output) {
-  throw new Error(
-    "--characters, --glyphs, --unihan and --output are required",
-  );
+  throw new Error("--characters, --glyphs, --unihan and --output are required");
 }
 
 const characters = (await Bun.file(values.characters).json()) as 字符数据[];
@@ -28,8 +28,12 @@ const unihan = parseUnihanIRGSources(await Bun.file(values.unihan).text());
 const reviewedDecisions = values.decisions
   ? ((await Bun.file(values.decisions).json()) as ReviewedSourceDecision[])
   : REVIEWED_SOURCE_DECISIONS;
+const visualEvidence = values.visualEvidence
+  ? parseSourceVisualEvidence(await Bun.file(values.visualEvidence).text())
+  : undefined;
 const audit = auditUnihanSources(unihan, characters, glyphs, {
   reviewedDecisions,
+  visualEvidence,
 });
 await Bun.write(values.output, `${JSON.stringify(audit, null, 2)}\n`);
 console.log(JSON.stringify(audit.summary, null, 2));

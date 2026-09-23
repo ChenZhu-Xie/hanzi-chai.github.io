@@ -31,11 +31,13 @@ import {
   auditUnihanSources,
   DEFAULT_MINIMUM_EVIDENCE,
   glyphShapeKey,
+  parseSourceVisualEvidence,
   parseUnihanIRGSources,
   readUnihanVersion,
   resolveUnresolvedSourceProposal,
-  sortSources,
+  type SourceVisualEvidence,
   SUPPORTED_UNIHAN_VERSION,
+  sortSources,
   type UnihanAudit,
   type UnihanAuditItem,
   type UnihanAuditStatus,
@@ -125,6 +127,10 @@ export default function UnihanSourceRecommendation() {
   const [glyphs, setGlyphs] = useAtom(可编辑字形列表原子);
   const [sources, setSources] = useState<UnihanSourceMap>(new Map());
   const [filename, setFilename] = useState("");
+  const [visualEvidence, setVisualEvidence] = useState<
+    Map<number, SourceVisualEvidence>
+  >(new Map());
+  const [visualEvidenceFilename, setVisualEvidenceFilename] = useState("");
   const [fromText, setFromText] = useState("4E00");
   const [toText, setToText] = useState("9FFF");
   const [audit, setAudit] = useState<UnihanAudit>();
@@ -233,6 +239,7 @@ export default function UnihanSourceRecommendation() {
           from,
           to,
           reviewedDecisions: REVIEWED_SOURCE_DECISIONS,
+          visualEvidence,
         },
       );
       setAudit(result);
@@ -284,7 +291,12 @@ export default function UnihanSourceRecommendation() {
         sources,
         currentCharacters,
         currentGlyphs,
-        { from, to, reviewedDecisions: REVIEWED_SOURCE_DECISIONS },
+        {
+          from,
+          to,
+          reviewedDecisions: REVIEWED_SOURCE_DECISIONS,
+          visualEvidence,
+        },
       );
       const freshItems = new Map(
         freshAudit.items.map((item) => [item.unicode, item]),
@@ -502,43 +514,66 @@ export default function UnihanSourceRecommendation() {
                       entry.referenceId,
                     );
                     return (
-                      <Flex gap="small" align="center" key={entry.referenceId}>
-                        <Typography.Text>
-                          G 部件 {formatGlyphTree(entry.referenceId)} →
-                        </Typography.Text>
-                        {entry.reliable && entry.replacementId !== undefined ? (
+                      <Flex vertical gap={0} key={entry.referenceId}>
+                        <Flex gap="small" align="center">
                           <Typography.Text>
-                            {formatGlyphTree(entry.replacementId)}（
-                            {entry.reviewed ? "人工已确认" : "统计已定"}）
+                            G 部件 {formatGlyphTree(entry.referenceId)} →
                           </Typography.Text>
-                        ) : entry.alternatives.length > 0 ? (
-                          <Select
-                            aria-label={`${item.codepoint} ${source} 部件 ${entry.referenceId} 的人工选择`}
-                            placeholder="选择视觉匹配项"
-                            value={manualChoices[key]}
-                            className="min-w-72"
-                            options={entry.alternatives.map((alternative) => ({
-                              value: alternative.id,
-                              label: `${formatGlyphTree(alternative.id)}（${alternative.count} 个已完成父字）`,
-                            }))}
-                            allowClear
-                            onChange={(value) => {
-                              setManualChoices((current) => {
-                                const next = { ...current };
-                                if (value === undefined) delete next[key];
-                                else next[key] = value;
-                                return next;
-                              });
-                              setSelected((current) =>
-                                current.filter(
-                                  (value) => value !== item.unicode,
-                                ),
-                              );
-                            }}
-                          />
-                        ) : (
+                          {entry.reliable &&
+                          entry.replacementId !== undefined ? (
+                            <Typography.Text>
+                              {formatGlyphTree(entry.replacementId)}（
+                              {entry.reviewed
+                                ? "人工已确认"
+                                : entry.visualSupport?.level === "strict"
+                                  ? `PDF 严格视觉 + ${entry.visualSupport.anchorSources.join("/")} 已确认锚点`
+                                  : "统计已定"}
+                              ）
+                            </Typography.Text>
+                          ) : entry.alternatives.length > 0 ? (
+                            <Select
+                              aria-label={`${item.codepoint} ${source} 部件 ${entry.referenceId} 的人工选择`}
+                              placeholder="选择视觉匹配项"
+                              value={manualChoices[key]}
+                              className="min-w-72"
+                              options={entry.alternatives.map(
+                                (alternative) => ({
+                                  value: alternative.id,
+                                  label: `${formatGlyphTree(alternative.id)}（${alternative.count} 个已完成父字）`,
+                                }),
+                              )}
+                              allowClear
+                              onChange={(value) => {
+                                setManualChoices((current) => {
+                                  const next = { ...current };
+                                  if (value === undefined) delete next[key];
+                                  else next[key] = value;
+                                  return next;
+                                });
+                                setSelected((current) =>
+                                  current.filter(
+                                    (value) => value !== item.unicode,
+                                  ),
+                                );
+                              }}
+                            />
+                          ) : (
+                            <Typography.Text type="secondary">
+                              无候选
+                            </Typography.Text>
+                          )}
+                        </Flex>
+                        {entry.visualSupport?.level === "likely" && (
                           <Typography.Text type="secondary">
-                            无候选
+                            父字统计原先偏向
+                            {entry.statisticalReplacementId === undefined
+                              ? "其他候选"
+                              : ` ${formatGlyphTree(entry.statisticalReplacementId)}`}
+                            ；PDF 软视觉与
+                            {entry.visualSupport.anchorSources.join("/")}{" "}
+                            已确认来源同形， 因而只把{" "}
+                            {formatGlyphTree(entry.referenceId)}{" "}
+                            提到首选，仍须人工确认。
                           </Typography.Text>
                         )}
                       </Flex>
@@ -566,8 +601,8 @@ export default function UnihanSourceRecommendation() {
         <Alert
           type="info"
           showIcon
-          message="Unihan_IRGSources.txt 决定 source membership；PDF 只用于视觉核对。Dry-run 不会发起写请求。"
-          description={`审计还会使用 ${REVIEWED_SOURCE_DECISIONS.length} 条已逐项视觉确认的最小部件决策；它们不会单独触发写入。当前不因字体细节新建兄弟部件：横／提、点／捺、竖／竖钩、竖弯钩／竖提可留作将来的条件变体。`}
+          message="Unihan_IRGSources.txt 决定 source membership；可选 PDF 证据只比较同一字符的来源字形。Dry-run 不会发起写请求。"
+          description={`审计还会使用 ${REVIEWED_SOURCE_DECISIONS.length} 条已逐项视觉确认的最小部件决策。PDF 软视觉只调整未决候选顺序；严格视觉也必须连到已确认的同字来源锚点才可形成候选。当前不因字体细节新建兄弟部件：横／提、点／捺／横捺、竖／竖钩、竖弯钩／竖提可留作将来的条件变体。`}
         />
         {feedback && (
           <Alert
@@ -612,6 +647,40 @@ export default function UnihanSourceRecommendation() {
             }}
           >
             <Button>{filename || "载入 Unihan_IRGSources.txt"}</Button>
+          </Upload>
+          <Upload
+            accept=".json,application/json"
+            maxCount={1}
+            showUploadList={false}
+            beforeUpload={async (file) => {
+              try {
+                const parsed = parseSourceVisualEvidence(await file.text());
+                setVisualEvidence(parsed);
+                setVisualEvidenceFilename(file.name);
+                setAudit(undefined);
+                setSelected([]);
+                setManualChoices({});
+                setFeedback({
+                  type: "success",
+                  text: `读取 ${parsed.size} 个字符的 PDF 来源间视觉证据。`,
+                });
+              } catch (error) {
+                setVisualEvidence(new Map());
+                setVisualEvidenceFilename("");
+                setAudit(undefined);
+                setSelected([]);
+                setManualChoices({});
+                setFeedback({
+                  type: "error",
+                  text: `PDF 视觉证据无效：${error instanceof Error ? error.message : String(error)}`,
+                });
+              }
+              return false;
+            }}
+          >
+            <Button>
+              {visualEvidenceFilename || "可选：载入 PDF 视觉证据 JSON"}
+            </Button>
           </Upload>
           <span>从</span>
           <Input

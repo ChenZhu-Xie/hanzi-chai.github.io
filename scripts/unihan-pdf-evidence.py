@@ -225,7 +225,11 @@ def chamfer_distance(left: np.ndarray, right: np.ndarray) -> float:
     )
 
 
-def choose_threshold(labels: list[tuple[float, bool]]) -> tuple[float, dict]:
+def choose_threshold(
+    labels: list[tuple[float, bool]],
+    precision_target: float = 0.995,
+    minimum_true_positive: int = 1,
+) -> tuple[float, dict]:
     if not labels:
         raise RuntimeError("No reviewed PDF pairs were available for calibration")
     ordered = sorted(labels, key=lambda item: item[0])
@@ -249,7 +253,11 @@ def choose_threshold(labels: list[tuple[float, bool]]) -> tuple[float, dict]:
         true_negative = total_different - false_positive
         precision = true_positive / max(1, true_positive + false_positive)
         recall = true_positive / max(1, true_positive + false_negative)
-        if precision >= 0.995 and recall > best_recall:
+        if (
+            true_positive >= minimum_true_positive
+            and precision >= precision_target
+            and recall > best_recall
+        ):
             selected = threshold
             best_recall = recall
             selected_metrics = {
@@ -261,7 +269,11 @@ def choose_threshold(labels: list[tuple[float, bool]]) -> tuple[float, dict]:
                 "recall": recall,
             }
     if not selected_metrics:
-        raise RuntimeError("Unable to calibrate a threshold with 99.5% precision")
+        raise RuntimeError(
+            "Unable to calibrate a threshold with "
+            f"{precision_target:.1%} precision and "
+            f"{minimum_true_positive} positive pairs"
+        )
     return selected, selected_metrics
 
 
@@ -417,7 +429,8 @@ def main() -> None:
                 flush=True,
             )
 
-    threshold, metrics = choose_threshold(calibration)
+    threshold, metrics = choose_threshold(calibration, 0.995)
+    likely_threshold, likely_metrics = choose_threshold(calibration, 0.95)
     try:
         different_threshold, different_metrics = choose_different_threshold(
             calibration
@@ -428,21 +441,38 @@ def main() -> None:
         # missing per-pair calibration.
         different_threshold, different_metrics = None, None
     pair_thresholds: dict[tuple[str, str], float] = {}
+    pair_likely_thresholds: dict[tuple[str, str], float] = {}
     pair_different_thresholds: dict[tuple[str, str], float] = {}
     pair_metrics = {}
     for pair, labels in sorted(calibration_by_pair.items()):
         if sum(not same for _, same in labels) < 10:
             continue
+        pair_key = "/".join(pair)
+        pair_metrics[pair_key] = {"pairs": len(labels)}
         try:
-            pair_threshold, pair_metric = choose_threshold(labels)
+            pair_threshold, pair_metric = choose_threshold(labels, 0.995, 10)
+            pair_thresholds[pair] = pair_threshold
+            pair_metrics[pair_key].update(
+                {
+                    "sameThreshold": pair_threshold,
+                    "sameCalibration": pair_metric,
+                }
+            )
         except RuntimeError:
-            continue
-        pair_thresholds[pair] = pair_threshold
-        pair_metrics["/".join(pair)] = {
-            "sameThreshold": pair_threshold,
-            "pairs": len(labels),
-            **pair_metric,
-        }
+            pass
+        try:
+            pair_likely_threshold, pair_likely_metric = choose_threshold(
+                labels, 0.95, 10
+            )
+            pair_likely_thresholds[pair] = pair_likely_threshold
+            pair_metrics[pair_key].update(
+                {
+                    "likelySameThreshold": pair_likely_threshold,
+                    "likelySameCalibration": pair_likely_metric,
+                }
+            )
+        except RuntimeError:
+            pass
         try:
             pair_different_threshold, pair_different_metric = (
                 choose_different_threshold(labels)
@@ -450,7 +480,7 @@ def main() -> None:
         except RuntimeError:
             continue
         pair_different_thresholds[pair] = pair_different_threshold
-        pair_metrics["/".join(pair)].update(
+        pair_metrics[pair_key].update(
             {
                 "differentThreshold": pair_different_threshold,
                 "differentCalibration": pair_different_metric,
@@ -469,6 +499,12 @@ def main() -> None:
                 if pair in pair_thresholds
                 and distance <= pair_thresholds[pair]
             ],
+            "likelySameEdges": [
+                "/".join(pair)
+                for pair, distance in sorted(distances.items())
+                if pair in pair_likely_thresholds
+                and distance <= pair_likely_thresholds[pair]
+            ],
             "differentEdges": [
                 "/".join(pair)
                 for pair, distance in sorted(distances.items())
@@ -485,9 +521,11 @@ def main() -> None:
             "method": "normalized skeleton symmetric chamfer, complete-link clustering",
             "dpi": args.dpi,
             "sameThreshold": threshold,
+            "likelySameThreshold": likely_threshold,
             "differentThreshold": different_threshold,
             "calibrationPairs": len(calibration),
             "calibration": metrics,
+            "likelySameCalibration": likely_metrics,
             "differentCalibration": different_metrics,
             "sourcePairCalibration": pair_metrics,
             "locatedSourceGlyphs": len(records),
