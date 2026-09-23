@@ -274,4 +274,102 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 504,
     replacementId: 569,
   },
+
+  // U+6752 杒: J keeps G's 刃 component 395, whose third stroke falls down
+  // and left; T uses sibling 397, whose third stroke extends down and right.
+  {
+    unicode: 0x6752,
+    source: "J",
+    referenceId: 395,
+    replacementId: 395,
+  },
+  {
+    unicode: 0x6752,
+    source: "T",
+    referenceId: 395,
+    replacementId: 397,
+  },
+
+  // U+671E 朞: G/H/KP(N) use 月 504 with a vertical first stroke;
+  // T/J/K/U use sibling 569 with a left-falling first stroke.
+  ...(["H", "N"] as const).map((source) => ({
+    unicode: 0x671e,
+    source,
+    referenceId: 504,
+    replacementId: 504,
+  })),
+  ...(["T", "J", "K", "U"] as const).map((source) => ({
+    unicode: 0x671e,
+    source,
+    referenceId: 504,
+    replacementId: 569,
+  })),
+
+  // U+6485 撅: KP(N) uses 厥 127248, whose inner left child contains the
+  // outward-opening 八 117. G/H/T/J/K/V use 5384 with inner child 934.
+  ...(["H", "T", "J", "K", "V"] as const).map((source) => ({
+    unicode: 0x6485,
+    source,
+    referenceId: 5384,
+    replacementId: 5384,
+  })),
+  {
+    unicode: 0x6485,
+    source: "N",
+    referenceId: 5384,
+    replacementId: 127248,
+  },
+
+  // U+808E 肎: G/KP(N) use 月 504 (竖 first stroke); J/K use 569 (撇).
+  // T uses the existing third sibling 579 = 撇、横折钩、点、横, where the
+  // PDF's inner 点/捺 and 提 are covered by 点=捺 and 横=提.
+  {
+    unicode: 0x808e,
+    source: "N",
+    referenceId: 504,
+    replacementId: 504,
+  },
+  ...(["J", "K"] as const).map((source) => ({
+    unicode: 0x808e,
+    source,
+    referenceId: 504,
+    replacementId: 569,
+  })),
+  {
+    unicode: 0x808e,
+    source: "T",
+    referenceId: 504,
+    replacementId: 579,
+  },
+
+  // U+7527 甧: G/J use 月 504 with a vertical first stroke; T uses 569
+  // with a left-falling first stroke.
+  {
+    unicode: 0x7527,
+    source: "J",
+    referenceId: 504,
+    replacementId: 504,
+  },
+  {
+    unicode: 0x7527,
+    source: "T",
+    referenceId: 504,
+    replacementId: 569,
+  },
+
+  // U+67ED 柭: G/KP(N) use 4929 = ⿸(247, 188), whose inner first stroke
+  // starts with a short horizontal segment. H/T/J/K use 4930 = ⿸(247, 118)
+  // with a separate 撇 and no horizontal lead-in.
+  {
+    unicode: 0x67ed,
+    source: "N",
+    referenceId: 4929,
+    replacementId: 4929,
+  },
+  ...(["H", "T", "J", "K"] as const).map((source) => ({
+    unicode: 0x67ed,
+    source,
+    referenceId: 4929,
+    replacementId: 4930,
+  })),
 ].map((decision) => ({ ...decision, provenance: "manual" }));

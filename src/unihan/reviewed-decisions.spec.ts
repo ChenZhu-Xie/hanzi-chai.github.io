@@ -372,3 +372,379 @@ test("splits U+6709 月 into the reviewed T and non-T variants", () => {
     V: 6445,
   });
 });
+
+test("splits U+6752 刃 into J 395 and T 397", () => {
+  const glyphs: 基本字形数据[] = [448, 395, 397].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 18722,
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 448 }, { id: 395 }],
+    ambiguous: false,
+  });
+  const evidence = new Map(
+    ["T", "J"].map((source) => [
+      source,
+      new Map([[448, new Map([[448, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x6752,
+      glyphs: [{ id: 18722, sources: ["G", "T", "J"] }],
+    },
+    ["T", "J"],
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    T: { existingGlyphId: undefined, references: [448, 397] },
+    J: { existingGlyphId: 18722, references: [448, 395] },
+  });
+});
+
+test("splits U+671E 月 into vertical G H N and left-falling T J K U", () => {
+  const glyphs: 基本字形数据[] = [4276, 504, 569].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 18683,
+    type: "compound",
+    operator: "⿱",
+    references: [{ id: 4276 }, { id: 504 }],
+    ambiguous: false,
+  });
+  const sources = ["H", "T", "J", "K", "N", "U"];
+  const evidence = new Map(
+    sources.map((source) => [
+      source,
+      new Map([[4276, new Map([[4276, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x671e,
+      glyphs: [{ id: 18683, sources: ["G", ...sources] }],
+    },
+    sources,
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    H: { existingGlyphId: 18683, references: [4276, 504] },
+    T: { existingGlyphId: undefined, references: [4276, 569] },
+    J: { existingGlyphId: undefined, references: [4276, 569] },
+    K: { existingGlyphId: undefined, references: [4276, 569] },
+    N: { existingGlyphId: 18683, references: [4276, 504] },
+    U: { existingGlyphId: undefined, references: [4276, 569] },
+  });
+});
+
+test("splits U+6485 厥 into KP 127248 and all other sources 5384", () => {
+  const components: 基本字形数据[] = [220, 71, 5385, 127247].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  const glyphs: 基本字形数据[] = [
+    ...components,
+    {
+      id: 5384,
+      type: "compound",
+      operator: "⿸",
+      references: [{ id: 71 }, { id: 5385 }],
+      ambiguous: false,
+    },
+    {
+      id: 127248,
+      type: "compound",
+      operator: "⿸",
+      references: [{ id: 71 }, { id: 127247 }],
+      ambiguous: false,
+    },
+    {
+      id: 18088,
+      type: "compound",
+      operator: "⿰",
+      references: [{ id: 220 }, { id: 5384 }],
+      ambiguous: false,
+    },
+  ];
+  const sources = ["H", "T", "J", "K", "N", "V"];
+  const evidence = new Map(
+    sources.map((source) => [
+      source,
+      new Map([[220, new Map([[220, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x6485,
+      glyphs: [{ id: 18088, sources: ["G", ...sources] }],
+    },
+    sources,
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    H: { existingGlyphId: 18088, references: [220, 5384] },
+    T: { existingGlyphId: 18088, references: [220, 5384] },
+    J: { existingGlyphId: 18088, references: [220, 5384] },
+    K: { existingGlyphId: 18088, references: [220, 5384] },
+    N: { existingGlyphId: undefined, references: [220, 127248] },
+    V: { existingGlyphId: 18088, references: [220, 5384] },
+  });
+});
+
+test("splits U+808E 月 into vertical 504, left-falling 569, and dotted 579", () => {
+  const glyphs: 基本字形数据[] = [155, 504, 569, 579].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 24813,
+    type: "compound",
+    operator: "⿱",
+    references: [{ id: 155 }, { id: 504 }],
+    ambiguous: false,
+  });
+  const sources = ["T", "J", "K", "N"];
+  const evidence = new Map(
+    sources.map((source) => [
+      source,
+      new Map([[155, new Map([[155, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x808e,
+      glyphs: [{ id: 24813, sources: ["G", ...sources] }],
+    },
+    sources,
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    T: { existingGlyphId: undefined, references: [155, 579] },
+    J: { existingGlyphId: undefined, references: [155, 569] },
+    K: { existingGlyphId: undefined, references: [155, 569] },
+    N: { existingGlyphId: 24813, references: [155, 504] },
+  });
+});
+
+test("splits U+7527 月 into vertical G J and left-falling T", () => {
+  const glyphs: 基本字形数据[] = [8688, 504, 569].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 22146,
+    type: "compound",
+    operator: "⿱",
+    references: [{ id: 8688 }, { id: 504 }],
+    ambiguous: false,
+  });
+  const evidence = new Map(
+    ["T", "J"].map((source) => [
+      source,
+      new Map([[8688, new Map([[8688, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x7527,
+      glyphs: [{ id: 22146, sources: ["G", "T", "J"] }],
+    },
+    ["T", "J"],
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    T: { existingGlyphId: undefined, references: [8688, 569] },
+    J: { existingGlyphId: 22146, references: [8688, 504] },
+  });
+});
+
+test("splits U+67ED right component into KP 4929 and H T J K 4930", () => {
+  const glyphs: 基本字形数据[] = [448, 4929, 4930].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 18856,
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 448 }, { id: 4929 }],
+    ambiguous: false,
+  });
+  const sources = ["H", "T", "J", "K", "N"];
+  const evidence = new Map(
+    sources.map((source) => [
+      source,
+      new Map([[448, new Map([[448, new Set([1, 2, 3])]])]]),
+    ]),
+  );
+  const result = recommendMissingSources(
+    {
+      unicode: 0x67ed,
+      glyphs: [{ id: 18856, sources: ["G", ...sources] }],
+    },
+    sources,
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    H: { existingGlyphId: undefined, references: [448, 4930] },
+    T: { existingGlyphId: undefined, references: [448, 4930] },
+    J: { existingGlyphId: undefined, references: [448, 4930] },
+    K: { existingGlyphId: undefined, references: [448, 4930] },
+    N: { existingGlyphId: 18856, references: [448, 4929] },
+  });
+});

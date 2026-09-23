@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util";
-import { type 基本字形数据, type 字符数据, 字形库 } from "hanzi-chai";
+import { type 基本字形数据, 字形库, type 字符数据 } from "hanzi-chai";
+import { glyphToSvgMarkup } from "../src/components/glyph-svg";
 import { isRecommendationSample } from "../src/unihan";
 
 const { values } = parseArgs({
@@ -29,6 +30,12 @@ for (const character of characters) {
     }),
   );
   if (Object.keys(candidates).length !== ids.length) continue;
+  const candidateSvgs = Object.fromEntries(
+    ids.flatMap((id) => {
+      const glyph = library.获取字形(id);
+      return glyph ? [[id, glyphToSvgMarkup(glyph.图形盒子)] as const] : [];
+    }),
+  );
   rows.push({
     unicode: character.unicode,
     sourceGlyphs: Object.fromEntries(
@@ -37,6 +44,7 @@ for (const character of characters) {
       ),
     ),
     candidates,
+    candidateSvgs,
   });
 }
 
