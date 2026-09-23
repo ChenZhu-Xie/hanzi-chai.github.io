@@ -86,4 +86,42 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 4213,
     replacementId: 4213,
   })),
+
+  // U+65E6 旦: every source keeps the semantic 日 component (506), not the
+  // visually similar compound 冒字头 (4098).
+  ...(["H", "T", "J", "K", "N", "V"] as const).map((source) => ({
+    unicode: 0x65e6,
+    source,
+    referenceId: 506,
+    replacementId: 506,
+  })),
+
+  // High-yield identity decisions visually confirmed by the maintainer.
+  // U+6A22 樢: G/T/J/K/KP(N) all keep 鳥 (4199).
+  ...(["T", "J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6a22,
+    source,
+    referenceId: 4199,
+    replacementId: 4199,
+  })),
+  { unicode: 0x6536, source: "V", referenceId: 545, replacementId: 545 },
+  { unicode: 0x6599, source: "V", referenceId: 933, replacementId: 933 },
+  { unicode: 0x887e, source: "N", referenceId: 921, replacementId: 921 },
+  { unicode: 0x73e4, source: "K", referenceId: 890, replacementId: 890 },
+
+  // U+6637 昷: G/T/J/K/KP(N) all keep the bottom 皿 component (744).
+  ...(["T", "J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6637,
+    source,
+    referenceId: 744,
+    replacementId: 744,
+  })),
+
+  // U+6903 椃: H uses 虎 126882 = ⿸(866, 128), not G's 4109.
+  {
+    unicode: 0x6903,
+    source: "H",
+    referenceId: 4109,
+    replacementId: 126882,
+  },
 ].map((decision) => ({ ...decision, provenance: "manual" }));

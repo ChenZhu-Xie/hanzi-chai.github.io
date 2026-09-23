@@ -394,6 +394,75 @@ describe("recommendation safety", () => {
     ]);
   });
 
+  test("accepts two uncontested identity examples only when no sibling is known", () => {
+    const twoIdentitySamples: 字符数据[] = [0x4e30, 0x4e31].map(
+      (unicode) => ({
+        unicode,
+        glyphs: [{ id: 100, sources: ["G", "T"] }],
+      }),
+    );
+    const evidence = buildSourceEvidenceIndex(twoIdentitySamples, glyphs);
+    const accepted = recommendMissingSources(
+      candidate,
+      ["T"],
+      glyphs,
+      evidence,
+      3,
+      2,
+      undefined,
+      undefined,
+      [],
+      new Set(),
+    );
+    expect(accepted.unresolvedSources).toEqual([]);
+    expect(accepted.proposals[0]?.evidence).toEqual([
+      expect.objectContaining({
+        referenceId: 1,
+        replacementId: 1,
+        reliable: true,
+        uncontestedIdentity: true,
+      }),
+      expect.objectContaining({
+        referenceId: 3,
+        replacementId: 3,
+        reliable: true,
+        uncontestedIdentity: true,
+      }),
+    ]);
+
+    const siblingKnown = recommendMissingSources(
+      candidate,
+      ["T"],
+      glyphs,
+      evidence,
+      3,
+      2,
+      undefined,
+      undefined,
+      [],
+      new Set([1]),
+    );
+    expect(siblingKnown.unresolvedSources).toEqual(["T"]);
+
+    const twoReplacementSamples = buildSourceEvidenceIndex(
+      reviewedSamples.slice(0, 2),
+      glyphs,
+    );
+    const replacement = recommendMissingSources(
+      candidate,
+      ["T"],
+      glyphs,
+      twoReplacementSamples,
+      3,
+      2,
+      undefined,
+      undefined,
+      [],
+      new Set(),
+    );
+    expect(replacement.unresolvedSources).toEqual(["T"]);
+  });
+
   test("recommends a reviewed sibling for an indecomposable component", () => {
     const reviewedComponents: 字符数据[] = [0x4e40, 0x4e41, 0x4e42].map(
       (unicode) => ({

@@ -11,6 +11,7 @@ export const CJK_UNIFIED_END = 0x9fff;
 export const SUPPORTED_UNIHAN_VERSION = "18.0.0";
 export const DEFAULT_MINIMUM_EVIDENCE = 3;
 export const DEFAULT_MINIMUM_DOMINANCE = 2;
+export const MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE = 2;
 
 export const IRG_PROPERTY_TO_SOURCE = new Map<string, string>([
   ["kIRG_GSource", "G"],
@@ -52,6 +53,8 @@ export interface RecommendationEvidence {
   count: number;
   reliable: boolean;
   reviewed?: boolean;
+  /** Accepted with two identity examples because no sibling competes. */
+  uncontestedIdentity?: boolean;
   alternatives: { id: number; count: number; examples: number[] }[];
   /** Nested evidence used to resolve this top-level reference recursively. */
   basis?: RecommendationEvidence[];
@@ -107,6 +110,7 @@ export interface UnihanAudit {
     generatedAt: string;
     minimumEvidence: number;
     minimumDominance: number;
+    minimumUncontestedIdentityEvidence: number;
     reviewedDecisions: ReviewedSourceDecision[];
   };
   summary: UnihanAuditSummary;
@@ -483,6 +487,7 @@ function makeRecommendationEvidence(
   minimumEvidence: number,
   minimumDominance: number,
   reviewedDecision?: ReviewedSourceDecision,
+  allowUncontestedIdentity = false,
 ): RecommendationEvidence {
   const alternatives = [...(replacements ?? [])]
     .map(([id, examples]) => ({
@@ -516,16 +521,23 @@ function makeRecommendationEvidence(
   }
   const winner = alternatives[0];
   const runnerUp = alternatives[1];
-  const reliable =
+  const meetsStandardThreshold =
     winner !== undefined &&
     winner.count >= minimumEvidence &&
     (runnerUp === undefined ||
       winner.count >= runnerUp.count * minimumDominance);
+  const uncontestedIdentity =
+    !meetsStandardThreshold &&
+    allowUncontestedIdentity &&
+    winner?.id === referenceId &&
+    winner.count >= MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE &&
+    alternatives.length === 1;
   return {
     referenceId,
     replacementId: winner?.id,
     count: winner?.count ?? 0,
-    reliable,
+    reliable: meetsStandardThreshold || uncontestedIdentity,
+    uncontestedIdentity: uncontestedIdentity || undefined,
     alternatives,
   };
 }
@@ -538,6 +550,7 @@ function resolveReferenceRecursively(
   minimumEvidence: number,
   minimumDominance: number,
   reviewedDecisions: ReadonlyMap<number, ReviewedSourceDecision>,
+  knownSiblingIds?: ReadonlySet<number>,
   depth = 0,
   seen = new Set<number>(),
 ): { id: number; evidence: RecommendationEvidence } | undefined {
@@ -549,6 +562,7 @@ function resolveReferenceRecursively(
     minimumEvidence,
     minimumDominance,
     reviewedDecisions.get(referenceId),
+    knownSiblingIds !== undefined && !knownSiblingIds.has(referenceId),
   );
   if (
     direct.reliable &&
@@ -568,6 +582,7 @@ function resolveReferenceRecursively(
       minimumEvidence,
       minimumDominance,
       reviewedDecisions,
+      knownSiblingIds,
       depth + 1,
       nextSeen,
     ),
@@ -630,6 +645,7 @@ export function recommendMissingSources(
   existingGlyphIndex?: GlyphIndex,
   glyphEvidenceIndex = buildGlyphEvidenceIndex([character], glyphs),
   reviewedDecisions: ReviewedSourceDecision[] = [],
+  knownSiblingIds?: ReadonlySet<number>,
 ): {
   proposals: UnihanGlyphProposal[];
   unresolvedSources: string[];
@@ -668,6 +684,8 @@ export function recommendMissingSources(
         minimumEvidence,
         minimumDominance,
         sourceReviews.get(referenceGlyph.id),
+        knownSiblingIds !== undefined &&
+          !knownSiblingIds.has(referenceGlyph.id),
       );
       const winner = evidence.replacementId
         ? glyphIndex.byId.get(evidence.replacementId)
@@ -698,6 +716,7 @@ export function recommendMissingSources(
         minimumEvidence,
         minimumDominance,
         sourceReviews.get(reference.id),
+        knownSiblingIds !== undefined && !knownSiblingIds.has(reference.id),
       );
       const recursive = componentEvidence.reliable
         ? undefined
@@ -709,6 +728,7 @@ export function recommendMissingSources(
             minimumEvidence,
             minimumDominance,
             sourceReviews,
+            knownSiblingIds,
           );
       if (recursive) {
         evidence.push(recursive.evidence);
@@ -857,6 +877,42 @@ export function auditUnihanSources(
     glyphs,
   );
   const glyphEvidenceIndex = buildGlyphEvidenceIndex(characters, glyphs);
+  const knownSiblingIndex = buildReviewedGlyphSiblingIndex(characters, glyphs);
+  const knownSiblingIds = new Set<number>();
+  const markKnownSiblingTree = (
+    referenceId: number,
+    replacementId: number,
+    depth = 0,
+  ) => {
+    if (depth > 10 || referenceId === replacementId) return;
+    knownSiblingIds.add(referenceId);
+    knownSiblingIds.add(replacementId);
+    const reference = glyphIndex.byId.get(referenceId);
+    const replacement = glyphIndex.byId.get(replacementId);
+    if (
+      reference?.type !== "compound" ||
+      replacement?.type !== "compound" ||
+      reference.operator !== replacement.operator ||
+      reference.references.length !== replacement.references.length
+    ) {
+      return;
+    }
+    for (let index = 0; index < reference.references.length; index++) {
+      markKnownSiblingTree(
+        reference.references[index]!.id,
+        replacement.references[index]!.id,
+        depth + 1,
+      );
+    }
+  };
+  for (const [referenceId, siblings] of knownSiblingIndex) {
+    for (const sibling of siblings) {
+      markKnownSiblingTree(referenceId, sibling.id);
+    }
+  }
+  for (const decision of options.reviewedDecisions ?? []) {
+    markKnownSiblingTree(decision.referenceId, decision.replacementId);
+  }
   const summary: UnihanAuditSummary = {
     scanned: 0,
     hasNonG: 0,
@@ -920,6 +976,7 @@ export function auditUnihanSources(
         glyphIndex,
         glyphEvidenceIndex,
         options.reviewedDecisions ?? [],
+        knownSiblingIds,
       );
       proposals = recommendation.proposals;
       unresolved = recommendation.unresolved;
@@ -938,7 +995,7 @@ export function auditUnihanSources(
           missingSources.length > 0
         ) {
           status = "safe-candidate";
-          reason = `每个目标来源的完整拆分都可由已完成区间或当前字符的维护者确认推导；统计项至少有 ${minimumEvidence} 个独立字符证据，且第一名至少是第二名的 ${minimumDominance} 倍。`;
+          reason = `每个目标来源的完整拆分都可由已完成区间或当前字符的维护者确认推导；统计项通常至少有 ${minimumEvidence} 个独立字符证据，且第一名至少是第二名的 ${minimumDominance} 倍；无已知兄弟且无竞争者的原部件保持可由 ${MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE} 个独立样本确认。`;
         } else {
           status = "already-complete";
           reason =
@@ -981,6 +1038,8 @@ export function auditUnihanSources(
       generatedAt: new Date().toISOString(),
       minimumEvidence,
       minimumDominance,
+      minimumUncontestedIdentityEvidence:
+        MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE,
       reviewedDecisions: (options.reviewedDecisions ?? []).map((decision) => ({
         ...decision,
       })),
