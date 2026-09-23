@@ -567,7 +567,7 @@ export default function UnihanSourceRecommendation() {
           type="info"
           showIcon
           message="Unihan_IRGSources.txt 决定 source membership；PDF 只用于视觉核对。Dry-run 不会发起写请求。"
-          description={`审计还会使用 ${REVIEWED_SOURCE_DECISIONS.length} 条已逐项视觉确认的最小部件决策；它们不会单独触发写入。`}
+          description={`审计还会使用 ${REVIEWED_SOURCE_DECISIONS.length} 条已逐项视觉确认的最小部件决策；它们不会单独触发写入。当前不因字体细节新建兄弟部件：横／提、点／捺、竖／竖钩、竖弯钩／竖提可留作将来的条件变体。`}
         />
         {feedback && (
           <Alert

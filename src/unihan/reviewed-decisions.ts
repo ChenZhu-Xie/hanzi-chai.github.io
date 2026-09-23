@@ -54,4 +54,36 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     replacementId: 127075,
   },
   { unicode: 0x649b, source: "V", referenceId: 4726, replacementId: 4726 },
+
+  // U+660E 明: V keeps the same 月 component (569) as the other forms.
+  { unicode: 0x660e, source: "V", referenceId: 569, replacementId: 569 },
+
+  // U+6BA6 殦: H keeps the same 鳥 component (4199) as the other forms.
+  { unicode: 0x6ba6, source: "H", referenceId: 4199, replacementId: 4199 },
+
+  // U+6770 杰: H keeps the same bottom-four-dots component (605).
+  { unicode: 0x6770, source: "H", referenceId: 605, replacementId: 605 },
+
+  // U+6B3D 欽: the chart's final rising stroke is a conditional rendering
+  // detail. The current model keeps every source on the existing 金 (4174).
+  ...(["H", "T", "J", "K", "N", "V"] as const).map((source) => ({
+    unicode: 0x6b3d,
+    source,
+    referenceId: 4174,
+    replacementId: 4174,
+  })),
+
+  // U+6F76 潶: source-font differences in 三点水 and the four bottom dots
+  // do not create siblings while their stroke categories stay unchanged.
+  ...(["H", "T", "J", "K", "N"] as const).flatMap((source) => [
+    { unicode: 0x6f76, source, referenceId: 350, replacementId: 350 },
+    { unicode: 0x6f76, source, referenceId: 605, replacementId: 605 },
+  ]),
+  // Every source's 黑 was visually confirmed as 4213 = ⿱(1057, 605).
+  ...(["H", "T", "J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6f76,
+    source,
+    referenceId: 4213,
+    replacementId: 4213,
+  })),
 ].map((decision) => ({ ...decision, provenance: "manual" }));
