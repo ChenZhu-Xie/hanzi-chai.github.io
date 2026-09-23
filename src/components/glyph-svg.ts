@@ -1,4 +1,12 @@
-import type { N6, 图形盒子, 矢量笔画数据, 笔画名称, 绘制 } from "hanzi-chai";
+import type {
+  N6,
+  图形盒子,
+  向量,
+  基本字形数据,
+  矢量笔画数据,
+  笔画名称,
+  绘制,
+} from "hanzi-chai";
 import { isEqual } from "lodash-es";
 
 const drawLength = ({ command, parameterList }: 绘制) => {
@@ -127,15 +135,81 @@ export function strokeToSvgPath(
 }
 
 /** Render a glyph as a standalone SVG document for browser and CLI parity. */
-export function glyphToSvgMarkup(glyph: 图形盒子, displayMode = false) {
+export interface GlyphSvgOptions {
+  /** Scale the normal repository stroke width without changing geometry. */
+  strokeWidthScale?: number;
+  /** Mark every stroke start and segment boundary for human topology review. */
+  showStrokePoints?: boolean;
+  /** Optional per-stroke colors used by leaf-aware human review panels. */
+  strokeColors?: string[];
+}
+
+function strokeBoundaryPoints({
+  start,
+  curveList,
+}: 矢量笔画数据): 向量[] {
+  const points: 向量[] = [[...start]];
+  const current: 向量 = [...start];
+  for (const { command, parameterList } of curveList) {
+    if (command === "h") current[0] += parameterList[0];
+    else if (command === "v") current[1] += parameterList[0];
+    else if (command !== "a") {
+      const values = parameterList as N6;
+      current[0] += values[4];
+      current[1] += values[5];
+    }
+    points.push([...current]);
+  }
+  return points;
+}
+
+export function glyphToSvgMarkup(
+  glyph: 图形盒子,
+  displayMode = false,
+  options: GlyphSvgOptions = {},
+) {
   const strokes = glyph.获取笔画列表();
   const { strokeWidth, viewBox } = glyph.确定笔画粗细和视窗(displayMode);
-  const serializedStrokeWidth = Number(strokeWidth.toPrecision(12));
+  const serializedStrokeWidth = Number(
+    (strokeWidth * (options.strokeWidthScale ?? 1)).toPrecision(12),
+  );
   const paths = strokes
     .map(
       (stroke, index) =>
-        `<path d="${strokeToSvgPath(stroke, index, strokes)}" stroke="black" stroke-width="${serializedStrokeWidth}" fill="none" stroke-linecap="square"/>`,
+        `<path d="${strokeToSvgPath(stroke, index, strokes)}" stroke="${options.strokeColors?.[index] ?? "black"}" stroke-width="${serializedStrokeWidth}" fill="none" stroke-linecap="square"/>`,
     )
     .join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="100" height="100">${paths}</svg>`;
+  const points = options.showStrokePoints
+    ? strokes
+        .flatMap(strokeBoundaryPoints)
+        .map(
+          ([x, y]) =>
+            `<circle cx="${x}" cy="${y}" r="1.5" fill="red"/>`,
+        )
+        .join("")
+    : "";
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="100" height="100">${paths}${points}</svg>`;
+}
+
+/** Resolve each flattened stroke back to its terminal component ID. */
+export function glyphLeafStrokeIds(
+  id: number,
+  glyphById: ReadonlyMap<number, 基本字形数据>,
+  seen = new Set<number>(),
+): number[] {
+  if (seen.has(id)) throw new Error(`字形 ${id} 存在循环引用`);
+  const glyph = glyphById.get(id);
+  if (!glyph) throw new Error(`字形 ${id} 不存在`);
+  if (glyph.type === "component") return glyph.strokes.map(() => id);
+
+  const nextSeen = new Set(seen).add(id);
+  const parts = glyph.references.map(({ id: referenceId }) =>
+    glyphLeafStrokeIds(referenceId, glyphById, nextSeen),
+  );
+  if (!glyph.strokes?.length) return parts.flat();
+
+  return glyph.strokes.flatMap(({ index, from, to }) => {
+    const part = parts[index] ?? [];
+    return part.slice(from ?? 0, (to ?? part.length - 1) + 1);
+  });
 }
