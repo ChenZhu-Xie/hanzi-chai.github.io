@@ -7,6 +7,41 @@ import type { ReviewedSourceDecision } from "./index";
  * compatible parent without declaring an entire IRG source globally equal.
  */
 export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
+  // U+64CE 擎: H uses 敬 127089, whose smallest differing subtree is grass
+  // sibling 486 rather than G's 228. The lower 手 remains 529.
+  ...(["H", "T"] as const).flatMap((source) =>
+    ([
+      [6274, 127089],
+      [529, 529],
+    ] as const).map(([referenceId, replacementId]) => ({
+      unicode: 0x64ce,
+      source,
+      referenceId,
+      replacementId,
+    })),
+  ),
+  ...([
+    [6274, 6274],
+    [529, 529],
+  ] as const).map(([referenceId, replacementId]) => ({
+    unicode: 0x64ce,
+    source: "K" as const,
+    referenceId,
+    replacementId,
+  })),
+
+  // U+64CF 擏: H independently validates propagation from U+64CE. The left
+  // 手 stays 220 while the right 敬 changes from 6274 to 127089.
+  ...([
+    [220, 220],
+    [6274, 127089],
+  ] as const).map(([referenceId, replacementId]) => ({
+    unicode: 0x64cf,
+    source: "H" as const,
+    referenceId,
+    replacementId,
+  })),
+
   // U+7CA6 粦: G/H/T/KP(N) keep 4161 (leaf 255); J/K use 126982 (leaf 438).
   { unicode: 0x7ca6, source: "H", referenceId: 4161, replacementId: 4161 },
   { unicode: 0x7ca6, source: "T", referenceId: 4161, replacementId: 4161 },

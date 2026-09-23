@@ -748,3 +748,125 @@ test("splits U+67ED right component into KP 4929 and H T J K 4930", () => {
     N: { existingGlyphId: 18856, references: [448, 4929] },
   });
 });
+
+test("uses grass sibling 486 in H/T 擎 and keeps 228 in K", () => {
+  const component = (id: number): 基本字形数据 => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  });
+  const glyphs: 基本字形数据[] = [228, 486, 4274, 545, 529].map(component);
+  glyphs.push(
+    {
+      id: 6275,
+      type: "compound",
+      operator: "⿱",
+      references: [{ id: 228 }, { id: 4274 }],
+      ambiguous: false,
+    },
+    {
+      id: 25376,
+      type: "compound",
+      operator: "⿱",
+      references: [{ id: 486 }, { id: 4274 }],
+      ambiguous: false,
+    },
+    {
+      id: 6274,
+      type: "compound",
+      operator: "⿰",
+      references: [{ id: 6275 }, { id: 545 }],
+      ambiguous: false,
+    },
+    {
+      id: 127089,
+      type: "compound",
+      operator: "⿰",
+      references: [{ id: 25376 }, { id: 545 }],
+      ambiguous: false,
+    },
+    {
+      id: 18168,
+      type: "compound",
+      operator: "⿱",
+      references: [{ id: 6274 }, { id: 529 }],
+      ambiguous: false,
+    },
+  );
+
+  const result = recommendMissingSources(
+    {
+      unicode: 0x64ce,
+      glyphs: [{ id: 18168, sources: ["G", "H", "T", "K"] }],
+    },
+    ["H", "T", "K"],
+    glyphs,
+    new Map(),
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(result.proposals).toHaveLength(3);
+  expect(
+    Object.fromEntries(
+      result.proposals.map(({ source, existingGlyphId, glyph }) => [
+        source,
+        {
+          existingGlyphId,
+          references:
+            glyph.type === "compound"
+              ? glyph.references.map(({ id }) => id)
+              : [],
+        },
+      ]),
+    ),
+  ).toEqual({
+    H: { existingGlyphId: undefined, references: [127089, 529] },
+    T: { existingGlyphId: undefined, references: [127089, 529] },
+    K: { existingGlyphId: 18168, references: [6274, 529] },
+  });
+});
+
+test("propagates the reviewed H-source 敬 sibling into U+64CF 擏", () => {
+  const glyphs: 基本字形数据[] = [220, 6274, 127089].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 18169,
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 220 }, { id: 6274 }],
+    ambiguous: false,
+  });
+
+  const result = recommendMissingSources(
+    { unicode: 0x64cf, glyphs: [{ id: 18169, sources: ["G", "H"] }] },
+    ["H"],
+    glyphs,
+    new Map(),
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(result.proposals[0]?.glyph).toMatchObject({
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 220 }, { id: 127089 }],
+  });
+});
