@@ -407,4 +407,13 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 4929,
     replacementId: 4930,
   })),
+
+  // U+82C6 苆: the J-source grass top has one horizontal crossing both
+  // verticals, so it keeps component 228 rather than siblings 437 or 486.
+  {
+    unicode: 0x82c6,
+    source: "J",
+    referenceId: 228,
+    replacementId: 228,
+  },
 ].map((decision) => ({ ...decision, provenance: "manual" }));
