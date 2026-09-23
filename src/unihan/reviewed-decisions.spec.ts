@@ -850,7 +850,6 @@ test("propagates the reviewed H-source 敬 sibling into U+64CF 擏", () => {
     references: [{ id: 220 }, { id: 6274 }],
     ambiguous: false,
   });
-
   const result = recommendMissingSources(
     { unicode: 0x64cf, glyphs: [{ id: 18169, sources: ["G", "H"] }] },
     ["H"],
@@ -963,4 +962,100 @@ test("uses 角 4110 in the reviewed H/T/J/K sources of U+659B 斛", () => {
       references: [{ id: 4110 }, { id: 602 }],
     });
   }
+});
+
+test("uses 韋 126927 with bottom 438 in the reviewed J-source U+6690 暐", () => {
+  const glyphs: 基本字形数据[] = [506, 255, 438].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push(
+    {
+      id: 4179,
+      type: "compound",
+      operator: "⿳",
+      references: [{ id: 379 }, { id: 282 }, { id: 255 }],
+      ambiguous: false,
+    },
+    {
+      id: 126927,
+      type: "compound",
+      operator: "⿳",
+      references: [{ id: 379 }, { id: 282 }, { id: 438 }],
+      ambiguous: false,
+    },
+    {
+      id: 18559,
+      type: "compound",
+      operator: "⿰",
+      references: [{ id: 506 }, { id: 4179 }],
+      ambiguous: false,
+    },
+  );
+  const evidence = new Map([
+    ["J", new Map([[506, new Map([[506, new Set([1, 2, 3])]])]])],
+  ]);
+
+  const result = recommendMissingSources(
+    { unicode: 0x6690, glyphs: [{ id: 18559, sources: ["G", "J"] }] },
+    ["J"],
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(result.proposals[0]?.glyph).toMatchObject({
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 506 }, { id: 126927 }],
+  });
+});
+
+test("uses split upper component 62022 in the reviewed J-source U+7740 着", () => {
+  const glyphs: 基本字形数据[] = [928, 62022, 712].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 18132,
+    type: "compound",
+    operator: "⿸",
+    references: [{ id: 928 }, { id: 712 }],
+    ambiguous: false,
+  });
+  const evidence = new Map([
+    ["J", new Map([[712, new Map([[712, new Set([1, 2, 3])]])]])],
+  ]);
+
+  const result = recommendMissingSources(
+    { unicode: 0x7740, glyphs: [{ id: 18132, sources: ["G", "J"] }] },
+    ["J"],
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(result.proposals[0]?.glyph).toMatchObject({
+    type: "compound",
+    operator: "⿸",
+    references: [{ id: 62022 }, { id: 712 }],
+  });
 });

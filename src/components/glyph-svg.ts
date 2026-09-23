@@ -142,6 +142,8 @@ export interface GlyphSvgOptions {
   showStrokePoints?: boolean;
   /** Optional per-stroke colors used by leaf-aware human review panels. */
   strokeColors?: string[];
+  /** Omit non-target strokes while retaining the full glyph coordinate box. */
+  strokeVisibility?: boolean[];
 }
 
 function strokeBoundaryPoints({
@@ -176,12 +178,18 @@ export function glyphToSvgMarkup(
   const paths = strokes
     .map(
       (stroke, index) =>
-        `<path d="${strokeToSvgPath(stroke, index, strokes)}" stroke="${options.strokeColors?.[index] ?? "black"}" stroke-width="${serializedStrokeWidth}" fill="none" stroke-linecap="square"/>`,
+        options.strokeVisibility?.[index] === false
+          ? ""
+          : `<path d="${strokeToSvgPath(stroke, index, strokes)}" stroke="${options.strokeColors?.[index] ?? "black"}" stroke-width="${serializedStrokeWidth}" fill="none" stroke-linecap="square"/>`,
     )
     .join("");
   const points = options.showStrokePoints
     ? strokes
-        .flatMap(strokeBoundaryPoints)
+        .flatMap((stroke, index) =>
+          options.strokeVisibility?.[index] === false
+            ? []
+            : strokeBoundaryPoints(stroke),
+        )
         .map(
           ([x, y]) =>
             `<circle cx="${x}" cy="${y}" r="1.5" fill="red"/>`,

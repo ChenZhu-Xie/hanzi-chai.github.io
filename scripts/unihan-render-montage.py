@@ -156,6 +156,228 @@ def topology_points(binary: np.ndarray):
     return endpoints, junctions, skeleton
 
 
+def _cluster_axis(values: list[float], maximum_gap: float) -> list[float]:
+    """Collapse nearby raster detections into one geometric location."""
+    if not values:
+        return []
+    groups = [[value] for value in sorted(values)]
+    merged = [groups[0]]
+    for group in groups[1:]:
+        if group[0] - merged[-1][-1] <= maximum_gap:
+            merged[-1].extend(group)
+        else:
+            merged.append(group)
+    return [float(np.mean(group)) for group in merged]
+
+
+def _branch_angle_at(
+    skeleton: np.ndarray, x: float, y: float, radius_x=10, radius_y=18
+) -> float | None:
+    """Estimate a crossing branch angle after excluding the horizontal itself."""
+    points = np.argwhere(skeleton)
+    if not points.size:
+        return None
+    dy = points[:, 0] - y
+    dx = points[:, 1] - x
+    local = points[
+        (np.abs(dx) <= radius_x)
+        & (np.abs(dy) <= radius_y)
+        & (np.abs(dy) >= 4)
+    ]
+    if len(local) < 6:
+        return None
+    coordinates = np.column_stack((local[:, 1], local[:, 0])).astype(float)
+    coordinates -= coordinates.mean(axis=0)
+    covariance = np.cov(coordinates, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    angle = abs(float(np.degrees(np.arctan2(direction[1], direction[0]))))
+    return min(angle, 180 - angle)
+
+
+def horizontal_crossing_evidence(binary: np.ndarray) -> dict:
+    """Find offset stroke crossings on a long horizontal skeleton segment.
+
+    This intentionally measures local topology only. Overall contour curvature is
+    not returned: a direct falling stroke and a vertical-plus-falling pair both
+    produce a curved outer silhouette, so that feature cannot distinguish them.
+    """
+    _endpoints, junctions, skeleton = topology_points(binary)
+    height, width = skeleton.shape
+    # A horizontal opening recovers the complete ink band even when crossings
+    # split a one-pixel Hough segment. This matters for the two intersections in
+    # U+7740 J, where treating each fragment separately hides the left crossing.
+    horizontal_mask = cv2.morphologyEx(
+        binary.astype(np.uint8),
+        cv2.MORPH_OPEN,
+        np.ones((1, max(9, round(width * 0.08))), dtype=np.uint8),
+    )
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        horizontal_mask, 8
+    )
+    horizontal_lines = [
+        {
+            "left": float(stats[label, cv2.CC_STAT_LEFT]),
+            "right": float(
+                stats[label, cv2.CC_STAT_LEFT] + stats[label, cv2.CC_STAT_WIDTH] - 1
+            ),
+            "y": float(centroids[label][1]),
+        }
+        for label in range(1, count)
+        if stats[label, cv2.CC_STAT_WIDTH] >= width * 0.18
+        and stats[label, cv2.CC_STAT_WIDTH]
+        >= stats[label, cv2.CC_STAT_HEIGHT] * 3
+    ]
+    if not horizontal_lines:
+        return {"decision": "abstain", "reason": "no-long-horizontal"}
+
+    rows: list[dict] = []
+    for line in sorted(horizontal_lines, key=lambda item: item["y"]):
+        target = next(
+            (
+                row
+                for row in rows
+                if abs(row["y"] - line["y"]) <= 5
+                and line["left"] <= row["right"] + 18
+                and line["right"] >= row["left"] - 18
+            ),
+            None,
+        )
+        if target is None:
+            rows.append(dict(line))
+        else:
+            target["left"] = min(target["left"], line["left"])
+            target["right"] = max(target["right"], line["right"])
+            target["y"] = (target["y"] + line["y"]) / 2
+
+    candidates = []
+    for row in rows:
+        span = row["right"] - row["left"]
+        if span < width * 0.18 or not height * 0.3 <= row["y"] <= height * 0.72:
+            continue
+        # Junction dilation also marks decorated line ends. They are not stroke
+        # crossings, so only accept points safely inside the horizontal span.
+        interior_margin = max(8, span * 0.12)
+        crossing_xs = _cluster_axis(
+            [
+                float(x)
+                for x, y in junctions
+                if row["left"] + interior_margin <= x <= row["right"] - interior_margin
+                and abs(y - row["y"]) <= 10
+            ],
+            max(7, width * 0.045),
+        )
+        angles = [
+            _branch_angle_at(skeleton, x, row["y"]) for x in crossing_xs
+        ]
+        candidates.append(
+            {
+                "horizontalY": round(row["y"], 1),
+                "horizontalSpan": [round(row["left"], 1), round(row["right"], 1)],
+                "crossingXs": [round(value, 1) for value in crossing_xs],
+                "crossingAngles": [
+                    None if angle is None else round(angle, 1) for angle in angles
+                ],
+            }
+        )
+
+    qualified = [
+        row
+        for row in candidates
+        if len(row["crossingXs"]) >= 2
+        and row["crossingXs"][-1] - row["crossingXs"][0] >= width * 0.08
+        and any(
+            angle is not None and angle >= 72 for angle in row["crossingAngles"]
+        )
+    ]
+    if not qualified:
+        return {
+            "decision": "abstain",
+            "reason": "no-stable-offset-double-crossing",
+            "rows": candidates,
+        }
+    best = max(
+        qualified,
+        key=lambda row: (
+            len(row["crossingXs"]),
+            row["crossingXs"][-1] - row["crossingXs"][0],
+            row["horizontalY"],
+        ),
+    )
+    return {
+        "decision": "split-vertical-and-falling-strokes",
+        "reason": "offset-crossings-with-near-orthogonal-branch",
+        **best,
+    }
+
+
+def horizontal_crossing_consensus(image: Image.Image) -> dict:
+    """Require the local-topology conclusion to survive threshold changes."""
+    gray = np.asarray(image.convert("L"))
+    thresholds = (128, 160, 192)
+    trials = [horizontal_crossing_evidence(gray < value) for value in thresholds]
+    positive = [
+        trial
+        for trial in trials
+        if trial["decision"] == "split-vertical-and-falling-strokes"
+    ]
+    groups: list[list[dict]] = []
+    for trial in positive:
+        matching = next(
+            (
+                group
+                for group in groups
+                if abs(group[0]["horizontalY"] - trial["horizontalY"])
+                <= image.height * 0.06
+                and abs(group[0]["crossingXs"][0] - trial["crossingXs"][0])
+                <= image.width * 0.08
+                and abs(group[0]["crossingXs"][-1] - trial["crossingXs"][-1])
+                <= image.width * 0.08
+            ),
+            None,
+        )
+        if matching is None:
+            groups.append([trial])
+        else:
+            matching.append(trial)
+    stable = max(groups, key=len, default=[])
+    decision = "split-vertical-and-falling-strokes" if len(stable) >= 2 else "abstain"
+    return {
+        "decision": decision,
+        "consensus": f"{len(stable)}/{len(thresholds)}",
+        "stableEvidence": stable[0] if stable else None,
+        "trials": [
+            {"threshold": threshold, **trial}
+            for threshold, trial in zip(thresholds, trials)
+        ],
+    }
+
+
+def choose_split_stroke_candidate(pdf_evidence: dict, candidate_topology: dict) -> dict:
+    """Match PDF local topology to repository stroke identity, or abstain."""
+    if pdf_evidence.get("decision") != "split-vertical-and-falling-strokes":
+        return {"decision": "abstain", "reason": "pdf-topology-not-stable"}
+    matches = [
+        int(candidate_id)
+        for candidate_id, structures in candidate_topology.items()
+        if any(
+            structure.get("hasSeparateVerticalAndFallingLeaves")
+            for structure in structures
+        )
+    ]
+    if len(matches) != 1:
+        return {
+            "decision": "abstain",
+            "reason": "candidate-structure-not-unique",
+            "matchingCandidateIds": matches,
+        }
+    return {
+        "decision": "candidate",
+        "candidateId": matches[0],
+        "reason": "stable-offset-crossings-match-separate-vertical-and-falling-leaves",
+    }
+
+
 def topology_panel(image: Image.Image) -> Image.Image:
     gray = np.asarray(image.convert("L"))
     endpoints, junctions, skeleton = topology_points(gray < 224)
@@ -180,6 +402,7 @@ def topology_signature(image: Image.Image):
         "components": int(components),
         "endpoints": len(endpoints),
         "junctions": len(junctions),
+        "horizontalCrossingEvidence": horizontal_crossing_consensus(image),
     }
 
 
@@ -256,11 +479,18 @@ def mask_panel(mask: np.ndarray, size=256):
 
 
 def structure_guided_focus(
-    pdf_image: Image.Image, candidate_images: list[Image.Image], color: str
+    pdf_image: Image.Image,
+    candidate_images: list[Image.Image],
+    color: str,
+    candidate_target_images: list[Image.Image] | None = None,
 ):
     """Attribute PDF ink to a leaf after aligning on all invariant leaves."""
     pdf = np.asarray(pdf_image.convert("L")) < 224
-    targets = [color_mask(image, color) for image in candidate_images]
+    visible_targets = [color_mask(image, color) for image in candidate_images]
+    targets = [
+        color_mask(image, color)
+        for image in (candidate_target_images or candidate_images)
+    ]
     full = [np.asarray(image.convert("L")) < 224 for image in candidate_images]
     kernel = np.ones((5, 5), dtype=np.uint8)
     non_targets = [
@@ -268,7 +498,7 @@ def structure_guided_focus(
         & ~(
             cv2.dilate(target.astype(np.uint8), kernel, iterations=1).astype(bool)
         )
-        for ink, target in zip(full, targets)
+        for ink, target in zip(full, visible_targets)
     ]
     _aligned_non_targets, alignment = MATCHER.align_candidates_to_pdf(
         pdf, non_targets
@@ -430,7 +660,9 @@ def main():
                 row = rows_by_unicode[record["unicode"]]
                 ids = [int(value) for value in row["candidates"]]
                 panels = [pdf_cell(page, record["bbox"], page_sizes[page_number])]
+                full_pdf_crossing_evidence = horizontal_crossing_consensus(panels[0])
                 topology_inputs = [panels[0]]
+                topology_target_inputs = []
                 labels = [f"PDF {record['source']}"]
                 for glyph_id in ids:
                     if glyph_id not in svg_images:
@@ -438,10 +670,21 @@ def main():
                             row["candidateSvgs"][str(glyph_id)],
                         )
                     panels.append(ImageOps.contain(svg_images[glyph_id], (256, 256)))
+                    topology_svg = (
+                        row.get("candidateFocusSvgs", {}).get(str(glyph_id))
+                        if args.focus_color
+                        else None
+                    ) or row["candidateSvgs"][str(glyph_id)]
                     topology_inputs.append(
                         render_svg_review_image(
-                            without_review_points(row["candidateSvgs"][str(glyph_id)])
+                            without_review_points(topology_svg)
                         )
+                    )
+                    target_svg = row.get("candidateTopologySvgs", {}).get(
+                        str(glyph_id), topology_svg
+                    )
+                    topology_target_inputs.append(
+                        render_svg_review_image(without_review_points(target_svg))
                     )
                     if args.blind:
                         candidate = chr(65 + len(labels) - 1)
@@ -475,6 +718,7 @@ def main():
                                 topology_inputs[0],
                                 topology_inputs[1:],
                                 args.focus_color,
+                                topology_target_inputs,
                             )
                         else:
                             focus_box = discriminative_box(topology_inputs[1:])
@@ -500,6 +744,18 @@ def main():
                         label: topology_signature(panel)
                         for label, panel in zip(labels, topology_inputs)
                     }
+                    topology_report[filename]["candidateFocusTopology"] = row.get(
+                        "candidateFocusTopology", {}
+                    )
+                    topology_report[filename]["fullPdfHorizontalCrossingEvidence"] = (
+                        full_pdf_crossing_evidence
+                    )
+                    topology_report[filename]["localTopologyChoice"] = (
+                        choose_split_stroke_candidate(
+                            full_pdf_crossing_evidence,
+                            row.get("candidateFocusTopology", {}),
+                        )
+                    )
                 montage = draw_feature_annotations(
                     montage, annotations.get(filename, []), args.topology_row
                 )
