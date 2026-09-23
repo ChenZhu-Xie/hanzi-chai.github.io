@@ -316,6 +316,69 @@ def without_review_points(svg: str) -> str:
     return re.sub(r"<circle\b[^>]*/>", "", svg)
 
 
+def draw_feature_annotations(
+    montage: Image.Image, config: dict | list[dict], topology_row: bool
+) -> Image.Image:
+    """Mark the same reviewed feature in the glyph and topology rows."""
+    if isinstance(config, list):
+        subject = None
+        annotations = config
+    else:
+        subject = config.get("subject")
+        annotations = config.get("annotations", [])
+    if not annotations:
+        return montage
+    footer_lines = len(annotations) + (1 if subject else 0)
+    footer_height = 8 + 22 * footer_lines
+    annotated = Image.new(
+        "RGB", (montage.width, montage.height + footer_height), "white"
+    )
+    annotated.paste(montage, (0, 0))
+    draw = ImageDraw.Draw(annotated)
+    orange = (217, 119, 6)
+    footer_line = 0
+    if subject:
+        draw.text(
+            (8, montage.height + 5),
+            f"Review target: {subject}",
+            fill=(30, 64, 175),
+        )
+        footer_line = 1
+    for number, annotation in enumerate(annotations, start=1):
+        candidate = str(annotation["candidate"]).upper()
+        panel_index = ord(candidate) - ord("A") + 1
+        points = [
+            ("pdf", 0, 36),
+            ("glyph", panel_index, 36),
+        ]
+        if topology_row:
+            points.extend(
+                [
+                    ("pdfTopology", 0, 324),
+                    ("topology", panel_index, 324),
+                ]
+            )
+        for key, target_panel, row_y in points:
+            if key not in annotation:
+                continue
+            x_fraction, y_fraction = annotation[key]
+            x = target_panel * 256 + round(float(x_fraction) * 256)
+            y = row_y + round(float(y_fraction) * 256)
+            draw.ellipse(
+                (x - 11, y - 11, x + 11, y + 11),
+                outline=orange,
+                width=4,
+            )
+            draw.ellipse((x + 7, y - 20, x + 23, y - 4), fill=orange)
+            draw.text((x + 12, y - 19), str(number), fill="white", anchor="ma")
+        draw.text(
+            (8, montage.height + 5 + (footer_line + number - 1) * 22),
+            f"{number}. {annotation['text']}",
+            fill=orange,
+        )
+    return annotated
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
@@ -332,6 +395,7 @@ def main():
     parser.add_argument("--focus-differences", action="store_true")
     parser.add_argument("--focus-color")
     parser.add_argument("--topology-report", type=Path)
+    parser.add_argument("--annotations", type=Path)
     args = parser.parse_args()
 
     candidate_rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
@@ -355,6 +419,9 @@ def main():
     answer_key = {}
     review_template = {}
     topology_report = {}
+    annotations = (
+        json.loads(args.annotations.read_text("utf-8")) if args.annotations else {}
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for page_number, page_records in sorted(records_by_page.items()):
         with Image.open(args.pages_dir / f"page-{page_number:03d}.pbm") as page:
@@ -377,7 +444,16 @@ def main():
                         )
                     )
                     if args.blind:
-                        labels.append(f"Candidate {chr(65 + len(labels) - 1)}")
+                        candidate = chr(65 + len(labels) - 1)
+                        focus_ids = row.get("candidateFocusIds", {}).get(
+                            str(glyph_id), []
+                        )
+                        focus_label = (
+                            f" [component {','.join(map(str, focus_ids))}]"
+                            if focus_ids
+                            else ""
+                        )
+                        labels.append(f"Candidate {candidate}{focus_label}")
                     else:
                         flags = []
                         if glyph_id == result["expectedGlyphId"]:
@@ -424,6 +500,9 @@ def main():
                         label: topology_signature(panel)
                         for label, panel in zip(labels, topology_inputs)
                     }
+                montage = draw_feature_annotations(
+                    montage, annotations.get(filename, []), args.topology_row
+                )
                 montage.save(args.output_dir / filename)
                 expected_index = ids.index(result["expectedGlyphId"])
                 answer_key[filename] = {

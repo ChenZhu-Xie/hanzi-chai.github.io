@@ -23,6 +23,7 @@ const payload = (await Bun.file(values.input).json()) as {
   rows: Array<{
     candidates: Record<string, 矢量笔画数据[]>;
     candidateSvgs: Record<string, string>;
+    candidateFocusIds?: Record<string, number[]>;
   }>;
 };
 const definitions = values.definitions
@@ -66,6 +67,18 @@ const colorFor = (id: number) => {
 };
 
 for (const row of payload.rows) {
+  row.candidateFocusIds = Object.fromEntries(
+    Object.keys(row.candidates).map((id) => [
+      id,
+      [
+        ...new Set(
+          glyphLeafStrokeIds(Number(id), glyphById).filter((leafId) =>
+            familyById.has(leafId),
+          ),
+        ),
+      ].sort((left, right) => left - right),
+    ]),
+  );
   row.candidateSvgs = Object.fromEntries(
     Object.entries(row.candidates).map(([id, strokes]) => [
       id,

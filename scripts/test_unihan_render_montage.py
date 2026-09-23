@@ -90,6 +90,35 @@ class PdfCellTests(unittest.TestCase):
         self.assertTrue(pdf_mask.any())
         self.assertEqual(MONTAGE.topology_signature(focused[0])["components"], 1)
 
+    def test_marks_the_same_feature_in_glyph_and_topology_rows(self):
+        montage = Image.new("RGB", (768, 580), "white")
+
+        annotated = MONTAGE.draw_feature_annotations(
+            montage,
+            {
+                "subject": "left component 1019 vs 4110",
+                "annotations": [
+                    {
+                        "candidate": "B",
+                        "pdf": [0.4, 0.7],
+                        "glyph": [0.5, 0.75],
+                        "pdfTopology": [0.45, 0.65],
+                        "topology": [0.5, 0.68],
+                        "text": "B=4110: center vertical stops at lower horizontal",
+                    }
+                ],
+            },
+            True,
+        )
+
+        self.assertGreater(annotated.height, montage.height)
+        pixels = np.asarray(annotated)
+        glyph_y = 36 + round(0.75 * 256)
+        topology_y = 324 + round(0.68 * 256)
+        x = 2 * 256 + round(0.5 * 256)
+        self.assertTrue((pixels[glyph_y - 12 : glyph_y + 13, x - 12 : x + 13] != 255).any())
+        self.assertTrue((pixels[topology_y - 12 : topology_y + 13, x - 12 : x + 13] != 255).any())
+
 
 if __name__ == "__main__":
     unittest.main()
