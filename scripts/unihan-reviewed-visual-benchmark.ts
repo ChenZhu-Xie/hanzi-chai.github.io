@@ -1,7 +1,10 @@
 import { parseArgs } from "node:util";
 import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import { 字形库 } from "hanzi-chai";
-import { glyphToSvgMarkup } from "../src/components/glyph-svg";
+import {
+  glyphLeafStrokeIds,
+  glyphToSvgMarkup,
+} from "../src/components/glyph-svg";
 import {
   augmentSourceEvidenceWithReviews,
   buildGlyphEvidenceIndex,
@@ -153,14 +156,38 @@ const renderedRows = rows.flatMap((row) => {
     return glyph ? [[id, glyph] as const] : [];
   });
   if (rendered.length !== candidateIds.length) return [];
+  const leafIds = Object.fromEntries(
+    rendered.map(([id]) => [id, glyphLeafStrokeIds(id, glyphById)]),
+  );
+  const leafSets = Object.values(leafIds).map((ids) => new Set(ids));
+  const allLeafIds = new Set(Object.values(leafIds).flat());
+  const commonLeafIds = new Set(
+    [...allLeafIds].filter((id) => leafSets.every((set) => set.has(id))),
+  );
+  const focusLeafIds = [...allLeafIds]
+    .filter((id) => !commonLeafIds.has(id))
+    .sort((left, right) => left - right);
+  const focus = new Set(focusLeafIds);
   return [
     {
       ...row,
+      focusLeafIds,
+      candidateLeafIds: leafIds,
       candidates: Object.fromEntries(
         rendered.map(([id, glyph]) => [id, glyph.图形盒子.获取笔画列表()]),
       ),
       candidateSvgs: Object.fromEntries(
         rendered.map(([id, glyph]) => [id, glyphToSvgMarkup(glyph.图形盒子)]),
+      ),
+      candidateFocusSvgs: Object.fromEntries(
+        rendered.map(([id, glyph]) => [
+          id,
+          glyphToSvgMarkup(glyph.图形盒子, false, {
+            strokeColors: leafIds[id]!.map((leafId) =>
+              focus.has(leafId) ? "#2563eb" : "black",
+            ),
+          }),
+        ]),
       ),
     },
   ];

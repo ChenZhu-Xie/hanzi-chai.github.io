@@ -870,3 +870,51 @@ test("propagates the reviewed H-source 敬 sibling into U+64CF 擏", () => {
     references: [{ id: 220 }, { id: 127089 }],
   });
 });
+
+test("keeps the reviewed J-source grass top in U+82C6 苆 on 228 without assuming its lower component", () => {
+  const glyphs: 基本字形数据[] = [228, 437, 486, 8920].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 25313,
+    type: "compound",
+    operator: "⿱",
+    references: [{ id: 228 }, { id: 8920 }],
+    ambiguous: false,
+  });
+
+  const result = recommendMissingSources(
+    { unicode: 0x82c6, glyphs: [{ id: 25313, sources: ["G", "J"] }] },
+    ["J"],
+    glyphs,
+    new Map(),
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual(["J"]);
+  expect(result.proposals).toEqual([]);
+  expect(result.unresolved[0]).toMatchObject({
+    source: "J",
+    evidence: [
+      {
+        referenceId: 228,
+        replacementId: 228,
+        reliable: true,
+        reviewed: true,
+      },
+      {
+        referenceId: 8920,
+        reliable: false,
+      },
+    ],
+  });
+});
