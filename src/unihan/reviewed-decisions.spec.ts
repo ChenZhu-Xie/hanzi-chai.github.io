@@ -918,3 +918,49 @@ test("keeps the reviewed J-source grass top in U+82C6 苆 on 228 without assumin
     ],
   });
 });
+
+test("uses 角 4110 in the reviewed H/T/J/K sources of U+659B 斛", () => {
+  const glyphs: 基本字形数据[] = [1019, 4110, 602].map((id) => ({
+    id,
+    type: "component",
+    strokes: [],
+    operator: undefined,
+    references: undefined,
+    ambiguous: false,
+  }));
+  glyphs.push({
+    id: 6870,
+    type: "compound",
+    operator: "⿰",
+    references: [{ id: 1019 }, { id: 602 }],
+    ambiguous: false,
+  });
+  const evidence = new Map(
+    ["H", "T", "J", "K"].map((source) => [
+      source,
+      new Map([[602, new Map([[602, new Set([1, 2, 3, 4])]])]]),
+    ]),
+  );
+
+  const result = recommendMissingSources(
+    { unicode: 0x659b, glyphs: [{ id: 6870, sources: ["G", "H"] }] },
+    ["H", "T", "J", "K"],
+    glyphs,
+    evidence,
+    3,
+    2,
+    undefined,
+    undefined,
+    REVIEWED_SOURCE_DECISIONS,
+  );
+
+  expect(result.unresolvedSources).toEqual([]);
+  expect(result.proposals).toHaveLength(4);
+  for (const proposal of result.proposals) {
+    expect(proposal.glyph).toMatchObject({
+      type: "compound",
+      operator: "⿰",
+      references: [{ id: 4110 }, { id: 602 }],
+    });
+  }
+});

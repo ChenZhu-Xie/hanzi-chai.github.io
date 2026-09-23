@@ -416,4 +416,13 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 228,
     replacementId: 228,
   },
+
+  // U+659B 斛: H/T/J/K use 角 sibling 4110, whose inner vertical stops at the
+  // lower horizontal; 1019's inner vertical continues below it.
+  ...(["H", "T", "J", "K"] as const).map((source) => ({
+    unicode: 0x659b,
+    source,
+    referenceId: 1019,
+    replacementId: 4110,
+  })),
 ].map((decision) => ({ ...decision, provenance: "manual" }));
