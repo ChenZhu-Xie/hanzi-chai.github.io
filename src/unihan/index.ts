@@ -50,14 +50,27 @@ export type UnihanAuditStatus =
 export interface RecommendationEvidence {
   referenceId: number;
   replacementId?: number;
+  /** The count-only winner before a target-local visual prior is applied. */
+  statisticalReplacementId?: number;
   count: number;
   reliable: boolean;
   reviewed?: boolean;
   /** Accepted with two identity examples because no sibling competes. */
   uncontestedIdentity?: boolean;
   alternatives: { id: number; count: number; examples: number[] }[];
+  /** Target-local PDF similarity support; likely support never auto-applies. */
+  visualSupport?: {
+    level: "likely" | "strict";
+    anchorSources: string[];
+  };
   /** Nested evidence used to resolve this top-level reference recursively. */
   basis?: RecommendationEvidence[];
+}
+
+export interface SourceVisualEvidence {
+  sameEdges: string[];
+  likelySameEdges?: string[];
+  differentEdges?: string[];
 }
 
 export interface UnihanGlyphProposal {
@@ -150,6 +163,66 @@ interface GlyphIndex {
   byShape: Map<string, number>;
 }
 
+const CONDITIONAL_STROKE_FEATURE_GROUPS = [
+  new Set(["横", "提"]),
+  new Set(["点", "捺", "横捺"]),
+  new Set(["竖", "竖钩"]),
+  new Set(["竖弯钩", "竖提"]),
+] as const;
+
+function normalizeConditionalStrokeFeature(feature: string): string {
+  const group = CONDITIONAL_STROKE_FEATURE_GROUPS.find((candidate) =>
+    candidate.has(feature),
+  );
+  return group ? [...group].sort().join("=") : feature;
+}
+
+/**
+ * Compare two glyphs only inside a confirmed source-variant context. This is
+ * deliberately not a global ID merge: matching structure and stroke sequence
+ * are both required, while source-font geometry is ignored.
+ */
+function areConditionalGlyphVariants(
+  leftId: number,
+  rightId: number,
+  glyphById: ReadonlyMap<number, 基本字形数据>,
+  seen = new Set<string>(),
+): boolean {
+  if (leftId === rightId) return true;
+  const key = `${leftId}:${rightId}`;
+  if (seen.has(key)) return true;
+  seen.add(key);
+  const left = glyphById.get(leftId);
+  const right = glyphById.get(rightId);
+  if (!left || !right || left.type !== right.type) return false;
+  if (left.type === "component" && right.type === "component") {
+    const leftFeatures = (left.strokes ?? []).map(({ feature }) =>
+      normalizeConditionalStrokeFeature(feature),
+    );
+    const rightFeatures = (right.strokes ?? []).map(({ feature }) =>
+      normalizeConditionalStrokeFeature(feature),
+    );
+    return (
+      leftFeatures.length > 0 &&
+      leftFeatures.length === rightFeatures.length &&
+      leftFeatures.every((feature, index) => feature === rightFeatures[index])
+    );
+  }
+  if (left.type !== "compound" || right.type !== "compound") return false;
+  return (
+    left.operator === right.operator &&
+    left.references.length === right.references.length &&
+    left.references.every((reference, index) =>
+      areConditionalGlyphVariants(
+        reference.id,
+        right.references[index]!.id,
+        glyphById,
+        seen,
+      ),
+    )
+  );
+}
+
 export function sortSources(values: Iterable<string>): string[] {
   return [...new Set(values)].sort((a, b) => {
     const left = 来源排序.indexOf(a);
@@ -191,6 +264,64 @@ export function parseUnihanIRGSources(
 
 export function readUnihanVersion(text: string): string | undefined {
   return /^# Unicode Version ([0-9]+(?:\.[0-9]+){1,2})\s*$/m.exec(text)?.[1];
+}
+
+const SUPPORTED_SOURCE_SET = new Set(IRG_PROPERTY_TO_SOURCE.values());
+
+function parseVisualEdges(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.filter((edge): edge is string => {
+        if (typeof edge !== "string") return false;
+        const sources = edge.split("/");
+        return (
+          sources.length === 2 &&
+          sources[0] !== sources[1] &&
+          sources.every((source) => SUPPORTED_SOURCE_SET.has(source))
+        );
+      }),
+    ),
+  ];
+}
+
+/** Load target-local, calibrated source-pair evidence produced from U4E00.pdf. */
+export function parseSourceVisualEvidence(
+  text: string,
+): Map<number, SourceVisualEvidence> {
+  const payload: unknown = JSON.parse(text);
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("rows" in payload) ||
+    typeof payload.rows !== "object" ||
+    payload.rows === null ||
+    Array.isArray(payload.rows)
+  ) {
+    throw new Error("Invalid PDF visual evidence: expected a rows object");
+  }
+
+  const parsed = new Map<number, SourceVisualEvidence>();
+  for (const [codepoint, value] of Object.entries(payload.rows)) {
+    if (!/^U\+[0-9A-F]{4,6}$/i.test(codepoint)) continue;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      continue;
+    }
+    const unicode = Number.parseInt(codepoint.slice(2), 16);
+    const record = value as Record<string, unknown>;
+    const sameEdges = parseVisualEdges(record.sameEdges);
+    const likelySameEdges = parseVisualEdges(record.likelySameEdges);
+    const differentEdges = parseVisualEdges(record.differentEdges);
+    if (
+      sameEdges.length === 0 &&
+      likelySameEdges.length === 0 &&
+      differentEdges.length === 0
+    ) {
+      continue;
+    }
+    parsed.set(unicode, { sameEdges, likelySameEdges, differentEdges });
+  }
+  return parsed;
 }
 
 export function isRecommendationSample(unicode: number): boolean {
@@ -236,7 +367,14 @@ export function buildSourceEvidenceIndex(
           position++
         ) {
           const referenceId = gGlyph.references[position]!.id;
-          const replacementId = targetGlyph.references[position]!.id;
+          const rawReplacementId = targetGlyph.references[position]!.id;
+          const replacementId = areConditionalGlyphVariants(
+            referenceId,
+            rawReplacementId,
+            glyphById,
+          )
+            ? referenceId
+            : rawReplacementId;
           if (!glyphById.has(replacementId)) continue;
           const evidenceKey = `${referenceId}:${replacementId}`;
           if (seenInCharacter.has(evidenceKey)) continue;
@@ -331,7 +469,8 @@ export function buildGlyphEvidenceIndex(
   characters: 字符数据[],
   glyphs: 基本字形数据[],
 ): GlyphEvidenceIndex {
-  const glyphIds = new Set(glyphs.map(({ id }) => id));
+  const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
+  const glyphIds = new Set(glyphById.keys());
   const index: GlyphEvidenceIndex = new Map();
   for (const character of characters) {
     if (!isRecommendationSample(character.unicode)) continue;
@@ -353,9 +492,16 @@ export function buildGlyphEvidenceIndex(
           replacements = new Map();
           byReference.set(gEntry.id, replacements);
         }
-        const examples = replacements.get(targetEntry.id) ?? new Set<number>();
+        const replacementId = areConditionalGlyphVariants(
+          gEntry.id,
+          targetEntry.id,
+          glyphById,
+        )
+          ? gEntry.id
+          : targetEntry.id;
+        const examples = replacements.get(replacementId) ?? new Set<number>();
         examples.add(character.unicode);
-        replacements.set(targetEntry.id, examples);
+        replacements.set(replacementId, examples);
       }
     }
   }
@@ -409,6 +555,11 @@ export function buildReviewedGlyphSiblingIndex(
       for (const source of targetEntry.sources) {
         if (source === "G") continue;
         if (gGlyph.type === "component" && targetGlyph.type === "component") {
+          if (
+            areConditionalGlyphVariants(gEntry.id, targetEntry.id, glyphById)
+          ) {
+            continue;
+          }
           const example = {
             unicode: character.unicode,
             source,
@@ -434,6 +585,7 @@ export function buildReviewedGlyphSiblingIndex(
         ) {
           const left = gGlyph.references[position]!.id;
           const right = targetGlyph.references[position]!.id;
+          if (areConditionalGlyphVariants(left, right, glyphById)) continue;
           const example = {
             unicode: character.unicode,
             source,
@@ -542,6 +694,50 @@ function makeRecommendationEvidence(
   };
 }
 
+function sourcePair(left: string, right: string): string {
+  return [left, right].sort().join("/");
+}
+
+function applyVisualIdentityPrior(
+  evidence: RecommendationEvidence,
+  source: string,
+  visualEvidence: SourceVisualEvidence | undefined,
+  reliableIdentityAnchors: (referenceId: number, source: string) => string[],
+): RecommendationEvidence {
+  if (evidence.reliable || !visualEvidence) return evidence;
+  const identity = evidence.alternatives.find(
+    ({ id }) => id === evidence.referenceId,
+  );
+  if (!identity) return evidence;
+
+  const strictPairs = new Set(visualEvidence.sameEdges);
+  const likelyPairs = new Set(visualEvidence.likelySameEdges ?? []);
+  const anchors = reliableIdentityAnchors(evidence.referenceId, source);
+  const strictAnchors = anchors.filter((anchor) =>
+    strictPairs.has(sourcePair(anchor, source)),
+  );
+  const likelyAnchors = anchors.filter((anchor) =>
+    likelyPairs.has(sourcePair(anchor, source)),
+  );
+  const level = strictAnchors.length > 0 ? "strict" : "likely";
+  const anchorSources =
+    strictAnchors.length > 0 ? strictAnchors : likelyAnchors;
+  if (anchorSources.length === 0) return evidence;
+
+  return {
+    ...evidence,
+    replacementId: evidence.referenceId,
+    statisticalReplacementId: evidence.replacementId,
+    count: identity.count,
+    reliable: level === "strict",
+    alternatives: [
+      identity,
+      ...evidence.alternatives.filter(({ id }) => id !== evidence.referenceId),
+    ],
+    visualSupport: { level, anchorSources },
+  };
+}
+
 function resolveReferenceRecursively(
   referenceId: number,
   source: string,
@@ -551,18 +747,23 @@ function resolveReferenceRecursively(
   minimumDominance: number,
   reviewedDecisions: ReadonlyMap<number, ReviewedSourceDecision>,
   knownSiblingIds?: ReadonlySet<number>,
+  applyVisualPrior?: (
+    evidence: RecommendationEvidence,
+  ) => RecommendationEvidence,
   depth = 0,
   seen = new Set<number>(),
 ): { id: number; evidence: RecommendationEvidence } | undefined {
   if (depth > 10 || seen.has(referenceId)) return undefined;
   const nextSeen = new Set(seen).add(referenceId);
-  const direct = makeRecommendationEvidence(
-    referenceId,
-    evidenceIndex.get(source)?.get(referenceId),
-    minimumEvidence,
-    minimumDominance,
-    reviewedDecisions.get(referenceId),
-    knownSiblingIds !== undefined && !knownSiblingIds.has(referenceId),
+  const direct = (applyVisualPrior ?? ((evidence) => evidence))(
+    makeRecommendationEvidence(
+      referenceId,
+      evidenceIndex.get(source)?.get(referenceId),
+      minimumEvidence,
+      minimumDominance,
+      reviewedDecisions.get(referenceId),
+      knownSiblingIds !== undefined && !knownSiblingIds.has(referenceId),
+    ),
   );
   if (
     direct.reliable &&
@@ -583,6 +784,7 @@ function resolveReferenceRecursively(
       minimumDominance,
       reviewedDecisions,
       knownSiblingIds,
+      applyVisualPrior,
       depth + 1,
       nextSeen,
     ),
@@ -646,6 +848,7 @@ export function recommendMissingSources(
   glyphEvidenceIndex = buildGlyphEvidenceIndex([character], glyphs),
   reviewedDecisions: ReviewedSourceDecision[] = [],
   knownSiblingIds?: ReadonlySet<number>,
+  visualEvidence?: SourceVisualEvidence,
 ): {
   proposals: UnihanGlyphProposal[];
   unresolvedSources: string[];
@@ -675,17 +878,52 @@ export function recommendMissingSources(
     reviewedBySource.set(decision.source, byReference);
   }
 
+  const reliableIdentityAnchors = (
+    referenceId: number,
+    targetSource: string,
+  ): string[] => {
+    const anchors = new Set<string>(["G"]);
+    for (const [source, decisions] of reviewedBySource) {
+      if (source === targetSource) continue;
+      const decision = decisions.get(referenceId);
+      if (decision?.replacementId === referenceId) anchors.add(source);
+    }
+    for (const [source, sourceIndex] of evidenceIndex) {
+      if (source === targetSource) continue;
+      const anchorEvidence = makeRecommendationEvidence(
+        referenceId,
+        sourceIndex.get(referenceId),
+        minimumEvidence,
+        minimumDominance,
+        reviewedBySource.get(source)?.get(referenceId),
+        knownSiblingIds !== undefined && !knownSiblingIds.has(referenceId),
+      );
+      if (
+        anchorEvidence.reliable &&
+        anchorEvidence.replacementId === referenceId
+      ) {
+        anchors.add(source);
+      }
+    }
+    return sortSources([...anchors]);
+  };
+
   for (const source of missingSources) {
     const sourceReviews = reviewedBySource.get(source) ?? new Map();
     if (referenceGlyph.type === "component") {
-      const evidence = makeRecommendationEvidence(
-        referenceGlyph.id,
-        glyphEvidenceIndex.get(source)?.get(referenceGlyph.id),
-        minimumEvidence,
-        minimumDominance,
-        sourceReviews.get(referenceGlyph.id),
-        knownSiblingIds !== undefined &&
-          !knownSiblingIds.has(referenceGlyph.id),
+      const evidence = applyVisualIdentityPrior(
+        makeRecommendationEvidence(
+          referenceGlyph.id,
+          glyphEvidenceIndex.get(source)?.get(referenceGlyph.id),
+          minimumEvidence,
+          minimumDominance,
+          sourceReviews.get(referenceGlyph.id),
+          knownSiblingIds !== undefined &&
+            !knownSiblingIds.has(referenceGlyph.id),
+        ),
+        source,
+        visualEvidence,
+        reliableIdentityAnchors,
       );
       const winner = evidence.replacementId
         ? glyphIndex.byId.get(evidence.replacementId)
@@ -710,13 +948,18 @@ export function recommendMissingSources(
     const replacements: number[] = [];
     let reliable = true;
     for (const reference of referenceGlyph.references) {
-      const componentEvidence = makeRecommendationEvidence(
-        reference.id,
-        sourceIndex?.get(reference.id),
-        minimumEvidence,
-        minimumDominance,
-        sourceReviews.get(reference.id),
-        knownSiblingIds !== undefined && !knownSiblingIds.has(reference.id),
+      const componentEvidence = applyVisualIdentityPrior(
+        makeRecommendationEvidence(
+          reference.id,
+          sourceIndex?.get(reference.id),
+          minimumEvidence,
+          minimumDominance,
+          sourceReviews.get(reference.id),
+          knownSiblingIds !== undefined && !knownSiblingIds.has(reference.id),
+        ),
+        source,
+        visualEvidence,
+        reliableIdentityAnchors,
       );
       const recursive = componentEvidence.reliable
         ? undefined
@@ -729,6 +972,13 @@ export function recommendMissingSources(
             minimumDominance,
             sourceReviews,
             knownSiblingIds,
+            (entry) =>
+              applyVisualIdentityPrior(
+                entry,
+                source,
+                visualEvidence,
+                reliableIdentityAnchors,
+              ),
           );
       if (recursive) {
         evidence.push(recursive.evidence);
@@ -859,6 +1109,7 @@ export function auditUnihanSources(
     minimumEvidence?: number;
     minimumDominance?: number;
     reviewedDecisions?: ReviewedSourceDecision[];
+    visualEvidence?: ReadonlyMap<number, SourceVisualEvidence>;
   } = {},
 ): UnihanAudit {
   const from = options.from ?? CJK_UNIFIED_START;
@@ -884,7 +1135,12 @@ export function auditUnihanSources(
     replacementId: number,
     depth = 0,
   ) => {
-    if (depth > 10 || referenceId === replacementId) return;
+    if (
+      depth > 10 ||
+      areConditionalGlyphVariants(referenceId, replacementId, glyphIndex.byId)
+    ) {
+      return;
+    }
     knownSiblingIds.add(referenceId);
     knownSiblingIds.add(replacementId);
     const reference = glyphIndex.byId.get(referenceId);
@@ -977,6 +1233,7 @@ export function auditUnihanSources(
         glyphEvidenceIndex,
         options.reviewedDecisions ?? [],
         knownSiblingIds,
+        options.visualEvidence?.get(unicode),
       );
       proposals = recommendation.proposals;
       unresolved = recommendation.unresolved;
@@ -1038,8 +1295,7 @@ export function auditUnihanSources(
       generatedAt: new Date().toISOString(),
       minimumEvidence,
       minimumDominance,
-      minimumUncontestedIdentityEvidence:
-        MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE,
+      minimumUncontestedIdentityEvidence: MINIMUM_UNCONTESTED_IDENTITY_EVIDENCE,
       reviewedDecisions: (options.reviewedDecisions ?? []).map((decision) => ({
         ...decision,
       })),

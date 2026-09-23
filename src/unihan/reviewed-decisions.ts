@@ -124,4 +124,154 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 4109,
     replacementId: 126882,
   },
+
+  // U+6424 搤: G/H/T use 益 5644; J/K/KP(N) use 127533.
+  ...(["H", "T"] as const).map((source) => ({
+    unicode: 0x6424,
+    source,
+    referenceId: 5644,
+    replacementId: 5644,
+  })),
+  ...(["J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6424,
+    source,
+    referenceId: 5644,
+    replacementId: 127533,
+  })),
+
+  // U+6635 昵: T uses 尼 58234, whose 匕 starts with a horizontal stroke.
+  {
+    unicode: 0x6635,
+    source: "T",
+    referenceId: 5925,
+    replacementId: 58234,
+  },
+
+  // U+65E8 旨: H/T use 匕 1128; G/J/K/KP(N)/V keep 133.
+  ...(["H", "T"] as const).map((source) => ({
+    unicode: 0x65e8,
+    source,
+    referenceId: 133,
+    replacementId: 1128,
+  })),
+  ...(["J", "K", "N", "V"] as const).map((source) => ({
+    unicode: 0x65e8,
+    source,
+    referenceId: 133,
+    replacementId: 133,
+  })),
+
+  // U+657C 敼: all six chart forms keep 喜 5766, whose middle subtree uses
+  // component 345 (点 + 撇 + 横), including KP(N); do not infer 127051.
+  ...(["H", "T", "J", "K", "N"] as const).map((source) => ({
+    unicode: 0x657c,
+    source,
+    referenceId: 5766,
+    replacementId: 5766,
+  })),
+
+  // U+6EED 滭: the three reviewed 畢 variants are separated by stroke
+  // continuity, the split/continuous middle horizontal, and the relative
+  // length of the final two horizontals. G/J/K/KP(N) use 1104, H uses 1186,
+  // and T uses 4646.
+  {
+    unicode: 0x6eed,
+    source: "H",
+    referenceId: 1104,
+    replacementId: 1186,
+  },
+  {
+    unicode: 0x6eed,
+    source: "T",
+    referenceId: 1104,
+    replacementId: 4646,
+  },
+  ...(["J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6eed,
+    source,
+    referenceId: 1104,
+    replacementId: 1104,
+  })),
+
+  // U+69B4 榴: every source keeps 留 6821 = ⿱(6822, 727); equivalently,
+  // every 留 has the reviewed top 6822 rather than 53980's top 5127.
+  ...(["H", "T", "J", "K", "N", "V"] as const).flatMap((source) => [
+    {
+      unicode: 0x69b4,
+      source,
+      referenceId: 6822,
+      replacementId: 6822,
+    },
+    {
+      unicode: 0x69b4,
+      source,
+      referenceId: 727,
+      replacementId: 727,
+    },
+  ]),
+
+  // U+6962 楢: G/H/T/V use the integral 酋 component 1099; J/K/KP(N)
+  // use 126948 = ⿱(117, 977), with an independent 八 above 酉.
+  ...(["H", "T", "V"] as const).map((source) => ({
+    unicode: 0x6962,
+    source,
+    referenceId: 1099,
+    replacementId: 1099,
+  })),
+  ...(["J", "K", "N"] as const).map((source) => ({
+    unicode: 0x6962,
+    source,
+    referenceId: 1099,
+    replacementId: 126948,
+  })),
+
+  // U+6E9C 溜: all six sources use the same decomposition ⿰(350, 6821).
+  // Source-font details in 三点水 do not create siblings, and every 留 is
+  // the reviewed 6821 = ⿱(6822, 727).
+  ...(["H", "T", "J", "K", "N"] as const).flatMap((source) => [
+    {
+      unicode: 0x6e9c,
+      source,
+      referenceId: 350,
+      replacementId: 350,
+    },
+    {
+      unicode: 0x6e9c,
+      source,
+      referenceId: 6821,
+      replacementId: 6821,
+    },
+  ]),
+
+  // U+6C15 氕: G/H/T all use ⿹(536, 5). T keeps the curved 横斜钩
+  // 气 component 536 rather than the right-angled 横折弯钩 variant 1166.
+  ...(["H", "T"] as const).flatMap((source) => [
+    {
+      unicode: 0x6c15,
+      source,
+      referenceId: 536,
+      replacementId: 536,
+    },
+    {
+      unicode: 0x6c15,
+      source,
+      referenceId: 5,
+      replacementId: 5,
+    },
+  ]),
+
+  // U+6709 有: the lower 月 is 569 (a left-falling first stroke) only in T.
+  // G/H/J/K/KP(N)/V keep component 504 with a vertical first stroke.
+  ...(["H", "J", "K", "N", "V"] as const).map((source) => ({
+    unicode: 0x6709,
+    source,
+    referenceId: 504,
+    replacementId: 504,
+  })),
+  {
+    unicode: 0x6709,
+    source: "T",
+    referenceId: 504,
+    replacementId: 569,
+  },
 ].map((decision) => ({ ...decision, provenance: "manual" }));

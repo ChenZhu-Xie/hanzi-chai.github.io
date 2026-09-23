@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { type 基本字形数据, type 字符数据, 来源排序 } from "hanzi-chai";
+import {
+  type 基本字形数据,
+  type 字符数据,
+  来源排序,
+  type 笔画名称,
+} from "hanzi-chai";
 import {
   applySourceAssignments,
   auditUnihanSources,
@@ -9,6 +14,7 @@ import {
   buildReviewedGlyphSiblingIndex,
   buildSourceEvidenceIndex,
   IRG_PROPERTY_TO_SOURCE,
+  parseSourceVisualEvidence,
   parseUnihanIRGSources,
   readUnihanVersion,
   recommendMissingSources,
@@ -73,6 +79,43 @@ describe("parseUnihanIRGSources", () => {
       ].join("\n"),
     );
     expect([...parsed]).toEqual([[0x4e00, ["G"]]]);
+  });
+});
+
+describe("parseSourceVisualEvidence", () => {
+  test("loads valid PDF rows and ignores malformed entries", () => {
+    const parsed = parseSourceVisualEvidence(
+      JSON.stringify({
+        rows: {
+          "U+6C15": {
+            sameEdges: ["G/H", "bad"],
+            likelySameEdges: ["H/T", 42],
+            differentEdges: ["G/J"],
+          },
+          nope: { sameEdges: ["G/H"] },
+          "U+6C16": null,
+        },
+      }),
+    );
+
+    expect(parsed).toEqual(
+      new Map([
+        [
+          0x6c15,
+          {
+            sameEdges: ["G/H"],
+            likelySameEdges: ["H/T"],
+            differentEdges: ["G/J"],
+          },
+        ],
+      ]),
+    );
+  });
+
+  test("rejects JSON without a rows object", () => {
+    expect(() => parseSourceVisualEvidence("{}")).toThrow(
+      "PDF visual evidence",
+    );
   });
 });
 
@@ -347,9 +390,7 @@ describe("recommendation safety", () => {
       new Set([0x7ca6]),
     );
     expect(sourceSpecific.get("H")?.get(2)?.get(3)).toBeUndefined();
-    expect(sourceSpecific.get("J")?.get(2)?.get(3)).toEqual(
-      new Set([0x7ca6]),
-    );
+    expect(sourceSpecific.get("J")?.get(2)?.get(3)).toEqual(new Set([0x7ca6]));
 
     const exactCharacterDecision = recommendMissingSources(
       { unicode: 0x6404, glyphs: [{ id: 1, sources: ["G", "H"] }] },
@@ -394,13 +435,121 @@ describe("recommendation safety", () => {
     ]);
   });
 
-  test("accepts two uncontested identity examples only when no sibling is known", () => {
-    const twoIdentitySamples: 字符数据[] = [0x4e30, 0x4e31].map(
-      (unicode) => ({
-        unicode,
-        glyphs: [{ id: 100, sources: ["G", "T"] }],
-      }),
+  test("uses likely visual similarity only to reorder unreliable evidence", () => {
+    const visualCandidate: 字符数据 = {
+      unicode: 0x6405,
+      glyphs: [{ id: 100, sources: ["G", "H", "T"] }],
+    };
+    const evidence = new Map([
+      [
+        "T",
+        new Map([
+          [
+            1,
+            new Map([
+              [2, new Set([0x4e10, 0x4e11])],
+              [1, new Set([0x4e12])],
+            ]),
+          ],
+          [3, new Map([[3, new Set([0x4e10, 0x4e11, 0x4e12])]])],
+        ]),
+      ],
+    ]);
+    const result = recommendMissingSources(
+      visualCandidate,
+      ["T"],
+      glyphs,
+      evidence,
+      3,
+      2,
+      undefined,
+      undefined,
+      [
+        {
+          unicode: 0x6405,
+          source: "H",
+          referenceId: 1,
+          replacementId: 1,
+        },
+      ],
+      undefined,
+      { likelySameEdges: ["H/T"], sameEdges: [] },
     );
+
+    expect(result.unresolvedSources).toEqual(["T"]);
+    expect(result.unresolved[0]?.evidence[0]).toMatchObject({
+      referenceId: 1,
+      replacementId: 1,
+      statisticalReplacementId: 2,
+      reliable: false,
+      visualSupport: { level: "likely", anchorSources: ["H"] },
+      alternatives: [
+        { id: 1, count: 1 },
+        { id: 2, count: 2 },
+      ],
+    });
+  });
+
+  test("accepts strict visual similarity only with an identity candidate and reliable anchor", () => {
+    const visualCandidate: 字符数据 = {
+      unicode: 0x6405,
+      glyphs: [{ id: 100, sources: ["G", "H", "T"] }],
+    };
+    const evidence = new Map([
+      [
+        "T",
+        new Map([
+          [
+            1,
+            new Map([
+              [2, new Set([0x4e10, 0x4e11])],
+              [1, new Set([0x4e12])],
+            ]),
+          ],
+          [3, new Map([[3, new Set([0x4e10, 0x4e11, 0x4e12])]])],
+        ]),
+      ],
+    ]);
+    const result = recommendMissingSources(
+      visualCandidate,
+      ["T"],
+      glyphs,
+      evidence,
+      3,
+      2,
+      undefined,
+      undefined,
+      [
+        {
+          unicode: 0x6405,
+          source: "H",
+          referenceId: 1,
+          replacementId: 1,
+        },
+      ],
+      undefined,
+      { sameEdges: ["H/T"], likelySameEdges: ["H/T"] },
+    );
+
+    expect(result.unresolvedSources).toEqual([]);
+    expect(result.proposals[0]?.glyph.references).toEqual([
+      { id: 1 },
+      { id: 3 },
+    ]);
+    expect(result.proposals[0]?.evidence[0]).toMatchObject({
+      referenceId: 1,
+      replacementId: 1,
+      statisticalReplacementId: 2,
+      reliable: true,
+      visualSupport: { level: "strict", anchorSources: ["H"] },
+    });
+  });
+
+  test("accepts two uncontested identity examples only when no sibling is known", () => {
+    const twoIdentitySamples: 字符数据[] = [0x4e30, 0x4e31].map((unicode) => ({
+      unicode,
+      glyphs: [{ id: 100, sources: ["G", "T"] }],
+    }));
     const evidence = buildSourceEvidenceIndex(twoIdentitySamples, glyphs);
     const accepted = recommendMissingSources(
       candidate,
@@ -505,6 +654,64 @@ describe("recommendation safety", () => {
     expect(index.get(2)?.[0]).toMatchObject({ id: 1, count: 3 });
   });
 
+  test("folds confirmed conditional stroke variants into the reference component", () => {
+    const component = (id: number, features: 笔画名称[]): 基本字形数据 => ({
+      id,
+      type: "component",
+      operator: undefined,
+      references: undefined,
+      strokes: features.map((feature) => ({
+        feature,
+        start: [0, 0],
+        curveList: [],
+      })),
+      ambiguous: false,
+    });
+    const conditionalGlyphs: 基本字形数据[] = [
+      ...glyphs,
+      component(4, ["横", "点", "竖", "竖弯钩"]),
+      component(5, ["提", "捺", "竖钩", "竖提"]),
+      component(6, ["提", "横捺", "竖钩", "竖提"]),
+      component(7, ["撇", "捺", "竖钩", "竖提"]),
+      ...[
+        [103, 4],
+        [104, 5],
+        [105, 6],
+        [106, 7],
+      ].map(
+        ([id, referenceId]) =>
+          ({
+            id,
+            type: "compound",
+            operator: "⿰",
+            references: [{ id: referenceId }, { id: 3 }],
+            ambiguous: false,
+          }) as 基本字形数据,
+      ),
+    ];
+    const sample: 字符数据 = {
+      unicode: 0x4e70,
+      glyphs: [
+        { id: 103, sources: ["G"] },
+        { id: 104, sources: ["T"] },
+        { id: 105, sources: ["J"] },
+        { id: 106, sources: ["K"] },
+      ],
+    };
+    const evidence = buildSourceEvidenceIndex([sample], conditionalGlyphs);
+    expect(evidence.get("T")?.get(4)?.get(4)).toEqual(new Set([0x4e70]));
+    expect(evidence.get("J")?.get(4)?.get(4)).toEqual(new Set([0x4e70]));
+    expect(evidence.get("K")?.get(4)?.get(7)).toEqual(new Set([0x4e70]));
+
+    const siblings = buildReviewedGlyphSiblingIndex(
+      [sample],
+      conditionalGlyphs,
+    );
+    expect(siblings.get(4)?.map(({ id }) => id)).toEqual([7]);
+    expect(siblings.get(5)).toBeUndefined();
+    expect(siblings.get(6)).toBeUndefined();
+  });
+
   test("counts repeated component replacements once per source character", () => {
     const repeatedGlyphs: 基本字形数据[] = [
       ...glyphs,
@@ -601,6 +808,54 @@ describe("recommendation safety", () => {
         audit.summary.insufficientEvidence +
         audit.summary.unsupported,
     ).toBe(audit.summary.scanned);
+  });
+
+  test("passes target-local visual evidence through the full audit", () => {
+    const mixedSamples: 字符数据[] = [
+      ...reviewedSamples.slice(0, 2),
+      {
+        unicode: 0x4e13,
+        glyphs: [{ id: 100, sources: ["G", "T"] }],
+      },
+    ];
+    const visualCandidate: 字符数据 = {
+      unicode: 0x6405,
+      glyphs: [{ id: 100, sources: ["G", "H", "T"] }],
+    };
+    const audit = auditUnihanSources(
+      new Map([[visualCandidate.unicode, ["G", "H", "T"]]]),
+      [...mixedSamples, visualCandidate],
+      glyphs,
+      {
+        reviewedDecisions: [
+          {
+            unicode: visualCandidate.unicode,
+            source: "H",
+            referenceId: 1,
+            replacementId: 1,
+          },
+        ],
+        visualEvidence: new Map([
+          [
+            visualCandidate.unicode,
+            { sameEdges: [], likelySameEdges: ["H/T"] },
+          ],
+        ]),
+      },
+    );
+
+    const item = audit.items[0]!;
+    expect(item.status).toBe("insufficient-evidence");
+    expect(
+      item.unresolved
+        .find(({ source }) => source === "T")
+        ?.evidence.find(({ referenceId }) => referenceId === 1),
+    ).toMatchObject({
+      replacementId: 1,
+      statisticalReplacementId: 2,
+      reliable: false,
+      visualSupport: { level: "likely", anchorSources: ["H"] },
+    });
   });
 });
 
