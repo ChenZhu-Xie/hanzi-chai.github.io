@@ -425,4 +425,25 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 1019,
     replacementId: 4110,
   })),
+
+  // U+6690 暐: J uses 韋 126927, whose bottom is 438. Its bottom horizontal
+  // protrudes left of the left vertical; 4179 -> 255 starts flush there.
+  {
+    unicode: 0x6690,
+    source: "J",
+    referenceId: 4179,
+    replacementId: 126927,
+  },
+
+  // U+7740 着: the J-source upper component is 62022 = ⿱(929, 5), not
+  // component 928. On its last horizontal the central vertical and the
+  // separate left-falling stroke cross at two horizontally offset points;
+  // the vertical crossing is close to a right angle. The overall curved
+  // outline is deliberately not evidence because both candidates have one.
+  {
+    unicode: 0x7740,
+    source: "J",
+    referenceId: 928,
+    replacementId: 62022,
+  },
 ].map((decision) => ({ ...decision, provenance: "manual" }));

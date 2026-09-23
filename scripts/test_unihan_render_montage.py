@@ -53,6 +53,56 @@ class PdfCellTests(unittest.TestCase):
         self.assertEqual(len(endpoints), 3)
         self.assertEqual(len(junctions), 1)
 
+    def test_local_topology_rejects_one_curved_stroke_as_split_strokes(self):
+        image = Image.new("L", (160, 160), "white")
+        draw = ImageDraw.Draw(image)
+        for y in (35, 70, 105):
+            draw.line((20, y, 140, y), fill="black", width=5)
+        draw.line((92, 18, 92, 78), fill="black", width=5)
+        draw.line((92, 78, 52, 145), fill="black", width=5)
+
+        evidence = MONTAGE.horizontal_crossing_consensus(image)
+
+        self.assertEqual(evidence["decision"], "abstain")
+
+    def test_local_topology_finds_offset_vertical_and_falling_crossings(self):
+        image = Image.new("L", (160, 160), "white")
+        draw = ImageDraw.Draw(image)
+        for y in (35, 70, 105):
+            draw.line((20, y, 140, y), fill="black", width=5)
+        draw.line((96, 18, 96, 145), fill="black", width=5)
+        draw.line((72, 84, 36, 145), fill="black", width=5)
+
+        evidence = MONTAGE.horizontal_crossing_consensus(image)
+
+        self.assertEqual(
+            evidence["decision"], "split-vertical-and-falling-strokes"
+        )
+        self.assertIn(evidence["consensus"], {"2/3", "3/3"})
+
+    def test_combines_pdf_crossings_with_candidate_stroke_identity(self):
+        evidence = {"decision": "split-vertical-and-falling-strokes"}
+        candidates = {
+            "18132": [{"hasSeparateVerticalAndFallingLeaves": False}],
+            "900104": [{"hasSeparateVerticalAndFallingLeaves": True}],
+        }
+
+        choice = MONTAGE.choose_split_stroke_candidate(evidence, candidates)
+
+        self.assertEqual(choice["decision"], "candidate")
+        self.assertEqual(choice["candidateId"], 900104)
+
+    def test_candidate_match_abstains_when_structure_is_not_unique(self):
+        evidence = {"decision": "split-vertical-and-falling-strokes"}
+        candidates = {
+            "1": [{"hasSeparateVerticalAndFallingLeaves": True}],
+            "2": [{"hasSeparateVerticalAndFallingLeaves": True}],
+        }
+
+        choice = MONTAGE.choose_split_stroke_candidate(evidence, candidates)
+
+        self.assertEqual(choice["decision"], "abstain")
+
     def test_structure_guided_focus_abstains_instead_of_claiming_touching_other_part(self):
         size = 128
         pdf = Image.new("RGB", (size, size), "white")
@@ -89,6 +139,31 @@ class PdfCellTests(unittest.TestCase):
 
         self.assertTrue(pdf_mask.any())
         self.assertEqual(MONTAGE.topology_signature(focused[0])["components"], 1)
+
+    def test_candidate_topology_uses_unoccluded_target_only_layer(self):
+        size = 128
+        pdf = Image.new("RGB", (size, size), "white")
+        ImageDraw.Draw(pdf).line((15, 64, 113, 64), fill="black", width=7)
+
+        full = Image.new("RGB", (size, size), "white")
+        full_draw = ImageDraw.Draw(full)
+        full_draw.line((15, 64, 113, 64), fill="#2563eb", width=7)
+        # Simulate a later-drawn neighbouring component obscuring the center.
+        full_draw.rectangle((52, 58, 76, 70), fill="black")
+
+        target_only = Image.new("RGB", (size, size), "white")
+        ImageDraw.Draw(target_only).line(
+            (15, 64, 113, 64), fill="#2563eb", width=7
+        )
+
+        occluded = MONTAGE.structure_guided_focus(pdf, [full], "2563eb")
+        isolated = MONTAGE.structure_guided_focus(
+            pdf, [full], "2563eb", [target_only]
+        )
+        occluded_ink = (np.asarray(occluded[1].convert("L")) < 224).sum()
+        isolated_ink = (np.asarray(isolated[1].convert("L")) < 224).sum()
+
+        self.assertGreater(isolated_ink, occluded_ink)
 
     def test_marks_the_same_feature_in_glyph_and_topology_rows(self):
         montage = Image.new("RGB", (768, 580), "white")

@@ -59,6 +59,21 @@ describe("glyph SVG rendering", () => {
     expect(svg).toContain('stroke="#16a34a"');
   });
 
+  test("can omit non-target strokes without changing the SVG coordinate box", () => {
+    const svg = glyphToSvgMarkup(
+      图形盒子.从笔画列表构建([
+        { feature: "横", start: [10, 20], curveList: [{ command: "h", parameterList: [80] }] },
+        { feature: "竖", start: [50, 10], curveList: [{ command: "v", parameterList: [80] }] },
+      ]),
+      false,
+      { strokeVisibility: [true, false] },
+    );
+
+    expect(svg).toContain('d="M10 20 h80"');
+    expect(svg).not.toContain('d="M50 10 v80"');
+    expect(svg.match(/<path/g)).toHaveLength(1);
+  });
+
   test("tracks leaf ownership through compound stroke order", () => {
     const glyphs = [
       {
