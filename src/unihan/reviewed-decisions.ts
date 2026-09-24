@@ -1,6 +1,26 @@
 import type { ReviewedSourceDecision } from "./index";
 
 /**
+ * Confirmed source forms whose required sibling component does not exist in
+ * the repository yet. They are intentionally excluded from automatic apply
+ * until the new component receives a real database ID.
+ */
+export const REVIEWED_MISSING_SIBLING_DECISIONS = [
+  {
+    unicode: 0x9aa8,
+    sources: ["H", "T", "J", "K", "N"],
+    referenceId: 752,
+    topology: "inner-horizontal-right-of-middle-vertical",
+  },
+  {
+    unicode: 0x9aa8,
+    sources: ["V"],
+    referenceId: 752,
+    topology: "inner-horizontal-left-of-middle-vertical",
+  },
+] as const;
+
+/**
  * Source-specific component decisions checked by a maintainer against the
  * Unicode 18.0 U4E00 chart. Keep these at the smallest differing subtree: a
  * decision about 粦's lower-right leaf can then support every structurally

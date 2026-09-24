@@ -29,6 +29,12 @@ MATCHER = load_matcher()
 PDF = MATCHER.PDF
 cv2 = MATCHER.cv2
 
+TOPOLOGY_COLORS = {
+    "endpoint": (220, 38, 38),
+    "junction": (2, 132, 199),
+    "corner": (22, 163, 74),
+}
+
 
 def pdf_cell(page, bbox, page_size, size=256):
     x_scale = page.width / page_size[0]
@@ -417,6 +423,43 @@ def choose_split_stroke_candidate(pdf_evidence: dict, candidate_topology: dict) 
     }
 
 
+def draw_topology_markers(
+    image: Image.Image,
+    endpoints: list[tuple[int, int]],
+    junctions: list[tuple[int, int]],
+    corners: list[tuple[int, int]],
+    radius=5,
+) -> Image.Image:
+    """Draw large, haloed topology nodes without confusing them with editor handles."""
+    canvas = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+    for points, color in (
+        (endpoints, TOPOLOGY_COLORS["endpoint"]),
+        (junctions, TOPOLOGY_COLORS["junction"]),
+        (corners, TOPOLOGY_COLORS["corner"]),
+    ):
+        for x, y in points:
+            draw.ellipse(
+                (
+                    x - radius - 2,
+                    y - radius - 2,
+                    x + radius + 2,
+                    y + radius + 2,
+                ),
+                fill="white",
+            )
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+    return canvas
+
+
+def topology_overlay(image: Image.Image) -> Image.Image:
+    """Put the lower-row topology node vocabulary onto a candidate SVG."""
+    gray = np.asarray(image.convert("L"))
+    endpoints, junctions, skeleton = topology_points(gray < 224)
+    corners = corner_points(skeleton, endpoints, junctions)
+    return draw_topology_markers(image, endpoints, junctions, corners, radius=6)
+
+
 def topology_panel(image: Image.Image) -> Image.Image:
     gray = np.asarray(image.convert("L"))
     endpoints, junctions, skeleton = topology_points(gray < 224)
@@ -425,14 +468,7 @@ def topology_panel(image: Image.Image) -> Image.Image:
     array = np.asarray(canvas).copy()
     array[skeleton] = (55, 65, 81)
     canvas = Image.fromarray(array)
-    draw = ImageDraw.Draw(canvas)
-    for x, y in endpoints:
-        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(220, 38, 38))
-    for x, y in junctions:
-        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(2, 132, 199))
-    for x, y in corners:
-        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(217, 119, 6))
-    return canvas
+    return draw_topology_markers(canvas, endpoints, junctions, corners)
 
 
 def topology_signature(image: Image.Image):
@@ -786,8 +822,16 @@ def main():
                 candidate_set_warning = bool(result.get("candidateSetIncomplete"))
                 for glyph_id in ids:
                     if glyph_id not in svg_images:
-                        svg_images[glyph_id] = render_svg_review_image(
-                            row["candidateSvgs"][str(glyph_id)],
+                        svg_markup = row["candidateSvgs"][str(glyph_id)]
+                        candidate_image = render_svg_review_image(
+                            without_review_points(svg_markup)
+                            if args.topology_row
+                            else svg_markup
+                        )
+                        svg_images[glyph_id] = (
+                            topology_overlay(candidate_image)
+                            if args.topology_row
+                            else candidate_image
                         )
                     panels.append(ImageOps.contain(svg_images[glyph_id], (256, 256)))
                     topology_svg = (
@@ -852,11 +896,11 @@ def main():
                             ]
                     draw.text(
                         (8, 306),
-                        "Topology (colored-leaf ROI): red=end, blue=branch/cross, amber=degree-2 sharp turn"
+                        "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn"
                         if args.focus_color
-                        else "Topology (candidate-difference ROI): red=end, blue=branch/cross, amber=degree-2 sharp turn"
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn"
                         if args.focus_differences
-                        else "Topology: red=end, blue=branch/cross, amber=degree-2 sharp turn",
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn",
                         fill="black",
                     )
                     for index, panel in enumerate(topology_inputs):
