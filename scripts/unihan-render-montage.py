@@ -638,10 +638,17 @@ def structure_guided_focus(
     candidate_images: list[Image.Image],
     color: str,
     candidate_target_images: list[Image.Image] | None = None,
+    complete_target_window: bool = False,
 ):
     """Attribute PDF ink to a leaf after aligning on all invariant leaves."""
-    masks = structure_guided_focus_masks(
-        pdf_image, candidate_images, color, candidate_target_images
+    masks = (
+        target_window_focus_masks(
+            pdf_image, candidate_images, color, candidate_target_images
+        )
+        if complete_target_window
+        else structure_guided_focus_masks(
+            pdf_image, candidate_images, color, candidate_target_images
+        )
     )
     return [mask_panel(mask) for mask in masks]
 
@@ -928,6 +935,7 @@ def main():
                                 topology_inputs[1:],
                                 args.focus_color,
                                 topology_target_inputs,
+                                complete_target_window=True,
                             )
                         else:
                             focus_box = discriminative_box(topology_inputs[1:])

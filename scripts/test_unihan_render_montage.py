@@ -244,6 +244,29 @@ class PdfCellTests(unittest.TestCase):
 
         self.assertGreater(isolated_ink, occluded_ink)
 
+    def test_complete_target_window_keeps_every_disconnected_subpart(self):
+        size = 128
+        pdf = Image.new("RGB", (size, size), "white")
+        pdf_draw = ImageDraw.Draw(pdf)
+        pdf_draw.rectangle((52, 18, 96, 52), outline="black", width=5)
+        pdf_draw.line((72, 76, 98, 76), fill="black", width=5)
+
+        candidate = Image.new("RGB", (size, size), "white")
+        candidate_draw = ImageDraw.Draw(candidate)
+        candidate_draw.rectangle((52, 18, 96, 52), outline="#f59e0b", width=5)
+        candidate_draw.line((72, 76, 98, 76), fill="#f59e0b", width=5)
+
+        focused = MONTAGE.structure_guided_focus(
+            pdf,
+            [candidate],
+            "f59e0b",
+            complete_target_window=True,
+        )
+
+        self.assertGreaterEqual(
+            MONTAGE.topology_signature(focused[0])["components"], 2
+        )
+
     def test_marks_the_same_feature_in_glyph_and_topology_rows(self):
         montage = Image.new("RGB", (768, 580), "white")
 

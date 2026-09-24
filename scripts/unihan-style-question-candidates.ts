@@ -25,6 +25,7 @@ const payload = (await Bun.file(values.input).json()) as {
     candidateFocusSvgs?: Record<string, string>;
     candidateTopologySvgs?: Record<string, string>;
     candidateFocusIds?: Record<string, number[]>;
+    candidateLeafStrokeIds?: Record<string, number[]>;
     candidateFocusTopology?: Record<
       string,
       Array<{
@@ -99,6 +100,12 @@ const familyDescendants = (id: number, seen = new Set<number>()): number[] => {
 };
 
 for (const row of payload.rows) {
+  row.candidateLeafStrokeIds = Object.fromEntries(
+    Object.keys(row.candidates).map((id) => [
+      id,
+      glyphLeafStrokeIds(Number(id), glyphById),
+    ]),
+  );
   row.candidateFocusIds = Object.fromEntries(
     Object.keys(row.candidates).map((id) => [
       id,

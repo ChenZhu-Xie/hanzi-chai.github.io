@@ -6,6 +6,24 @@ import {
   REVIEWED_SOURCE_DECISIONS,
 } from "./reviewed-decisions";
 
+test("records the recursive topology review batch at the differing subtree", () => {
+  for (const [unicode, source, referenceId, replacementId] of [
+    [0x6418, "T", 9313, 127551],
+    [0x6461, "J", 7368, 46403],
+    [0x6478, "J", 7695, 7695],
+    [0x64ec, "T", 5201, 128254],
+    [0x655a, "T", 1028, 1028],
+  ] as const) {
+    expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
+      unicode,
+      source,
+      referenceId,
+      replacementId,
+      provenance: "manual",
+    });
+  }
+});
+
 test("keeps two horizontal strokes in reviewed J-source 月 forms", () => {
   for (const unicode of [0x6714, 0x6715, 0x6717, 0x6ed5, 0x80ba, 0x9a30]) {
     expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
