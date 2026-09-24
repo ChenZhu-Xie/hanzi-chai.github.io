@@ -165,6 +165,11 @@ def score_rows(rows: list[dict], weights: tuple[float, ...]):
         best_distance, predicted = distances[0]
         second_distance = distances[1][0] if len(distances) > 1 else best_distance
         tie = len(distances) > 1 and second_distance == best_distance
+        exact_component_matches = [
+            int(glyph_id)
+            for glyph_id, signature in candidate_signatures.items()
+            if signature["components"] == pdf["components"]
+        ]
         scored.append(
             {
                 **row,
@@ -179,6 +184,12 @@ def score_rows(rows: list[dict], weights: tuple[float, ...]):
                     )
                     for glyph_id in candidate_signatures
                 },
+                "exactComponentPredictionGlyphId": (
+                    exact_component_matches[0]
+                    if len(exact_component_matches) == 1
+                    else None
+                ),
+                "exactComponentCandidateIds": exact_component_matches,
             }
         )
     return scored
@@ -232,6 +243,11 @@ def main():
     parser.add_argument("--pages-dir", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--fixed-weights",
+        action="store_true",
+        help="skip calibration when only categorical subtree topology is needed",
+    )
     args = parser.parse_args()
 
     payload = json.loads(args.candidates.read_text("utf-8"))
@@ -306,7 +322,7 @@ def main():
 
     raw = prepare_distances(raw)
     train_raw = [row for row in raw if row["split"] == "train"]
-    weight_candidates = [
+    weight_candidates = [] if args.fixed_weights else [
         (
             component,
             endpoint,
@@ -326,20 +342,25 @@ def main():
         for local_difference in (0.0, 2.0, 4.0, 8.0)
         for orientation in (0.0, 1.0, 2.0, 4.0)
     ]
-    ranked = []
-    for weights in weight_candidates:
-        scored = score_rows(train_raw, weights)
-        report = summary(scored)
-        ranked.append(
-            (
-                report["correct"],
-                report["accuracyWhenAttempted"] or 0,
-                report["coverage"] or 0,
-                -sum(weights),
-                weights,
+    if args.fixed_weights:
+        # The topology cascade consumes the categorical exact-component field,
+        # which is independent of these descriptive ranking weights.
+        weights = (2.0, 1.0, 0.25, 0.0, 0.25, 0.0, 0.0, 0.0)
+    else:
+        ranked = []
+        for weights in weight_candidates:
+            scored = score_rows(train_raw, weights)
+            report = summary(scored)
+            ranked.append(
+                (
+                    report["correct"],
+                    report["accuracyWhenAttempted"] or 0,
+                    report["coverage"] or 0,
+                    -sum(weights),
+                    weights,
+                )
             )
-        )
-    weights = max(ranked)[-1]
+        weights = max(ranked)[-1]
     scored = score_rows(raw, weights)
     train = [row for row in scored if row["split"] == "train"]
     test = [row for row in scored if row["split"] == "test"]

@@ -524,4 +524,16 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 6054,
     replacementId: 48986,
   })),
+
+  // Recursive topology review batch. These decisions were made at the lowest
+  // differing subtree, not from whole-glyph optical similarity:
+  // - 搘/擬: 匕's first stroke is 横 (1128), not 平撇 (133).
+  // - 摡: the J form keeps the complete 白-over-匕 subtree in 46403.
+  // - 摸: J keeps grass sibling 228 inside 7695.
+  // - 敚: T keeps the 倒八 component 1028, not 正八-over-737 (13645).
+  { unicode: 0x6418, source: "T", referenceId: 9313, replacementId: 127551 },
+  { unicode: 0x6461, source: "J", referenceId: 7368, replacementId: 46403 },
+  { unicode: 0x6478, source: "J", referenceId: 7695, replacementId: 7695 },
+  { unicode: 0x64ec, source: "T", referenceId: 5201, replacementId: 128254 },
+  { unicode: 0x655a, source: "T", referenceId: 1028, replacementId: 1028 },
 ].map((decision) => ({ ...decision, provenance: "manual" }));

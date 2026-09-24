@@ -91,21 +91,23 @@ def render_raw_strokes(strokes: list[dict], size=128) -> np.ndarray:
     return canvas
 
 
-def render_strokes(strokes: list[dict], size=128) -> np.ndarray:
-    return normalize_skeleton(render_raw_strokes(strokes, size) > 24)
+def render_strokes(strokes: list[dict], size=128, output_size=64) -> np.ndarray:
+    return normalize_skeleton(render_raw_strokes(strokes, size) > 24, output_size)
 
 
-def render_stroke_layers(strokes: list[dict], size=128) -> list[np.ndarray]:
+def render_stroke_layers(
+    strokes: list[dict], size=128, output_size=64
+) -> list[np.ndarray]:
     layers = [render_raw_strokes([stroke], size) > 24 for stroke in strokes]
     if not layers:
         return []
     union = np.logical_or.reduce(layers)
     points = np.argwhere(union)
     if points.size == 0:
-        return [np.zeros((64, 64), dtype=bool) for _ in layers]
+        return [np.zeros((output_size, output_size), dtype=bool) for _ in layers]
     top, left = points.min(axis=0)
     bottom, right = points.max(axis=0) + 1
-    target = 54
+    target = output_size - max(10, output_size // 8)
     scale = min(target / (right - left), target / (bottom - top))
     width = max(1, round((right - left) * scale))
     height = max(1, round((bottom - top) * scale))
@@ -113,9 +115,9 @@ def render_stroke_layers(strokes: list[dict], size=128) -> list[np.ndarray]:
     for layer in layers:
         ink = layer[top:bottom, left:right].astype(np.uint8) * 255
         resized = cv2.resize(ink, (width, height), interpolation=cv2.INTER_AREA)
-        canvas = np.zeros((64, 64), dtype=bool)
-        y = (64 - height) // 2
-        x = (64 - width) // 2
+        canvas = np.zeros((output_size, output_size), dtype=bool)
+        y = (output_size - height) // 2
+        x = (output_size - width) // 2
         canvas[y : y + height, x : x + width] = resized > 24
         normalized.append(skeletonize(canvas))
     return normalized
@@ -132,14 +134,14 @@ def skeletonize(binary: np.ndarray) -> np.ndarray:
     return skeleton > 0
 
 
-def normalize_skeleton(binary: np.ndarray) -> np.ndarray:
+def normalize_skeleton(binary: np.ndarray, output_size=64) -> np.ndarray:
     points = np.argwhere(binary)
     if points.size == 0:
-        return np.zeros((64, 64), dtype=bool)
+        return np.zeros((output_size, output_size), dtype=bool)
     top, left = points.min(axis=0)
     bottom, right = points.max(axis=0) + 1
     ink = binary[top:bottom, left:right].astype(np.uint8) * 255
-    target = 54
+    target = output_size - max(10, output_size // 8)
     scale = min(target / ink.shape[1], target / ink.shape[0])
     resized = cv2.resize(
         ink,
@@ -149,9 +151,9 @@ def normalize_skeleton(binary: np.ndarray) -> np.ndarray:
         ),
         interpolation=cv2.INTER_AREA,
     )
-    normalized = np.zeros((64, 64), dtype=bool)
-    y = (64 - resized.shape[0]) // 2
-    x = (64 - resized.shape[1]) // 2
+    normalized = np.zeros((output_size, output_size), dtype=bool)
+    y = (output_size - resized.shape[0]) // 2
+    x = (output_size - resized.shape[1]) // 2
     normalized[y : y + resized.shape[0], x : x + resized.shape[1]] = resized > 24
     return skeletonize(normalized)
 
@@ -189,8 +191,8 @@ def render_svg_image(svg: str, size=256) -> np.ndarray:
     return image
 
 
-def render_svg(svg: str, size=256) -> np.ndarray:
-    return normalize_skeleton(render_svg_image(svg, size) < 224)
+def render_svg(svg: str, size=256, output_size=64) -> np.ndarray:
+    return normalize_skeleton(render_svg_image(svg, size) < 224, output_size)
 
 
 def discriminative_distance(
@@ -504,10 +506,12 @@ def align_candidates_to_pdf(
         return float(target_distance[ys[inside], xs[inside]].mean())
 
     best = (math.inf, 1.0, 1.0, 0, 0)
+    translation = max(6, round(pdf.shape[1] * 0.095))
+    coarse_step = max(2, round(pdf.shape[1] / 32))
     for scale_x in (0.9, 1.0, 1.1):
         for scale_y in (0.9, 1.0, 1.1):
-            for dx in range(-6, 7, 2):
-                for dy in range(-6, 7, 2):
+            for dx in range(-translation, translation + 1, coarse_step):
+                for dy in range(-translation, translation + 1, coarse_step):
                     candidate = (
                         score(scale_x, scale_y, dx, dy),
                         scale_x,
@@ -518,10 +522,17 @@ def align_candidates_to_pdf(
                     if candidate < best:
                         best = candidate
     _, coarse_x, coarse_y, coarse_dx, coarse_dy = best
+    fine_translation = max(2, round(pdf.shape[1] / 32))
     for scale_x in np.arange(coarse_x - 0.04, coarse_x + 0.041, 0.02):
         for scale_y in np.arange(coarse_y - 0.04, coarse_y + 0.041, 0.02):
-            for dx in range(coarse_dx - 2, coarse_dx + 3):
-                for dy in range(coarse_dy - 2, coarse_dy + 3):
+            for dx in range(
+                coarse_dx - fine_translation,
+                coarse_dx + fine_translation + 1,
+            ):
+                for dy in range(
+                    coarse_dy - fine_translation,
+                    coarse_dy + fine_translation + 1,
+                ):
                     candidate = (
                         score(scale_x, scale_y, dx, dy),
                         scale_x,
@@ -571,7 +582,9 @@ def stroke_kind(stroke: dict) -> tuple:
     )
 
 
-def unmatched_stroke_indices(strokes: list[dict], other: list[dict]) -> set[int]:
+def unmatched_stroke_indices(
+    strokes: list[dict], other: list[dict], maximum_start_distance=10.0
+) -> set[int]:
     """Greedily match same-topology strokes by location and return leftovers."""
     unmatched = set(range(len(strokes)))
     used_other: set[int] = set()
@@ -581,6 +594,12 @@ def unmatched_stroke_indices(strokes: list[dict], other: list[dict]) -> set[int]
             if stroke_kind(left) != stroke_kind(right):
                 continue
             distance = math.dist(left["start"], right["start"])
+            # Matching a same-named stroke on the opposite side of a component
+            # destroys exactly the topology we need to inspect (for example
+            # 倒八 点+撇 versus 正八 撇+捺).  Ten repository units tolerates
+            # layout jitter while preserving left/right and upper/lower roles.
+            if distance > maximum_start_distance:
+                continue
             pairs.append((distance, left_index, right_index))
     for _, left_index, right_index in sorted(pairs):
         if left_index not in unmatched or right_index in used_other:
@@ -646,6 +665,309 @@ def topology_distances(
             values = target_distance[unique_mask].tolist()
         distances.append(float(np.mean(values)) if values else 0.0)
     return distances
+
+
+def _directed_orientation_distance(
+    source: np.ndarray, target: np.ndarray, missing_penalty=16.0
+) -> float:
+    """Measure stroke direction before contour proximity.
+
+    Each source pixel is compared only with target pixels having the same local
+    orientation.  This prevents a nearby falling stroke from satisfying a
+    horizontal candidate merely because the two contours happen to touch.
+    """
+    values = []
+    for source_orientation, target_orientation in zip(
+        orientation_maps(source), orientation_maps(target)
+    ):
+        if not source_orientation.any():
+            continue
+        if not target_orientation.any():
+            values.extend([missing_penalty] * int(source_orientation.sum()))
+            continue
+        distance = PDF.distance_transform_edt(~target_orientation)
+        values.extend(
+            np.minimum(distance[source_orientation], missing_penalty).tolist()
+        )
+    if values:
+        return float(np.mean(values))
+    if not source.any():
+        return 0.0
+    if not target.any():
+        return missing_penalty
+    distance = PDF.distance_transform_edt(~target)
+    return float(np.minimum(distance[source], missing_penalty).mean())
+
+
+def _leaf_groups(leaf_ids: list[int]) -> list[dict]:
+    """Group consecutive strokes belonging to one terminal component use."""
+    groups = []
+    for stroke_index, leaf_id in enumerate(leaf_ids):
+        if groups and groups[-1]["id"] == leaf_id:
+            groups[-1]["strokeIndices"].append(stroke_index)
+        else:
+            groups.append({"id": leaf_id, "strokeIndices": [stroke_index]})
+    return groups
+
+
+def _lcs_left_indices(left: list[int], right: list[int]) -> set[int]:
+    """Return indices from one deterministic longest common subsequence."""
+    lengths = [[0] * (len(right) + 1) for _ in range(len(left) + 1)]
+    for left_index in range(len(left) - 1, -1, -1):
+        for right_index in range(len(right) - 1, -1, -1):
+            if left[left_index] == right[right_index]:
+                lengths[left_index][right_index] = (
+                    1 + lengths[left_index + 1][right_index + 1]
+                )
+            else:
+                lengths[left_index][right_index] = max(
+                    lengths[left_index + 1][right_index],
+                    lengths[left_index][right_index + 1],
+                )
+    matched = set()
+    left_index = right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        if (
+            left[left_index] == right[right_index]
+            and lengths[left_index][right_index]
+            == 1 + lengths[left_index + 1][right_index + 1]
+        ):
+            matched.add(left_index)
+            left_index += 1
+            right_index += 1
+        elif lengths[left_index + 1][right_index] >= lengths[left_index][right_index + 1]:
+            left_index += 1
+        else:
+            right_index += 1
+    return matched
+
+
+def recursive_unique_stroke_indices(
+    candidate_strokes: list[list[dict]],
+    candidate_leaf_ids: list[list[int]] | None,
+) -> tuple[list[set[int]], list[list[dict]] | None, list[set[int]]]:
+    """Find the lowest-level disagreement between candidate component trees.
+
+    Terminal component identity is stronger than a same-looking stroke elsewhere
+    in the character.  LCS matching preserves repeated components and their
+    parent order, so a 撇 on the left cannot cancel a 撇 on the right.  Older
+    evidence without leaf provenance falls back to stroke topology + position.
+    """
+    if candidate_leaf_ids and all(
+        len(ids) == len(strokes)
+        for ids, strokes in zip(candidate_leaf_ids, candidate_strokes)
+    ):
+        groups = [_leaf_groups(ids) for ids in candidate_leaf_ids]
+        leaf_unique = []
+        for candidate_index, candidate_groups in enumerate(groups):
+            common = set(range(len(candidate_groups)))
+            left = [group["id"] for group in candidate_groups]
+            for other_index, other_groups in enumerate(groups):
+                if candidate_index == other_index:
+                    continue
+                common &= _lcs_left_indices(
+                    left, [group["id"] for group in other_groups]
+                )
+            leaf_unique.append(
+                {
+                    stroke_index
+                    for group_index, group in enumerate(candidate_groups)
+                    if group_index not in common
+                    for stroke_index in group["strokeIndices"]
+                }
+            )
+        # Descend one level further: within the differing terminal components,
+        # remove strokes whose topology and local role still agree.  For 匕
+        # siblings this keeps only 横↔撇 while discarding their common 竖弯钩.
+        refined: list[set[int]] = []
+        for candidate_index, (strokes, candidate_indices) in enumerate(
+            zip(candidate_strokes, leaf_unique)
+        ):
+            ordered = sorted(candidate_indices)
+            local_strokes = [strokes[index] for index in ordered]
+            remaining: set[int] = set()
+            for other_index, (other_strokes, other_indices) in enumerate(
+                zip(candidate_strokes, leaf_unique)
+            ):
+                if candidate_index == other_index:
+                    continue
+                other_ordered = sorted(other_indices)
+                remaining |= unmatched_stroke_indices(
+                    local_strokes,
+                    [other_strokes[index] for index in other_ordered],
+                )
+            refined.append({ordered[index] for index in remaining})
+        # An empty side represents an absent stroke rather than a directly
+        # observable stroke class. Preserve the complete differing subtree so
+        # absence is judged from the full local topology, not from an infinity
+        # placeholder.
+        return (
+            refined if all(indices for indices in refined) else leaf_unique,
+            groups,
+            leaf_unique,
+        )
+
+    unique = []
+    for candidate_index, strokes in enumerate(candidate_strokes):
+        indices: set[int] = set()
+        for other_index, other in enumerate(candidate_strokes):
+            if candidate_index != other_index:
+                indices.update(unmatched_stroke_indices(strokes, other))
+        unique.append(indices)
+    return unique, None, unique
+
+
+def recursive_stroke_distances(
+    pdf: np.ndarray,
+    candidate_images: list[np.ndarray],
+    candidate_strokes: list[list[dict]],
+    candidate_layers: list[list[np.ndarray]],
+    alignment: dict | None,
+    candidate_leaf_ids: list[list[int]] | None = None,
+) -> tuple[list[float], dict]:
+    """Compare only the terminal strokes that differ between sibling trees.
+
+    The candidates are first recursively flattened to their terminal strokes by
+    the repository renderer.  Strokes with the same feature, curve commands and
+    position are paired across candidates.  The unpaired strokes are the
+    smallest observable disagreement between the sibling trees.  PDF ink
+    already explained by candidate-common geometry is removed before scoring,
+    so a wrong diagonal cannot borrow evidence from another diagonal elsewhere
+    in the parent character.
+
+    This is deliberately a topology-first score.  Whole-glyph optical distance
+    remains available only as a later tie-breaker.
+    """
+    matrix = alignment_matrix(alignment, pdf.shape)
+    aligned_layers = [
+        [warp_mask(layer, matrix) for layer in layers]
+        for layers in candidate_layers
+    ]
+    unique_indices, leaf_groups, subtree_indices = recursive_unique_stroke_indices(
+        candidate_strokes, candidate_leaf_ids
+    )
+    unique_masks = []
+    for indices, layers in zip(unique_indices, aligned_layers):
+        unique_masks.append(
+            np.logical_or.reduce([layers[index] for index in sorted(indices)])
+            if indices
+            else np.zeros_like(pdf)
+        )
+    subtree_masks = [
+        np.logical_or.reduce([layers[index] for index in sorted(indices)])
+        if indices
+        else np.zeros_like(pdf)
+        for indices, layers in zip(subtree_indices, aligned_layers)
+    ]
+    if not any(mask.any() for mask in unique_masks):
+        return [0.0 for _ in candidate_images], {
+            "decision": "abstain",
+            "reason": "no-terminal-stroke-difference",
+            "uniqueStrokeIndices": [sorted(value) for value in unique_indices],
+            "terminalLeafGroups": leaf_groups,
+        }
+
+    scale = max(1.0, pdf.shape[1] / 64)
+    unique_union = np.logical_or.reduce(unique_masks)
+    roi_width = max(11, round(11 * scale))
+    if roi_width % 2 == 0:
+        roi_width += 1
+    roi = cv2.dilate(
+        unique_union.astype(np.uint8), np.ones((roi_width, roi_width), np.uint8)
+    ).astype(bool)
+    common = candidate_consensus(candidate_images, tolerance=2.0 * scale)
+    common_distance = PDF.distance_transform_edt(~common)
+    # Keep only PDF ink that candidate-common terminal strokes cannot explain.
+    # The small tolerance absorbs antialiasing and registration noise without
+    # erasing a genuinely different horizontal/diagonal stroke.
+    pdf_difference = pdf & roi & (common_distance > 2.0 * scale)
+
+    def component_count(mask: np.ndarray) -> int:
+        reconnect = cv2.dilate(
+            mask.astype(np.uint8),
+            np.ones((max(1, round(scale)), max(1, round(scale))), np.uint8),
+        ).astype(bool)
+        skeleton = skeletonize(reconnect)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            skeleton.astype(np.uint8), 8
+        )
+        minimum_pixels = max(2, round(scale * 2))
+        return sum(
+            int(stats[label, cv2.CC_STAT_AREA]) >= minimum_pixels
+            for label in range(1, count)
+        )
+
+    # Use a complete local window for component-count topology. Unlike the
+    # residual score below, this intentionally retains shared strokes such as
+    # 白 above 匕. It fixes the failure mode where connected-component
+    # attribution dropped 白 before topology analysis.
+    topology_window_width = max(9, round(9 * scale))
+    if topology_window_width % 2 == 0:
+        topology_window_width += 1
+    subtree_union = np.logical_or.reduce(subtree_masks)
+    topology_window = cv2.dilate(
+        subtree_union.astype(np.uint8),
+        np.ones((topology_window_width, topology_window_width), np.uint8),
+    ).astype(bool)
+    pdf_component_count = component_count(pdf & topology_window)
+    candidate_component_counts = [component_count(mask) for mask in subtree_masks]
+    exact_component_indices = [
+        index
+        for index, count in enumerate(candidate_component_counts)
+        if count == pdf_component_count
+    ]
+    if not pdf_difference.any():
+        return [math.inf for _ in candidate_images], {
+            "decision": "abstain",
+            "reason": "no-unexplained-pdf-ink-in-difference-window",
+            "uniqueStrokeIndices": [sorted(value) for value in unique_indices],
+            "terminalLeafGroups": leaf_groups,
+        }
+
+    scores = []
+    details = []
+    for mask in unique_masks:
+        if not mask.any():
+            scores.append(math.inf)
+            details.append({"forward": math.inf, "reverse": math.inf})
+            continue
+        forward = _directed_orientation_distance(mask, pdf_difference)
+        # Reverse evidence is intentionally weaker: neighbouring parent strokes
+        # can enter the window, but the expected PDF stroke must still be
+        # explained by the candidate.
+        reverse = _directed_orientation_distance(pdf_difference, mask)
+        score = forward + 0.35 * reverse
+        scores.append(score)
+        details.append(
+            {
+                "forward": round(forward, 4),
+                "reverse": round(reverse, 4),
+                "score": round(score, 4),
+            }
+        )
+    finite = sorted((score, index) for index, score in enumerate(scores))
+    margin = (
+        finite[1][0] - finite[0][0]
+        if len(finite) > 1 and math.isfinite(finite[1][0])
+        else 0.0
+    )
+    return scores, {
+        "decision": "candidate" if margin > 0 else "abstain",
+        "candidateIndex": finite[0][1] if finite and margin > 0 else None,
+        "margin": round(margin, 4),
+        "uniqueStrokeIndices": [sorted(value) for value in unique_indices],
+        "differingSubtreeStrokeIndices": [
+            sorted(value) for value in subtree_indices
+        ],
+        "terminalLeafGroups": leaf_groups,
+        "pdfDifferencePixels": int(pdf_difference.sum()),
+        "candidateDetails": details,
+        "pdfComponentCount": pdf_component_count,
+        "candidateComponentCounts": candidate_component_counts,
+        "exactComponentCandidateIndex": (
+            exact_component_indices[0] if len(exact_component_indices) == 1 else None
+        ),
+    }
 
 
 def confidence_threshold(results: list[dict], precision_target=0.995):
@@ -801,7 +1123,9 @@ def main():
     )
     parser.add_argument("--alignment", choices=("none", "common"), default="none")
     parser.add_argument("--topology-weight", type=float, default=0.0)
+    parser.add_argument("--evidence-size", type=int, default=128)
     args = parser.parse_args()
+    evidence_size = args.evidence_size
 
     candidate_rows = json.loads(args.candidates.read_text(encoding="utf-8"))["rows"]
     candidates_by_unicode = {row["unicode"]: row for row in candidate_rows}
@@ -817,16 +1141,28 @@ def main():
             numeric_id = int(glyph_id)
             if numeric_id in rendered:
                 continue
-            stroke_layers[numeric_id] = render_stroke_layers(strokes)
+            stroke_layers[numeric_id] = render_stroke_layers(
+                strokes,
+                size=max(128, evidence_size * 2),
+                output_size=evidence_size,
+            )
             if args.renderer == "svg":
                 svg = row.get("candidateSvgs", {}).get(glyph_id)
                 if svg is None:
                     raise RuntimeError(
                         f"candidate {glyph_id} has no SVG; regenerate candidate evidence"
                     )
-                rendered[numeric_id] = render_svg(svg)
+                rendered[numeric_id] = render_svg(
+                    svg,
+                    size=max(256, evidence_size * 3),
+                    output_size=evidence_size,
+                )
             else:
-                rendered[numeric_id] = render_strokes(strokes)
+                rendered[numeric_id] = render_strokes(
+                    strokes,
+                    size=max(128, evidence_size * 2),
+                    output_size=evidence_size,
+                )
 
     results = []
     for page_number, page_records in sorted(records_by_page.items()):
@@ -837,7 +1173,10 @@ def main():
                 if expected is None:
                     continue
                 pdf_skeleton = PDF.normalized_skeleton(
-                    page, record["bbox"], page_sizes[page_number]
+                    page,
+                    record["bbox"],
+                    page_sizes[page_number],
+                    size=evidence_size,
                 )
                 candidate_ids = [int(glyph_id) for glyph_id in row["candidates"]]
                 candidate_images = [rendered[glyph_id] for glyph_id in candidate_ids]
@@ -865,13 +1204,55 @@ def main():
                     candidate_layers,
                     alignment,
                 )
+                recursive_scores, recursive_report = recursive_stroke_distances(
+                    pdf_skeleton,
+                    candidate_images,
+                    candidate_strokes,
+                    candidate_layers,
+                    alignment,
+                    [
+                        (
+                            row.get("candidateLeafStrokeIds")
+                            or row.get("candidateLeafIds")
+                            or {}
+                        ).get(str(glyph_id), [])
+                        for glyph_id in candidate_ids
+                    ]
+                    if row.get("candidateLeafStrokeIds")
+                    or row.get("candidateLeafIds")
+                    else None,
+                )
                 scores = [
                     visual + args.topology_weight * topology
                     for visual, topology in zip(visual_scores, topology_scores)
                 ]
                 distances = sorted(zip(scores, candidate_ids))
-                best_distance, best_id = distances[0]
-                second_distance = distances[1][0]
+                optical_best_distance, optical_best_id = distances[0]
+                recursive_ranking = sorted(zip(recursive_scores, candidate_ids))
+                recursive_best_distance, recursive_best_id = recursive_ranking[0]
+                exact_component_index = recursive_report.get(
+                    "exactComponentCandidateIndex"
+                )
+                if exact_component_index is not None:
+                    recursive_best_id = candidate_ids[exact_component_index]
+                recursive_decisive = (
+                    recursive_report["decision"] == "candidate"
+                    and math.isfinite(recursive_best_distance)
+                )
+                if recursive_decisive and exact_component_index is not None:
+                    best_id = recursive_best_id
+                    best_distance = recursive_scores[exact_component_index]
+                    second_distance = min(
+                        score
+                        for index, score in enumerate(recursive_scores)
+                        if index != exact_component_index
+                    )
+                else:
+                    chosen_ranking = (
+                        recursive_ranking if recursive_decisive else distances
+                    )
+                    best_distance, best_id = chosen_ranking[0]
+                    second_distance = chosen_ranking[1][0]
                 results.append(
                     {
                         "unicode": record["unicode"],
@@ -881,6 +1262,19 @@ def main():
                         "expectedGlyphId": expected,
                         "predictedGlyphId": best_id,
                         "correct": best_id == expected,
+                        "predictionMethod": (
+                            "recursive-component-count-topology"
+                            if recursive_decisive
+                            and exact_component_index is not None
+                            else "recursive-terminal-stroke-topology"
+                            if recursive_decisive
+                            else "whole-glyph-optical-fallback"
+                        ),
+                        "opticalPredictionGlyphId": optical_best_id,
+                        "recursiveTopologyPredictionGlyphId": (
+                            recursive_best_id if recursive_decisive else None
+                        ),
+                        "recursiveTopology": recursive_report,
                         "bestDistance": round(best_distance, 4),
                         "secondDistance": round(second_distance, 4),
                         "margin": round(second_distance - best_distance, 4),
@@ -896,6 +1290,9 @@ def main():
                                 ),
                                 "topologyDistance": round(
                                     topology_scores[candidate_ids.index(glyph_id)], 4
+                                ),
+                                "recursiveTopologyDistance": round(
+                                    recursive_scores[candidate_ids.index(glyph_id)], 4
                                 ),
                             }
                             for distance, glyph_id in distances
@@ -932,7 +1329,11 @@ def main():
             result["topologyGateCorrect"] = prediction == result["expectedGlyphId"]
     payload = {
         "metadata": {
-            "method": f"candidate-difference-region repository {args.renderer} render with {args.alignment} alignment, topology weight {args.topology_weight}",
+            "method": (
+                "recursive terminal-stroke topology before whole-glyph optical "
+                f"fallback; repository {args.renderer} render with "
+                f"{args.alignment} alignment at {evidence_size}px"
+            ),
             **summary,
             # This descriptive value sees both splits and must never be used as
             # an apply threshold. Only heldOutAcceptance tests train calibration.
