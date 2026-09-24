@@ -2,6 +2,8 @@ import { parseArgs } from "node:util";
 import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import { 字形库 } from "hanzi-chai";
 import {
+  glyphLeafOccurrences,
+  glyphLeafReviewColor,
   glyphLeafStrokeIds,
   glyphToSvgMarkup,
 } from "../src/components/glyph-svg";
@@ -168,6 +170,17 @@ const renderedRows = rows.flatMap((row) => {
     .filter((id) => !commonLeafIds.has(id))
     .sort((left, right) => left - right);
   const focus = new Set(focusLeafIds);
+  const colorByFamily = new Map<string, string>();
+  const colorFor = (leafId: number) => {
+    const key = familyKey(leafId);
+    let color = colorByFamily.get(key);
+    if (!color) {
+      color = glyphLeafReviewColor(colorByFamily.size);
+      colorByFamily.set(key, color);
+    }
+    return color;
+  };
+  for (const id of Object.values(leafIds).flat()) colorFor(id);
   return [
     {
       ...row,
@@ -176,8 +189,38 @@ const renderedRows = rows.flatMap((row) => {
       candidates: Object.fromEntries(
         rendered.map(([id, glyph]) => [id, glyph.图形盒子.获取笔画列表()]),
       ),
-      candidateSvgs: Object.fromEntries(
+      candidateScoringSvgs: Object.fromEntries(
         rendered.map(([id, glyph]) => [id, glyphToSvgMarkup(glyph.图形盒子)]),
+      ),
+      candidateSvgs: Object.fromEntries(
+        rendered.map(([id, glyph]) => [
+          id,
+          glyphToSvgMarkup(glyph.图形盒子, false, {
+            strokeWidthScale: 0.5,
+            showStrokeBoundaryPoints: true,
+            strokeColors: leafIds[id]!.map(colorFor),
+          }),
+        ]),
+      ),
+      candidateLeafColors: Object.fromEntries(
+        [...allLeafIds].map((id) => [id, colorFor(id)]),
+      ),
+      candidateLeafSvgs: Object.fromEntries(
+        rendered.map(([id, glyph]) => [
+          id,
+          glyphLeafOccurrences(id, glyphById).map((leaf) => ({
+            ...leaf,
+            familyKey: familyKey(leaf.leafId),
+            color: colorFor(leaf.leafId),
+            svg: glyphToSvgMarkup(glyph.图形盒子, false, {
+              strokeWidthScale: 0.5,
+              strokeColors: leafIds[id]!.map(() => colorFor(leaf.leafId)),
+              strokeVisibility: leafIds[id]!.map(
+                (_leafId, strokeIndex) => leaf.strokeIndices.includes(strokeIndex),
+              ),
+            }),
+          })),
+        ]),
       ),
       candidateFocusSvgs: Object.fromEntries(
         rendered.map(([id, glyph]) => [

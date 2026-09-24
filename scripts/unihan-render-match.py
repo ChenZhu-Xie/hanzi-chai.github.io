@@ -1464,7 +1464,9 @@ def main():
                 output_size=evidence_size,
             )
             if args.renderer == "svg":
-                svg = row.get("candidateSvgs", {}).get(glyph_id)
+                svg = row.get("candidateScoringSvgs", {}).get(glyph_id)
+                if svg is None:
+                    svg = row.get("candidateSvgs", {}).get(glyph_id)
                 if svg is None:
                     raise RuntimeError(
                         f"candidate {glyph_id} has no SVG; regenerate candidate evidence"

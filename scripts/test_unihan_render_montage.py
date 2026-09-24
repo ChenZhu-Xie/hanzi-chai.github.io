@@ -29,6 +29,35 @@ LEAF_EVAL = load_leaf_evaluator()
 
 
 class PdfCellTests(unittest.TestCase):
+    def test_builds_one_self_contained_html_tab_without_sidecar_images(self):
+        document = MONTAGE.build_review_html(
+            [
+                {
+                    "title": 'U+4E00 一 · G <source>',
+                    "filename": 'U+4E00-G.png',
+                    "width": 768,
+                    "height": 876,
+                    "data": "YWJj",
+                    "hypotheses": [
+                        {
+                            "candidate": "A",
+                            "coverage": 0.875,
+                            "leaves": [
+                                {"id": 228, "occurrence": 1, "color": "#f59e0b"}
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(document.count('<section class="case"'), 1)
+        self.assertIn("data:image/webp;base64,YWJj", document)
+        self.assertIn("U+4E00 一 · G &lt;source&gt;", document)
+        self.assertIn("灰线＝该候选未解释的 PDF 墨迹", document)
+        self.assertIn("Candidate A · coverage 87.5%", document)
+        self.assertIn("228:1", document)
+
     def test_topology_overlay_uses_large_distinct_node_colors(self):
         image = Image.new("RGB", (160, 160), "white")
         draw = ImageDraw.Draw(image)
@@ -266,6 +295,63 @@ class PdfCellTests(unittest.TestCase):
         self.assertGreaterEqual(
             MONTAGE.topology_signature(focused[0])["components"], 2
         )
+
+    def test_leaf_separation_moves_occurrences_away_from_glyph_center(self):
+        left = np.zeros((128, 128), dtype=bool)
+        right = np.zeros((128, 128), dtype=bool)
+        left[40:80, 30:35] = True
+        right[40:80, 93:98] = True
+
+        offsets = MONTAGE.leaf_separation_offsets([left, right], distance=16)
+
+        self.assertLess(offsets[0][0], 0)
+        self.assertGreater(offsets[1][0], 0)
+
+    def test_pdf_ink_is_attributed_to_nearest_terminal_leaf(self):
+        pdf = np.zeros((96, 96), dtype=bool)
+        pdf[20:76, 24:29] = True
+        pdf[20:76, 68:73] = True
+        left = np.zeros_like(pdf)
+        right = np.zeros_like(pdf)
+        left[20:76, 24:29] = True
+        right[20:76, 68:73] = True
+
+        attributed = MONTAGE.attribute_pdf_to_leaf_masks(pdf, [left, right])
+
+        self.assertTrue(attributed[0][20:76, 24:29].all())
+        self.assertFalse(attributed[0][:, 68:73].any())
+        self.assertTrue(attributed[1][20:76, 68:73].all())
+
+    def test_separate_leaf_topology_does_not_invent_cross_leaf_junction(self):
+        horizontal = np.zeros((128, 128), dtype=bool)
+        vertical = np.zeros((128, 128), dtype=bool)
+        horizontal[62:67, 20:108] = True
+        vertical[20:108, 62:67] = True
+        entries = [
+            {"leafId": 1, "occurrence": 0, "color": "#f59e0b"},
+            {"leafId": 2, "occurrence": 0, "color": "#7c3aed"},
+        ]
+
+        panel = MONTAGE.colored_leaf_topology_panel(
+            [horizontal, vertical], entries, [(0, 0), (0, 0)]
+        )
+        pixels = np.asarray(panel)
+        blue = np.all(pixels == MONTAGE.TOPOLOGY_COLORS["junction"], axis=2)
+
+        self.assertFalse(blue.any())
+
+    def test_unassigned_pdf_ink_remains_visible_as_neutral_evidence(self):
+        leaf = np.zeros((96, 96), dtype=bool)
+        leaf[20:76, 20:25] = True
+        unexplained = np.zeros_like(leaf)
+        unexplained[20:76, 70:75] = True
+        entries = [{"leafId": 1, "occurrence": 0, "color": "#f59e0b"}]
+
+        panel = MONTAGE.colored_leaf_topology_panel(
+            [leaf], entries, [(0, 0)], unexplained
+        )
+
+        self.assertEqual(panel.getpixel((72, 48)), (148, 163, 184))
 
     def test_marks_the_same_feature_in_glyph_and_topology_rows(self):
         montage = Image.new("RGB", (768, 580), "white")

@@ -146,6 +146,128 @@ export interface GlyphSvgOptions {
   strokeVisibility?: boolean[];
 }
 
+/**
+ * Human-review colors deliberately avoid the red/blue/green topology markers.
+ * Assign colors per review row so equal terminal families remain equal while
+ * unrelated leaves are easy to distinguish.
+ */
+export const GLYPH_LEAF_REVIEW_PALETTE = [
+  "#f59e0b",
+  "#7c3aed",
+  "#db2777",
+  "#92400e",
+  "#ca8a04",
+  "#c2410c",
+  "#4f46e5",
+  "#a21caf",
+  "#9f1239",
+  "#78350f",
+  "#0f766e",
+  "#6d28d9",
+] as const;
+
+const hslChannel = (value: number, p: number, q: number) => {
+  const normalized = value < 0 ? value + 1 : value > 1 ? value - 1 : value;
+  if (normalized < 1 / 6) return p + (q - p) * 6 * normalized;
+  if (normalized < 1 / 2) return q;
+  if (normalized < 2 / 3) return p + (q - p) * (2 / 3 - normalized) * 6;
+  return p;
+};
+
+/** An unbounded deterministic palette; leaf identity never aliases by modulo. */
+export function glyphLeafReviewColor(index: number): string {
+  const preset = GLYPH_LEAF_REVIEW_PALETTE[index];
+  if (preset) return preset;
+  const extraIndex = index - GLYPH_LEAF_REVIEW_PALETTE.length;
+  const forbiddenHues = [0, 142, 199];
+  let hueDegrees = (extraIndex * 137.508 + 28) % 360;
+  while (
+    forbiddenHues.some((forbidden) => {
+      const distance = Math.abs(hueDegrees - forbidden);
+      return Math.min(distance, 360 - distance) < 24;
+    })
+  ) {
+    hueDegrees = (hueDegrees + 47) % 360;
+  }
+  const hue = hueDegrees / 360;
+  const saturation = 0.58 + (extraIndex % 3) * 0.09;
+  const lightness = 0.32 + (Math.floor(extraIndex / 3) % 3) * 0.1;
+  const q =
+    lightness < 0.5
+      ? lightness * (1 + saturation)
+      : lightness + saturation - lightness * saturation;
+  const p = 2 * lightness - q;
+  const channels = [hue + 1 / 3, hue, hue - 1 / 3].map((value) =>
+    Math.round(hslChannel(value, p, q) * 255)
+      .toString(16)
+      .padStart(2, "0"),
+  );
+  return `#${channels.join("")}`;
+}
+
+export interface GlyphLeafOccurrence {
+  leafId: number;
+  occurrence: number;
+  strokeIndices: number[];
+}
+
+interface GlyphLeafStrokeOwner {
+  leafId: number;
+  occurrenceKey: string;
+}
+
+function glyphLeafStrokeOwners(
+  id: number,
+  glyphById: ReadonlyMap<number, 基本字形数据>,
+  path: string,
+  seen = new Set<number>(),
+): GlyphLeafStrokeOwner[] {
+  if (seen.has(id)) throw new Error(`字形 ${id} 存在循环引用`);
+  const glyph = glyphById.get(id);
+  if (!glyph) throw new Error(`字形 ${id} 不存在`);
+  if (glyph.type === "component") {
+    return glyph.strokes.map(() => ({ leafId: id, occurrenceKey: path }));
+  }
+  const nextSeen = new Set(seen).add(id);
+  const parts = glyph.references.map(({ id: referenceId }, index) =>
+    glyphLeafStrokeOwners(
+      referenceId,
+      glyphById,
+      `${path}/${index}:${referenceId}`,
+      nextSeen,
+    ),
+  );
+  if (!glyph.strokes?.length) return parts.flat();
+  return glyph.strokes.flatMap(({ index, from, to }) => {
+    const part = parts[index] ?? [];
+    return part.slice(from ?? 0, (to ?? part.length - 1) + 1);
+  });
+}
+
+/**
+ * Resolve real terminal-component instances through the reference tree.
+ * Stroke-order interleaving therefore cannot split one component occurrence.
+ */
+export function glyphLeafOccurrences(
+  id: number,
+  glyphById: ReadonlyMap<number, 基本字形数据>,
+): GlyphLeafOccurrence[] {
+  const owners = glyphLeafStrokeOwners(id, glyphById, `${id}`);
+  const byKey = new Map<string, GlyphLeafOccurrence>();
+  const countByLeaf = new Map<number, number>();
+  for (const [strokeIndex, { leafId, occurrenceKey }] of owners.entries()) {
+    let occurrence = byKey.get(occurrenceKey);
+    if (!occurrence) {
+      const occurrenceIndex = countByLeaf.get(leafId) ?? 0;
+      countByLeaf.set(leafId, occurrenceIndex + 1);
+      occurrence = { leafId, occurrence: occurrenceIndex, strokeIndices: [] };
+      byKey.set(occurrenceKey, occurrence);
+    }
+    occurrence.strokeIndices.push(strokeIndex);
+  }
+  return [...byKey.values()];
+}
+
 function strokeBoundaryPoints({
   start,
   curveList,
