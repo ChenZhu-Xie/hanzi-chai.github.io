@@ -1,0 +1,98 @@
+import importlib.util
+import unittest
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+PATH = Path(__file__).with_name("unihan-stroke-transfer.py")
+SPEC = importlib.util.spec_from_file_location("stroke_transfer", PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class StrokeTransferTest(unittest.TestCase):
+    def test_samples_relative_lines_and_cubic_without_control_points(self):
+        points = MODULE.sample_svg_centerline("M 1 2 h 3 v 4 c 1 0 2 1 3 2", curve_steps=4)
+        np.testing.assert_allclose(points[0], [1, 2])
+        np.testing.assert_allclose(points[1], [4, 2])
+        np.testing.assert_allclose(points[2], [4, 6])
+        np.testing.assert_allclose(points[-1], [7, 8])
+        self.assertEqual(len(points), 7)
+
+    def test_samples_hook_arc_to_its_endpoint(self):
+        points = MODULE.sample_svg_centerline("M 10 10 a 5 5 0 0 1 5 5")
+        np.testing.assert_allclose(points[-1], [15, 15])
+        self.assertGreater(len(points), 2)
+
+    def test_structural_bends_only_follow_real_command_boundaries(self):
+        points, fractions = MODULE.sample_svg_centerline(
+            "M 0 0 h 10 v 10", with_fractions=True
+        )
+        self.assertEqual(len(points), 3)
+        self.assertEqual(len(fractions), 1)
+        self.assertAlmostEqual(fractions[0], 0.5)
+        curve_points, curve_fractions = MODULE.sample_svg_centerline(
+            "M 0 0 c 5 0 10 5 10 10", with_fractions=True
+        )
+        self.assertGreater(len(curve_points), 3)
+        self.assertEqual(curve_fractions, [])
+
+    def test_partition_is_complete_disjoint_and_preserves_stroke_order(self):
+        target = np.zeros((24, 24), dtype=bool)
+        target[3:21, 3:21] = True
+        lines = [np.array([[6, 3], [6, 20]]), np.array([[17, 3], [17, 20]])]
+        masks, ambiguous, metrics = MODULE.partition_strokes(target, lines)
+        self.assertTrue(np.array_equal(np.logical_or.reduce(masks), target))
+        self.assertFalse(np.logical_and(masks[0], masks[1]).any())
+        self.assertTrue(ambiguous.any())
+        self.assertEqual(metrics["seededStrokes"], 2)
+        self.assertGreater(masks[0].sum(), 0)
+        self.assertGreater(masks[1].sum(), 0)
+
+    def test_coherent_snap_does_not_jump_backwards_at_a_crossing(self):
+        skeleton = np.zeros((31, 31), dtype=bool)
+        skeleton[15, 2:29] = True
+        skeleton[2:29, 15] = True
+        points = np.argwhere(skeleton)
+        tree = cKDTree(points[:, ::-1])
+        template = np.array([[3.0, 13.0], [27.0, 13.0]])
+        snapped, _distance = MODULE.snap_polyline_coherently(
+            template, points, tree, max_distance=5
+        )
+        self.assertGreater(len(snapped), 2)
+        self.assertTrue(np.all(np.diff(snapped[:, 0]) >= 0))
+        self.assertLessEqual(np.abs(snapped[:, 1] - 15).max(), 1)
+
+    def test_geodesic_labels_do_not_cross_whitespace(self):
+        target = np.zeros((16, 24), dtype=bool)
+        target[3:6, 2:22] = True
+        target[10:13, 2:22] = True
+        seeds = np.zeros_like(target, dtype=np.int32)
+        seeds[4, 3] = 1
+        seeds[11, 20] = 2
+        labels = MODULE.geodesic_labels(target, seeds)
+        self.assertTrue(np.all(labels[3:6, 2:22] == 1))
+        self.assertTrue(np.all(labels[10:13, 2:22] == 2))
+
+    def test_alignment_score_prefers_matching_stroke_direction(self):
+        target = np.zeros((64, 64), dtype=bool)
+        target[30:34, 8:56] = True
+        horizontal = [{"points": np.array([[0.0, 50.0], [100.0, 50.0]])}]
+        vertical = [{"points": np.array([[50.0, 0.0], [50.0, 100.0]])}]
+        matching = MODULE.candidate_alignment_metrics(horizontal, target, 64)
+        different = MODULE.candidate_alignment_metrics(vertical, target, 64)
+        self.assertLess(matching["score"], different["score"])
+
+    def test_vectorizes_holes_with_evenodd_compatible_subpaths(self):
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[3:37, 3:37] = True
+        mask[12:28, 12:28] = False
+        path = MODULE.mask_svg_path(mask, 40)
+        self.assertGreaterEqual(path.count("M "), 2)
+        self.assertGreaterEqual(path.count("Z"), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
