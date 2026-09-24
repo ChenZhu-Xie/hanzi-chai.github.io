@@ -29,6 +29,21 @@ LEAF_EVAL = load_leaf_evaluator()
 
 
 class PdfCellTests(unittest.TestCase):
+    def test_topology_overlay_uses_large_distinct_node_colors(self):
+        image = Image.new("RGB", (160, 160), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((20, 30, 80, 30), fill="black", width=5)
+        draw.line((50, 30, 50, 90), fill="black", width=5)
+        draw.line((100, 30, 100, 90), fill="black", width=5)
+        draw.line((100, 90, 145, 90), fill="black", width=5)
+
+        overlay = MONTAGE.topology_overlay(image)
+        pixels = np.asarray(overlay)
+
+        for color in MONTAGE.TOPOLOGY_COLORS.values():
+            matches = np.all(pixels == color, axis=2)
+            self.assertGreater(matches.sum(), 40)
+
     def test_marks_a_degree_two_right_angle_as_a_corner(self):
         binary = np.zeros((128, 128), dtype=bool)
         binary[24:81, 40] = True

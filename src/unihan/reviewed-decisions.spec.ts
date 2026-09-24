@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import { recommendMissingSources } from "./index";
-import { REVIEWED_SOURCE_DECISIONS } from "./reviewed-decisions";
+import {
+  REVIEWED_MISSING_SIBLING_DECISIONS,
+  REVIEWED_SOURCE_DECISIONS,
+} from "./reviewed-decisions";
 
 test("keeps two horizontal strokes in reviewed J-source 月 forms", () => {
   for (const unicode of [0x6714, 0x6715, 0x6717, 0x6ed5, 0x80ba, 0x9a30]) {
@@ -23,6 +26,23 @@ test("uses dotted 月 579 in U+9AA8 T source", () => {
     replacementId: 579,
     provenance: "manual",
   });
+});
+
+test("records the reviewed U+9AA8 upper-component source groups", () => {
+  expect(REVIEWED_MISSING_SIBLING_DECISIONS).toEqual([
+    {
+      unicode: 0x9aa8,
+      sources: ["H", "T", "J", "K", "N"],
+      referenceId: 752,
+      topology: "inner-horizontal-right-of-middle-vertical",
+    },
+    {
+      unicode: 0x9aa8,
+      sources: ["V"],
+      referenceId: 752,
+      topology: "inner-horizontal-left-of-middle-vertical",
+    },
+  ]);
 });
 
 test("resolves the reviewed T-source 尼 variant for U+6635", () => {
