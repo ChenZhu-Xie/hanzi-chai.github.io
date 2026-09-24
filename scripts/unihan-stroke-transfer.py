@@ -238,6 +238,191 @@ def candidate_strokes(row: dict, glyph_id: int) -> list[dict]:
     return [by_index[index] for index in range(expected)]
 
 
+def load_human_annotations(
+    path: Path,
+    *,
+    codepoint: int,
+    source: str,
+    glyph_id: int,
+    candidate: list[dict],
+    canvas: int,
+) -> tuple[list[dict], dict, list[dict]]:
+    """Validate and normalize human truth without modifying its source JSON."""
+    document = json.loads(path.read_text("utf-8"))
+    metadata = document.get("metadata", {})
+    expected_unicode = f"U+{codepoint:04X}"
+    if metadata.get("unicode") != expected_unicode or metadata.get("source") != source:
+        raise ValueError(
+            f"annotation target mismatch: expected {expected_unicode} {source}, "
+            f"got {metadata.get('unicode')} {metadata.get('source')}"
+        )
+    if metadata.get("candidateGlyphId") != glyph_id:
+        raise ValueError("annotation candidateGlyphId does not match --glyph-id")
+    raw_annotations = document.get("annotations")
+    if not isinstance(raw_annotations, list):
+        raise ValueError("annotation JSON has no annotations array")
+
+    by_component: dict[int, dict] = {}
+    family_to_candidate: dict[str, dict] = {}
+    for stroke in candidate:
+        by_component.setdefault(int(stroke["componentId"]), stroke)
+        family_to_candidate.setdefault(str(stroke["familyKey"]), stroke)
+
+    corrections = []
+    normalized = copy.deepcopy(document)
+    normalized_annotations = normalized["annotations"]
+    for index, annotation in enumerate(normalized_annotations):
+        label = str(annotation.get("label", "")).strip()
+        if not label.isdigit():
+            continue
+        component_id = int(label)
+        resolved = by_component.get(component_id)
+        if resolved is None:
+            resolved = next(
+                (
+                    stroke
+                    for family, stroke in family_to_candidate.items()
+                    if label in family.split("/")
+                ),
+                None,
+            )
+        if resolved is None:
+            continue
+        expected_id = int(resolved["componentId"])
+        if component_id != expected_id:
+            if annotation.get("type") == "lasso":
+                display = "部件圈"
+            else:
+                stroke_number = sum(
+                    item.get("type") != "lasso"
+                    for item in normalized_annotations[: index + 1]
+                )
+                display = f"第 {stroke_number} 笔"
+            corrections.append(
+                {
+                    "annotationIndex": index,
+                    "type": annotation.get("type"),
+                    "display": display,
+                    "from": component_id,
+                    "to": expected_id,
+                    "reason": f"selected candidate {glyph_id} uses sibling {expected_id}",
+                }
+            )
+        annotation["label"] = str(expected_id)
+        annotation["color"] = resolved["color"]
+
+    stroke_annotations = [
+        annotation
+        for annotation in normalized_annotations
+        if annotation.get("type") != "lasso"
+    ]
+    if len(stroke_annotations) != len(candidate):
+        raise ValueError(
+            f"human truth has {len(stroke_annotations)} strokes, candidate has {len(candidate)}"
+        )
+    manual = []
+    scale = canvas / 100
+    for index, (annotation, fallback) in enumerate(zip(stroke_annotations, candidate)):
+        points = np.asarray(annotation.get("points", []), dtype=float)
+        if len(points) < 2 or points.shape[1:] != (2,):
+            raise ValueError(f"human stroke {index + 1} has invalid points")
+        component_id = int(annotation.get("label") or fallback["componentId"])
+        component = by_component.get(component_id, fallback)
+        manual.append(
+            {
+                **fallback,
+                "componentId": component_id,
+                "familyKey": component["familyKey"],
+                "color": component["color"],
+                "hierarchy": component["hierarchy"],
+                "occurrence": component["occurrence"],
+                "points": points * scale,
+                "annotationType": annotation.get("type", "freehand"),
+            }
+        )
+    return manual, normalized, corrections
+
+
+def partition_human_truth(
+    target: np.ndarray,
+    centerlines: list[np.ndarray],
+    strokes: list[dict],
+    annotations: list[dict],
+    canvas: int,
+) -> tuple[list[np.ndarray], np.ndarray, dict]:
+    """Use human stroke medians plus component lassos to assign target ink."""
+    baseline_masks, ambiguous, metrics = partition_strokes(target, centerlines)
+    component_ids = list(dict.fromkeys(int(stroke["componentId"]) for stroke in strokes))
+    component_number = {component_id: index + 1 for index, component_id in enumerate(component_ids)}
+    component_seeds = np.zeros(target.shape, dtype=np.int32)
+    overlapping = np.zeros(target.shape, dtype=bool)
+    scale = canvas / 100
+
+    for annotation in annotations:
+        if annotation.get("type") != "lasso":
+            continue
+        label = str(annotation.get("label", ""))
+        if not label.isdigit() or int(label) not in component_number:
+            continue
+        points = np.rint(np.asarray(annotation.get("points", []), dtype=float) * scale).astype(np.int32)
+        if len(points) < 3:
+            continue
+        polygon = np.zeros(target.shape, dtype=np.uint8)
+        cv2.fillPoly(polygon, [points], 1)
+        seed = target & (polygon > 0)
+        conflict = seed & (component_seeds > 0) & (
+            component_seeds != component_number[int(label)]
+        )
+        overlapping |= conflict
+        component_seeds[seed & ~conflict] = component_number[int(label)]
+        component_seeds[conflict] = 0
+
+    for stroke, line in zip(strokes, centerlines):
+        seed = target & _line_seed(target.shape, line, width=2)
+        component_seeds[seed] = component_number[int(stroke["componentId"])]
+    component_labels = geodesic_labels(target, component_seeds)
+
+    masks = [np.zeros_like(target) for _ in strokes]
+    for component_id in component_ids:
+        indices = [
+            index
+            for index, stroke in enumerate(strokes)
+            if int(stroke["componentId"]) == component_id
+        ]
+        component_mask = target & (
+            component_labels == component_number[component_id]
+        )
+        if not component_mask.any():
+            for index in indices:
+                masks[index] = baseline_masks[index]
+            continue
+        if len(indices) == 1:
+            masks[indices[0]] = component_mask
+            continue
+        local_masks, _local_ambiguous, _local_metrics = partition_strokes(
+            component_mask, [centerlines[index] for index in indices]
+        )
+        for index, local_mask in zip(indices, local_masks):
+            masks[index] = local_mask
+
+    uncovered = target & ~np.logical_or.reduce(masks)
+    if uncovered.any():
+        for index, baseline in enumerate(baseline_masks):
+            masks[index] |= uncovered & baseline
+    metrics.update(
+        {
+            "partitionMode": "human-stroke-and-component-truth",
+            "humanLassoCount": sum(
+                annotation.get("type") == "lasso" for annotation in annotations
+            ),
+            "humanComponentIds": component_ids,
+            "lassoConflictPixels": int(overlapping.sum()),
+            "strokePixels": [int(mask.sum()) for mask in masks],
+        }
+    )
+    return masks, ambiguous, metrics
+
+
 def normalize_target(binary: np.ndarray, canvas: int, padding: float = 0.08) -> np.ndarray:
     points = np.argwhere(binary)
     if points.size == 0:
@@ -815,12 +1000,14 @@ def format_metric(value) -> str:
     return str(value)
 
 
-def annotation_editor_script(metadata: dict) -> str:
+def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | None = None) -> str:
     payload = json.dumps(metadata, ensure_ascii=False)
+    initial_payload = json.dumps(initial_annotations or [], ensure_ascii=False).replace("</", "<\\/")
     return r'''
     (() => {
       document.querySelector('.editor').id = 'human-editor';
       const metadata = __METADATA__;
+      const initialAnnotations = __INITIAL_ANNOTATIONS__;
       const storageKey = `unihan-human-annotations:${metadata.reviewKey}`;
       const board = document.querySelector('#annotation-board');
       const layer = document.querySelector('#annotation-layer');
@@ -828,14 +1015,23 @@ def annotation_editor_script(metadata: dict) -> str:
       const labelInput = document.querySelector('#component-label');
       const colorInput = document.querySelector('#annotation-color');
       const fileInput = document.querySelector('#annotation-file');
-      let tool = 'stroke';
+      let tool = 'freehand';
       let current = null;
-      let annotations = [];
+      let pointDraft = null;
+      let previewPoint = null;
+      let annotations = initialAnnotations;
+      let history = [];
+      let future = [];
 
-      try {
-        const saved = JSON.parse(localStorage.getItem(storageKey) || '[]');
-        if (Array.isArray(saved)) annotations = saved;
-      } catch (_error) {}
+      // A freshly supplied human-truth file is authoritative.  Do not let an
+      // older browser draft silently restore the pre-correction IDs/colors.
+      if (!initialAnnotations.length) {
+        try {
+          const raw = localStorage.getItem(storageKey);
+          const saved = raw ? JSON.parse(raw) : null;
+          if (Array.isArray(saved)) annotations = saved;
+        } catch (_error) {}
+      }
 
       const svgElement = (name, attributes = {}) => {
         const element = document.createElementNS('http://www.w3.org/2000/svg', name);
@@ -850,12 +1046,24 @@ def annotation_editor_script(metadata: dict) -> str:
         const mapped = point.matrixTransform(board.getScreenCTM().inverse());
         return [Math.max(0, Math.min(100, mapped.x)), Math.max(0, Math.min(100, mapped.y))];
       };
-      const strokeNumber = annotation => annotations.filter(item => item.type === 'stroke').indexOf(annotation) + 1;
+      const isStroke = annotation => annotation.type !== 'lasso';
+      const strokeNumber = annotation => annotations.filter(isStroke).indexOf(annotation) + 1;
       const persist = () => {
         localStorage.setItem(storageKey, JSON.stringify(annotations));
-        const strokes = annotations.filter(item => item.type === 'stroke').length;
+        const strokes = annotations.filter(isStroke).length;
         const regions = annotations.filter(item => item.type === 'lasso').length;
         status.innerHTML = `<b>人工真值：</b>${strokes} 笔，${regions} 个部件圈。PDF 的真实笔数现在由你的 ${strokes} 条中心线定义。`;
+      };
+      const checkpoint = () => {
+        history.push(structuredClone(annotations));
+        if (history.length > 100) history.shift();
+        future = [];
+      };
+      const mutate = callback => {
+        checkpoint();
+        callback();
+        persist();
+        render();
       };
       const centroid = points => [
         points.reduce((sum, point) => sum + point[0], 0) / points.length,
@@ -870,6 +1078,13 @@ def annotation_editor_script(metadata: dict) -> str:
             'fill-opacity': preview ? '.08' : '.16', stroke: annotation.color,
             'stroke-width': '.55', 'stroke-dasharray': '1.2 .7',
           });
+        } else if (annotation.type === 'bezier' && annotation.controlPoints?.length === 4) {
+          const [start, control1, control2, end] = annotation.controlPoints;
+          shape = svgElement('path', {
+            d: `M ${start.join(' ')} C ${control1.join(' ')} ${control2.join(' ')} ${end.join(' ')}`,
+            fill: 'none', stroke: annotation.color, 'stroke-width': '1.05',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          });
         } else {
           shape = svgElement('polyline', {
             points: pointsText(annotation.points), fill: 'none', stroke: annotation.color,
@@ -882,19 +1097,17 @@ def annotation_editor_script(metadata: dict) -> str:
           shape.addEventListener('pointerdown', event => {
             if (tool !== 'erase') return;
             event.stopPropagation();
-            annotations.splice(Number(shape.dataset.annotationIndex), 1);
-            persist();
-            render();
+            mutate(() => annotations.splice(Number(shape.dataset.annotationIndex), 1));
           });
         }
         layer.append(shape);
         if (preview) return;
-        const anchor = annotation.type === 'stroke' ? annotation.points[0] : centroid(annotation.points);
+        const anchor = isStroke(annotation) ? annotation.points[0] : centroid(annotation.points);
         const text = svgElement('text', {
           x: anchor[0], y: anchor[1] - 1.2, fill: annotation.color, class: 'annotation-label',
-          'text-anchor': annotation.type === 'stroke' ? 'start' : 'middle',
+          'text-anchor': isStroke(annotation) ? 'start' : 'middle',
         });
-        const prefix = annotation.type === 'stroke' ? `第${strokeNumber(annotation)}笔` : '部件';
+        const prefix = isStroke(annotation) ? `第${strokeNumber(annotation)}笔` : '部件';
         text.textContent = annotation.label ? `${prefix} · ${annotation.label}` : prefix;
         layer.append(text);
       };
@@ -902,6 +1115,7 @@ def annotation_editor_script(metadata: dict) -> str:
         layer.replaceChildren();
         annotations.forEach((annotation, index) => appendAnnotation(annotation, index));
         if (current) appendAnnotation(current, -1, true);
+        if (pointDraft) appendAnnotation(pointDraft, -1, true);
       };
       const simplifyPoints = points => points.filter((point, index) => {
         if (index === 0 || index === points.length - 1) return true;
@@ -909,17 +1123,45 @@ def annotation_editor_script(metadata: dict) -> str:
         return Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .3;
       });
 
+      const cubicPoints = controls => Array.from({length: 41}, (_, index) => {
+        const t = index / 40, m = 1 - t;
+        return [0, 1].map(axis => m ** 3 * controls[0][axis] + 3 * m ** 2 * t * controls[1][axis] + 3 * m * t ** 2 * controls[2][axis] + t ** 3 * controls[3][axis]);
+      });
+      const draftAnnotation = (type, points, controlPoints = undefined) => ({
+        type, color: colorInput.value, label: labelInput.value.trim(), points,
+        controlPoints, createdAt: new Date().toISOString(),
+      });
+      const finishPointDraft = () => {
+        if (!pointDraft) return;
+        if (pointDraft.type === 'polyline' && pointDraft.points.length >= 2) {
+          mutate(() => annotations.push(pointDraft));
+        }
+        pointDraft = null;
+        previewPoint = null;
+        render();
+      };
+
       board.addEventListener('pointerdown', event => {
-        if (tool === 'erase') return;
+        if (!['freehand', 'lasso'].includes(tool)) return;
         board.setPointerCapture(event.pointerId);
-        current = {
-          type: tool, color: colorInput.value, label: labelInput.value.trim(),
-          points: [drawingPoint(event)], createdAt: new Date().toISOString(),
-        };
+        current = draftAnnotation(tool, [drawingPoint(event)]);
         render();
       });
       board.addEventListener('pointermove', event => {
-        if (!current) return;
+        if (!current) {
+          if (['line', 'polyline', 'bezier'].includes(tool) && pointDraft) {
+            previewPoint = drawingPoint(event);
+            if (tool === 'line') pointDraft.points = [pointDraft.points[0], previewPoint];
+            else if (tool === 'polyline') pointDraft.points = [...pointDraft.fixedPoints, previewPoint];
+            else {
+              const controls = [...pointDraft.fixedPoints, previewPoint];
+              pointDraft.controlPoints = controls;
+              pointDraft.points = controls.length === 4 ? cubicPoints(controls) : controls;
+            }
+            render();
+          }
+          return;
+        }
         const point = drawingPoint(event);
         const previous = current.points[current.points.length - 1];
         if (Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .18) {
@@ -931,7 +1173,11 @@ def annotation_editor_script(metadata: dict) -> str:
         if (!current) return;
         if (board.hasPointerCapture(event.pointerId)) board.releasePointerCapture(event.pointerId);
         current.points = simplifyPoints(current.points);
-        if (current.points.length > 1) annotations.push(current);
+        if (current.points.length > 1) {
+          const finished = current;
+          checkpoint();
+          annotations.push(finished);
+        }
         current = null;
         persist();
         render();
@@ -939,19 +1185,75 @@ def annotation_editor_script(metadata: dict) -> str:
       board.addEventListener('pointerup', finish);
       board.addEventListener('pointercancel', finish);
 
+      board.addEventListener('click', event => {
+        if (!['line', 'polyline', 'bezier'].includes(tool) || event.detail > 1) return;
+        const point = drawingPoint(event);
+        if (!pointDraft) {
+          pointDraft = draftAnnotation(tool, [point]);
+          pointDraft.fixedPoints = [point];
+        } else {
+          pointDraft.fixedPoints.push(point);
+        }
+        if (tool === 'line' && pointDraft.fixedPoints.length === 2) {
+          pointDraft.points = [...pointDraft.fixedPoints];
+          const finished = pointDraft;
+          mutate(() => annotations.push(finished));
+          pointDraft = null;
+        } else if (tool === 'bezier' && pointDraft.fixedPoints.length === 4) {
+          pointDraft.controlPoints = [...pointDraft.fixedPoints];
+          pointDraft.points = cubicPoints(pointDraft.controlPoints);
+          const finished = pointDraft;
+          mutate(() => annotations.push(finished));
+          pointDraft = null;
+        }
+        render();
+      });
+      board.addEventListener('dblclick', event => {
+        if (tool !== 'polyline') return;
+        event.preventDefault();
+        finishPointDraft();
+      });
+
       document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => {
         tool = button.dataset.tool;
+        current = null;
+        pointDraft = null;
+        previewPoint = null;
         document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
         board.style.cursor = tool === 'erase' ? 'not-allowed' : 'crosshair';
       }));
-      document.querySelector('#undo-annotation').onclick = () => { annotations.pop(); persist(); render(); };
+      const undo = () => {
+        if (!history.length) return;
+        future.push(structuredClone(annotations));
+        annotations = history.pop();
+        persist(); render();
+      };
+      const redo = () => {
+        if (!future.length) return;
+        history.push(structuredClone(annotations));
+        annotations = future.pop();
+        persist(); render();
+      };
+      document.querySelector('#undo-annotation').onclick = undo;
+      document.querySelector('#redo-annotation').onclick = redo;
       document.querySelector('#clear-annotations').onclick = () => {
         if (!annotations.length || confirm('清空本字源的全部人工标注？')) {
-          annotations = [];
-          persist();
-          render();
+          mutate(() => { annotations = []; });
         }
       };
+      document.addEventListener('keydown', event => {
+        const modifier = event.ctrlKey || event.metaKey;
+        if (modifier && event.key.toLowerCase() === 'z') {
+          event.preventDefault();
+          if (event.shiftKey) redo(); else undo();
+        } else if (modifier && event.key.toLowerCase() === 'y') {
+          event.preventDefault(); redo();
+        } else if (event.key === 'Escape') {
+          current = null; pointDraft = null; previewPoint = null; render();
+        } else if (event.key === 'Enter' && tool === 'polyline') {
+          event.preventDefault(); finishPointDraft();
+        }
+      });
       document.querySelector('#export-annotations').onclick = () => {
         const output = { format: 'hanzi-chai-pdf-stroke-review-v1', metadata, annotations };
         const blob = new Blob([JSON.stringify(output, null, 2)], { type: 'application/json' });
@@ -965,7 +1267,12 @@ def annotation_editor_script(metadata: dict) -> str:
       fileInput.addEventListener('change', async () => {
         const documentValue = JSON.parse(await fileInput.files[0].text());
         if (!Array.isArray(documentValue.annotations)) throw new Error('JSON 缺少 annotations 数组');
-        annotations = documentValue.annotations;
+        checkpoint();
+        annotations = documentValue.annotations.map(annotation => {
+          const color = window.__componentColorById?.[String(annotation.label)];
+          return color ? {...annotation, color} : annotation;
+        });
+        future = [];
         persist();
         render();
         fileInput.value = '';
@@ -973,7 +1280,7 @@ def annotation_editor_script(metadata: dict) -> str:
       persist();
       render();
     })();
-    '''.replace("__METADATA__", payload)
+    '''.replace("__METADATA__", payload).replace("__INITIAL_ANNOTATIONS__", initial_payload)
 
 
 def interaction_script(registry: dict[str, dict]) -> str:
@@ -984,7 +1291,23 @@ def interaction_script(registry: dict[str, dict]) -> str:
       const tip = document.querySelector('#hierarchy-tip');
       const picker = document.querySelector('#component-picker');
       const labelInput = document.querySelector('#component-label');
+      const colorInput = document.querySelector('#annotation-color');
       let activeFamily = null;
+
+      window.__componentColorById = {};
+      for (const part of Object.values(parts)) {
+        window.__componentColorById[String(part.leafId)] = part.color;
+        for (const node of part.hierarchy) {
+          window.__componentColorById[String(node.id)] ??= node.color;
+          for (const id of String(node.familyKey).split('/')) {
+            window.__componentColorById[id] ??= node.color;
+          }
+        }
+      }
+      labelInput.addEventListener('input', () => {
+        const color = window.__componentColorById[labelInput.value.trim()];
+        if (color) colorInput.value = color;
+      });
 
       const readableText = color => {
         const value = color.replace('#', '');
@@ -1035,9 +1358,8 @@ def interaction_script(registry: dict[str, dict]) -> str:
           });
         });
       };
-      const openPicker = (element, part, event) => {
-        const fill = Boolean(element.closest('[data-selection-mode="fill"]'));
-        picker.innerHTML = `<div class="picker-title">${fill ? '选中后直接填入部件标签' : '选中后复制 ID'}</div>`;
+      const openPicker = (part, event) => {
+        picker.innerHTML = '<div class="picker-title">右键层级列表 · 选中后仅复制 ID</div>';
         for (const option of pickerOptions(part)) {
           const button = document.createElement('button');
           button.type = 'button';
@@ -1047,10 +1369,7 @@ def interaction_script(registry: dict[str, dict]) -> str:
           button.innerHTML = `<span>${option.sibling ? '同族候选' : option.type === 'glyph' ? '字 / 字形' : '部件'} · ${option.label || ''}</span><b>ID ${option.id}</b>`;
           button.onclick = async clickEvent => {
             clickEvent.stopPropagation();
-            if (fill) {
-              labelInput.value = String(option.id);
-              labelInput.dispatchEvent(new Event('input', { bubbles: true }));
-            } else await copyId(option.id);
+            await copyId(option.id);
             picker.hidden = true;
           };
           picker.append(button);
@@ -1076,7 +1395,18 @@ def interaction_script(registry: dict[str, dict]) -> str:
         element.addEventListener('click', event => {
           event.stopPropagation();
           highlight(part.familyKey);
-          openPicker(element, part, event);
+          if (element.closest('[data-selection-mode="fill"]')) {
+            labelInput.value = String(part.leafId);
+            colorInput.value = part.color;
+            labelInput.dispatchEvent(new Event('input', { bubbles: true }));
+            colorInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        });
+        element.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          event.stopPropagation();
+          highlight(part.familyKey);
+          openPicker(part, event);
         });
       });
       document.addEventListener('click', event => {
@@ -1101,6 +1431,8 @@ def build_html(
     canvas: int,
     row: dict,
     evidence: dict | None,
+    initial_annotations: list[dict] | None = None,
+    annotation_corrections: list[dict] | None = None,
 ) -> str:
     stroke_palette = (
         "#e11d48", "#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0891b2",
@@ -1212,17 +1544,37 @@ def build_html(
             "candidateGlyphId": glyph_id,
             "candidateStrokeCount": len(strokes),
             "candidateStrokeOrder": [stroke["feature"] for stroke in strokes],
-        }
+        },
+        initial_annotations,
     )
     original_use = f'''<use class="source-use" href="{glyph['useAttributes']['href']}" x="{glyph['useAttributes'].get('x', 0)}" y="{glyph['useAttributes'].get('y', 0)}"/>'''
     interaction_js = interaction_script(registry)
     decision_method = (result or {}).get("predictionMethod", "未载入历史评测证据")
     decision_margin = format_metric((result or {}).get("margin"))
+    human_driven = metrics.get("partitionMode") == "human-stroke-and-component-truth"
+    partition_title = (
+        "人工真值重新分区的 PDF 墨迹归属"
+        if human_driven
+        else "候选驱动的 PDF 墨迹归属假设（不是已识别笔画）"
+    )
+    warning = (
+        f"已载入人工真值：{len(strokes)} 笔、{metrics.get('humanLassoCount', 0)} 个部件圈；"
+        f"按真值重分区。ID 自动纠正 {len(annotation_corrections or [])} 项。"
+        if human_driven
+        else f"候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。"
+    )
+    correction_note = (
+        "；".join(
+            f"{item['display']} {item['from']}→{item['to']}"
+            for item in (annotation_corrections or [])
+        )
+        or "无 ID 纠正"
+    )
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
     *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:0 8px 7px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar button{{font-size:11px;padding:4px 6px;margin:6px 3px 0 0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:6px 4px 0 0;font-size:11px}}.toolbar input[type=text]{{width:112px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:250px;max-width:390px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
-    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供的是假设笔数与笔序。当前系统尚未识别出 PDF 的真实笔画。</div><div class="warning">候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按候选笔槽着色（非真实拆笔）</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
+    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供引用树，人工标注可提供真实笔画与部件边界。</div><div class="warning">{html.escape(warning)}</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按逐笔槽着色</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
     <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
-    <section class="review-section"><h2 class="section-title">第 2 行 · PDF 归属假设、拟合中心线、人工真值标注</h2><div class="vector-row"><article class="vector-card"><h3>候选驱动的 PDF 墨迹归属假设（不是已识别笔画）</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">点击部件后选择层级 ID：复制到剪贴板。页首“归属图 / 原始 PDF”可切换。</div></article><article class="vector-card"><h3>拟合后的逐笔中心线</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article><article class="vector-card editor"><h3>人工真值标注板（点击第一行候选可回填）</h3><div class="toolbar"><button type="button" data-tool="stroke" class="active">画笔画</button><button type="button" data-tool="lasso">圈部件</button><button type="button" data-tool="erase">删除</button><label>部件标签 <input id="component-label" type="text" placeholder="点上方候选"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出</button><button type="button" id="import-annotations">导入</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="annotation-status"></div><div class="help-box"><b>候选笔序：</b>{html.escape(candidate_order)}</div></div></article></div></section>
+    <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><button type="button" data-tool="freehand" class="active">自由线</button><button type="button" data-tool="line">直线</button><button type="button" data-tool="polyline">折线</button><button type="button" data-tool="bezier">贝塞尔</button><button type="button" data-tool="lasso">圈部件</button><button type="button" data-tool="erase">删除</button><label>部件标签 <input id="component-label" type="text" placeholder="点上方候选"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="redo-annotation">重做</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出</button><button type="button" id="import-annotations">导入</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="annotation-status"></div><div class="help-box"><b>快捷键：</b>Ctrl+Z 撤销；Ctrl+Y / Ctrl+Shift+Z 重做；Esc 取消当前线；折线按 Enter 或双击完成。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
     </main><div id="hierarchy-tip" class="hierarchy-float" hidden></div><div id="component-picker" class="hierarchy-float" hidden></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
     document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode'),sourceButton=document.querySelector('#source-view-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};sourceButton.onclick=()=>{{document.body.classList.toggle('original-source-mode');sourceButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
@@ -1240,6 +1592,11 @@ def main():
         "--evidence",
         type=Path,
         help="optional reviewed vector benchmark with per-candidate scoring evidence",
+    )
+    parser.add_argument(
+        "--annotations",
+        type=Path,
+        help="optional exported human-truth JSON used to repartition PDF ink",
     )
     parser.add_argument("--unicode", required=True, help="hex codepoint, e.g. 6418")
     parser.add_argument("--source", required=True)
@@ -1268,10 +1625,38 @@ def main():
         size=args.canvas,
     ) < 224
     target = normalize_target(source_mask, args.canvas)
-    strokes = candidate_strokes(row, args.glyph_id)
-    fitted = fit_centerlines(strokes, args.canvas)
-    snapped, snap_distances = snap_centerlines(fitted, target, max_distance=args.canvas * 0.08)
-    masks, ambiguous, metrics = partition_strokes(target, snapped)
+    candidate = candidate_strokes(row, args.glyph_id)
+    normalized_annotations = None
+    annotation_corrections = []
+    if args.annotations:
+        strokes, normalized_document, annotation_corrections = load_human_annotations(
+            args.annotations,
+            codepoint=codepoint,
+            source=args.source,
+            glyph_id=args.glyph_id,
+            candidate=candidate,
+            canvas=args.canvas,
+        )
+        normalized_annotations = normalized_document["annotations"]
+        snapped, snap_distances = snap_centerlines(
+            [stroke["points"] for stroke in strokes],
+            target,
+            max_distance=args.canvas * 0.045,
+        )
+        masks, ambiguous, metrics = partition_human_truth(
+            target,
+            snapped,
+            strokes,
+            normalized_annotations,
+            args.canvas,
+        )
+    else:
+        strokes = candidate
+        fitted = fit_centerlines(strokes, args.canvas)
+        snapped, snap_distances = snap_centerlines(
+            fitted, target, max_distance=args.canvas * 0.08
+        )
+        masks, ambiguous, metrics = partition_strokes(target, snapped)
     fragment_counts = []
     for mask in masks:
         component_count, _labels = cv2.connectedComponents(
@@ -1280,8 +1665,13 @@ def main():
         fragment_counts.append(max(0, int(component_count) - 1))
     metrics["candidateStrokeCount"] = len(strokes)
     metrics["candidateStrokeOrder"] = [stroke["feature"] for stroke in strokes]
-    metrics["pdfActualStrokeCount"] = None
-    metrics["pdfActualStrokeOrder"] = None
+    metrics["pdfActualStrokeCount"] = len(strokes) if args.annotations else None
+    metrics["pdfActualStrokeOrder"] = (
+        normalized_document.get("metadata", {}).get("candidateStrokeOrder")
+        if args.annotations
+        else None
+    )
+    metrics["annotationLabelCorrections"] = annotation_corrections
     metrics["partitionInkFragments"] = fragment_counts
     metrics["totalPartitionInkFragments"] = sum(fragment_counts)
     metrics["maxSnapDistances"] = [round(value, 3) for value in snap_distances]
@@ -1298,6 +1688,8 @@ def main():
         args.canvas,
         row,
         evidence,
+        normalized_annotations,
+        annotation_corrections,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, "utf-8")

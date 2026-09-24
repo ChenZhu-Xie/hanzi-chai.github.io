@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,83 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_human_annotations_normalize_a_sibling_to_selected_leaf(self):
+        candidate = [
+            {
+                "componentId": 1128,
+                "familyKey": "133/1128",
+                "color": "#db2777",
+                "hierarchy": [{"id": 1128}],
+                "occurrence": 0,
+                "feature": "horizontal",
+            },
+            {
+                "componentId": 1128,
+                "familyKey": "133/1128",
+                "color": "#db2777",
+                "hierarchy": [{"id": 1128}],
+                "occurrence": 1,
+                "feature": "hook",
+            },
+        ]
+        document = {
+            "metadata": {
+                "unicode": "U+6418",
+                "source": "T",
+                "candidateGlyphId": 900019,
+            },
+            "annotations": [
+                {"type": "line", "label": "133", "color": "#000000", "points": [[10, 20], [30, 40]]},
+                {"type": "freehand", "label": "133", "color": "#000000", "points": [[50, 60], [70, 80]]},
+                {"type": "lasso", "label": "133", "color": "#000000", "points": [[5, 5], [90, 5], [90, 90]]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "annotations.json"
+            path.write_text(json.dumps(document), "utf-8")
+            strokes, normalized, corrections = MODULE.load_human_annotations(
+                path,
+                codepoint=0x6418,
+                source="T",
+                glyph_id=900019,
+                candidate=candidate,
+                canvas=200,
+            )
+
+        self.assertEqual([item["label"] for item in normalized["annotations"]], ["1128"] * 3)
+        self.assertEqual([item["color"] for item in normalized["annotations"]], ["#db2777"] * 3)
+        self.assertEqual(len(corrections), 3)
+        self.assertEqual(
+            [item["display"] for item in corrections],
+            ["第 1 笔", "第 2 笔", "部件圈"],
+        )
+        self.assertEqual([item["componentId"] for item in strokes], [1128, 1128])
+        np.testing.assert_allclose(strokes[0]["points"], [[20, 40], [60, 80]])
+
+    def test_human_truth_partition_is_complete_and_preserves_component_groups(self):
+        target = np.zeros((32, 32), dtype=bool)
+        target[3:13, 3:29] = True
+        target[19:29, 3:29] = True
+        centerlines = [
+            np.array([[4, 8], [27, 8]], dtype=float),
+            np.array([[4, 24], [27, 24]], dtype=float),
+        ]
+        strokes = [{"componentId": 10}, {"componentId": 20}]
+        annotations = [
+            {"type": "lasso", "label": "10", "points": [[0, 0], [100, 0], [100, 45], [0, 45]]},
+            {"type": "lasso", "label": "20", "points": [[0, 55], [100, 55], [100, 100], [0, 100]]},
+        ]
+        masks, _ambiguous, metrics = MODULE.partition_human_truth(
+            target, centerlines, strokes, annotations, 32
+        )
+
+        self.assertTrue(np.array_equal(np.logical_or.reduce(masks), target))
+        self.assertFalse(np.logical_and(masks[0], masks[1]).any())
+        self.assertTrue(masks[0][8, 8])
+        self.assertTrue(masks[1][24, 8])
+        self.assertEqual(metrics["humanComponentIds"], [10, 20])
+        self.assertEqual(metrics["humanLassoCount"], 2)
+
     def test_samples_relative_lines_and_cubic_without_control_points(self):
         points = MODULE.sample_svg_centerline("M 1 2 h 3 v 4 c 1 0 2 1 3 2", curve_steps=4)
         np.testing.assert_allclose(points[0], [1, 2])
