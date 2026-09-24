@@ -741,6 +741,47 @@ def polyline_path(points: np.ndarray, canvas: int) -> str:
     return "M " + " L ".join(f"{x * scale:.4f} {y * scale:.4f}" for x, y in points)
 
 
+def directed_stroke_features(points: np.ndarray, canvas: int) -> dict:
+    """Describe one stroke as an ordered arc from pen-down to pen-up."""
+    values = np.asarray(points, dtype=float)
+    if not len(values):
+        return {"pointCount": 0}
+    scale = 100 / canvas
+    segments = np.diff(values, axis=0)
+    lengths = np.linalg.norm(segments, axis=1)
+    nonzero = lengths > 1e-6
+    vectors = segments[nonzero]
+    vector_lengths = lengths[nonzero]
+    units = vectors / vector_lengths[:, None] if len(vectors) else np.empty((0, 2))
+
+    def vector_payload(vector: np.ndarray) -> dict:
+        angle = math.degrees(math.atan2(float(vector[1]), float(vector[0])))
+        return {
+            "dx": round(float(vector[0]), 5),
+            "dy": round(float(vector[1]), 5),
+            "angleDegrees": round(angle, 3),
+        }
+
+    turns = []
+    for left, right in zip(units, units[1:]):
+        cross = float(left[0] * right[1] - left[1] * right[0])
+        dot = float(np.clip(np.dot(left, right), -1.0, 1.0))
+        turns.append(round(math.degrees(math.atan2(cross, dot)), 3))
+    displacement = values[-1] - values[0]
+    return {
+        "pointCount": len(values),
+        "direction": "points[0] -> points[-1] (pen-down -> pen-up)",
+        "start": [round(float(value * scale), 4) for value in values[0]],
+        "end": [round(float(value * scale), 4) for value in values[-1]],
+        "arcLength": round(float(lengths.sum() * scale), 4),
+        "displacement": [round(float(value * scale), 4) for value in displacement],
+        "startTangent": vector_payload(units[0]) if len(units) else None,
+        "endTangent": vector_payload(units[-1]) if len(units) else None,
+        "segmentDirections": [vector_payload(unit) for unit in units],
+        "signedTurnsDegrees": turns,
+    }
+
+
 def _cluster_points(points: list[np.ndarray], radius: float) -> list[np.ndarray]:
     if not points:
         return []
@@ -861,6 +902,12 @@ def interactive_candidate_svg(
     candidate_key = str(glyph_id)
     root = ET.fromstring(row["candidateSvgs"][candidate_key])
     root.set("class", "candidate-svg")
+    # candidateSvgs already contain endpoint-only red circles.  Rebuild the
+    # complete marker layer so candidates and PDF attribution use one topology
+    # vocabulary: red endpoints, blue contacts, green structural bends.
+    for child in list(root):
+        if child.tag.rsplit("}", 1)[-1] == "circle":
+            root.remove(child)
     paths = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "path"]
     by_stroke: dict[int, tuple[str, dict]] = {}
     for leaf in row["candidateLeafSvgs"][candidate_key]:
@@ -903,7 +950,14 @@ def interactive_candidate_svg(
         path.set("data-family-key", str(part["familyKey"]))
         path.set("data-component-id", str(part["leafId"]))
     ET.register_namespace("", "http://www.w3.org/2000/svg")
-    return ET.tostring(root, encoding="unicode")
+    markup = ET.tostring(root, encoding="unicode")
+    candidate = candidate_strokes(row, glyph_id)
+    markers = marker_svg(
+        [stroke["points"] for stroke in candidate],
+        100,
+        candidate,
+    )
+    return markup.replace("</svg>", f'<g class="candidate-topology">{markers}</g></svg>')
 
 
 def evidence_for_record(evidence: dict | None, unicode: int, source: str) -> dict | None:
@@ -1314,9 +1368,19 @@ def interaction_script(registry: dict[str, dict]) -> str:
         const [r, g, b] = [0, 2, 4].map(index => parseInt(value.slice(index, index + 2), 16));
         return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? '#111827' : '#fff';
       };
+      const levelDescription = (node, index, total) => {
+        const bottomUp = index + 1;
+        const topDown = total - index;
+        let kind;
+        if (node.type === 'glyph') kind = index === total - 1 ? '顶级字 / 字形' : '字 / 字形';
+        else if (index === 0) kind = '末级部件';
+        else if (index === total - 1) kind = '顶级部件';
+        else kind = `${'上'.repeat(index)}级部件`;
+        return `${kind} · 自下而上第 ${bottomUp}/${total} 级 · 自上而下第 ${topDown}/${total} 级`;
+      };
       const hierarchyRows = part => part.hierarchy.map((node, index) => {
-        const kind = index === 0 ? '末级部件' : node.type === 'glyph' ? '字 / 字形' : '上级部件';
-        return `<div class="hierarchy-row" style="background:${node.color};color:${readableText(node.color)}"><span>${kind} · ${node.label || ''}</span><b>ID ${node.id}</b></div>`;
+        const kind = levelDescription(node, index, part.hierarchy.length);
+        return `<div class="hierarchy-row" style="background:${node.color};color:${readableText(node.color)}"><span>${kind}<br>${node.label || ''}</span><b>ID ${node.id}</b></div>`;
       }).join('');
       const familyMatches = (part, family) => part && part.hierarchy.some(node => node.familyKey === family);
       const highlight = family => {
@@ -1347,14 +1411,15 @@ def interaction_script(registry: dict[str, dict]) -> str:
       };
       const pickerOptions = part => {
         const seen = new Set();
-        return part.hierarchy.flatMap(node => {
+        const total = part.hierarchy.length;
+        return part.hierarchy.flatMap((node, index) => {
           const ids = String(node.familyKey).split('/').map(Number).filter(Number.isFinite);
           const members = ids.length ? ids : [node.id];
           return members.flatMap(id => {
             const key = `${node.familyKey}:${id}`;
             if (seen.has(key)) return [];
             seen.add(key);
-            return [{ ...node, id, sibling: id !== node.id }];
+            return [{ ...node, id, sibling: id !== node.id, level: levelDescription(node, index, total) }];
           });
         });
       };
@@ -1366,7 +1431,7 @@ def interaction_script(registry: dict[str, dict]) -> str:
           button.className = 'picker-option';
           button.style.background = option.color;
           button.style.color = readableText(option.color);
-          button.innerHTML = `<span>${option.sibling ? '同族候选' : option.type === 'glyph' ? '字 / 字形' : '部件'} · ${option.label || ''}</span><b>ID ${option.id}</b>`;
+          button.innerHTML = `<span>${option.sibling ? '同族候选 · ' : ''}${option.level}<br>${option.label || ''}</span><b>ID ${option.id}</b>`;
           button.onclick = async clickEvent => {
             clickEvent.stopPropagation();
             await copyId(option.id);
@@ -1544,6 +1609,7 @@ def build_html(
             "candidateGlyphId": glyph_id,
             "candidateStrokeCount": len(strokes),
             "candidateStrokeOrder": [stroke["feature"] for stroke in strokes],
+            "strokePointSemantics": "points[0] is pen-down; points[-1] is pen-up; order is directed",
         },
         initial_annotations,
     )
@@ -1571,7 +1637,7 @@ def build_html(
         or "无 ID 纠正"
     )
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
-    *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:0 8px 7px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar button{{font-size:11px;padding:4px 6px;margin:6px 3px 0 0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:6px 4px 0 0;font-size:11px}}.toolbar input[type=text]{{width:112px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:250px;max-width:390px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
+    *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.node{{pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:0 8px 7px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar button{{font-size:11px;padding:4px 6px;margin:6px 3px 0 0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:6px 4px 0 0;font-size:11px}}.toolbar input[type=text]{{width:112px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:330px;max-width:520px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.hierarchy-row b,.picker-option b{{white-space:nowrap;align-self:center}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
     </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供引用树，人工标注可提供真实笔画与部件边界。</div><div class="warning">{html.escape(warning)}</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按逐笔槽着色</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
     <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
     <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><button type="button" data-tool="freehand" class="active">自由线</button><button type="button" data-tool="line">直线</button><button type="button" data-tool="polyline">折线</button><button type="button" data-tool="bezier">贝塞尔</button><button type="button" data-tool="lasso">圈部件</button><button type="button" data-tool="erase">删除</button><label>部件标签 <input id="component-label" type="text" placeholder="点上方候选"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="redo-annotation">重做</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出</button><button type="button" id="import-annotations">导入</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="annotation-status"></div><div class="help-box"><b>快捷键：</b>Ctrl+Z 撤销；Ctrl+Y / Ctrl+Shift+Z 重做；Esc 取消当前线；折线按 Enter 或双击完成。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
@@ -1672,6 +1738,15 @@ def main():
         else None
     )
     metrics["annotationLabelCorrections"] = annotation_corrections
+    metrics["directedStrokeFeatures"] = [
+        {
+            "strokeNumber": index + 1,
+            "componentId": int(stroke["componentId"]),
+            "feature": stroke["feature"],
+            **directed_stroke_features(centerline, args.canvas),
+        }
+        for index, (stroke, centerline) in enumerate(zip(strokes, snapped))
+    ]
     metrics["partitionInkFragments"] = fragment_counts
     metrics["totalPartitionInkFragments"] = sum(fragment_counts)
     metrics["maxSnapDistances"] = [round(value, 3) for value in snap_distances]
