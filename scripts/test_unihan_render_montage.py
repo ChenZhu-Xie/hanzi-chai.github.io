@@ -40,9 +40,19 @@ class PdfCellTests(unittest.TestCase):
         overlay = MONTAGE.topology_overlay(image)
         pixels = np.asarray(overlay)
 
-        for color in MONTAGE.TOPOLOGY_COLORS.values():
+        for key in ("endpoint", "junction"):
+            color = MONTAGE.TOPOLOGY_COLORS[key]
             matches = np.all(pixels == color, axis=2)
             self.assertGreater(matches.sum(), 40)
+        gray = MONTAGE.TOPOLOGY_COLORS["corner"]
+        gray_pixels = np.all(pixels == gray, axis=2)
+        self.assertGreater(gray_pixels.sum(), 10)
+        endpoints, junctions, skeleton = MONTAGE.topology_points(
+            np.asarray(image.convert("L")) < 224
+        )
+        corners = MONTAGE.corner_points(skeleton, endpoints, junctions)
+        x, y = corners[0]
+        self.assertNotEqual(overlay.getpixel((x, y)), gray)
 
     def test_marks_a_degree_two_right_angle_as_a_corner(self):
         binary = np.zeros((128, 128), dtype=bool)
@@ -54,6 +64,16 @@ class PdfCellTests(unittest.TestCase):
         self.assertEqual(len(endpoints), 2)
         self.assertEqual(len(junctions), 0)
         self.assertTrue(any(abs(x - 40) <= 4 and abs(y - 80) <= 4 for x, y in corners))
+
+    def test_does_not_mark_diagonal_raster_stair_steps_as_corners(self):
+        binary = np.zeros((128, 128), dtype=bool)
+        for value in range(20, 101):
+            binary[value, value] = True
+        endpoints, junctions, skeleton = MONTAGE.topology_points(binary)
+
+        corners = MONTAGE.corner_points(skeleton, endpoints, junctions)
+
+        self.assertEqual(corners, [])
 
     def test_topology_point_distance_uses_positions_not_only_counts(self):
         same = [[0.1, 0.2], [0.8, 0.9]]

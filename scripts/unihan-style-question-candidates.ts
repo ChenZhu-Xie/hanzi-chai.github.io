@@ -56,13 +56,15 @@ const glyphById = new Map(
   ]),
 );
 const palette = [
-  "#2563eb",
-  "#16a34a",
-  "#ea580c",
+  // Deliberately exclude the topology-node red, blue, and gray.
+  "#f59e0b",
   "#7c3aed",
-  "#0891b2",
-  "#a16207",
+  "#db2777",
+  "#0f766e",
+  "#65a30d",
+  "#92400e",
 ];
+const focusColor = "#f59e0b";
 const familyById = new Map<number, string>();
 const colorByFamily = new Map<string, string>();
 for (const [index, family] of (definitions.siblingFamilies ?? []).entries()) {
@@ -171,7 +173,7 @@ for (const row of payload.rows) {
           strokeWidthScale: 0.5,
           showStrokeBoundaryPoints: true,
           strokeColors: glyphLeafStrokeIds(glyphId, glyphById).map((leafId) =>
-            targetLeaves.has(leafId) ? "#2563eb" : "black",
+            targetLeaves.has(leafId) ? focusColor : "black",
           ),
         }),
       ];
@@ -193,7 +195,7 @@ for (const row of payload.rows) {
           // Remove non-target paths from the SVG DOM. A transparent SVG path
           // can retain black RGB under alpha and reappear when rasterized.
           strokeColors: glyphLeafStrokeIds(glyphId, glyphById).map(
-            () => "#2563eb",
+            () => focusColor,
           ),
           strokeVisibility: glyphLeafStrokeIds(glyphId, glyphById).map(
             (leafId) => targetLeaves.has(leafId),
