@@ -29,6 +29,17 @@ LEAF_EVAL = load_leaf_evaluator()
 
 
 class PdfCellTests(unittest.TestCase):
+    def test_marks_a_degree_two_right_angle_as_a_corner(self):
+        binary = np.zeros((128, 128), dtype=bool)
+        binary[24:81, 40] = True
+        binary[80, 40:101] = True
+        endpoints, junctions, skeleton = MONTAGE.topology_points(binary)
+        corners = MONTAGE.corner_points(skeleton, endpoints, junctions)
+
+        self.assertEqual(len(endpoints), 2)
+        self.assertEqual(len(junctions), 0)
+        self.assertTrue(any(abs(x - 40) <= 4 and abs(y - 80) <= 4 for x, y in corners))
+
     def test_topology_point_distance_uses_positions_not_only_counts(self):
         same = [[0.1, 0.2], [0.8, 0.9]]
         shifted = [[0.1, 0.8], [0.8, 0.2]]

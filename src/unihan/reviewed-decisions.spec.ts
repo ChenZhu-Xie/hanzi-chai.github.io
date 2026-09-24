@@ -3,6 +3,28 @@ import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import { recommendMissingSources } from "./index";
 import { REVIEWED_SOURCE_DECISIONS } from "./reviewed-decisions";
 
+test("keeps two horizontal strokes in reviewed J-source 月 forms", () => {
+  for (const unicode of [0x6714, 0x6715, 0x6717, 0x6ed5, 0x80ba, 0x9a30]) {
+    expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
+      unicode,
+      source: "J",
+      referenceId: 569,
+      replacementId: 569,
+      provenance: "manual",
+    });
+  }
+});
+
+test("uses dotted 月 579 in U+9AA8 T source", () => {
+  expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
+    unicode: 0x9aa8,
+    source: "T",
+    referenceId: 504,
+    replacementId: 579,
+    provenance: "manual",
+  });
+});
+
 test("resolves the reviewed T-source 尼 variant for U+6635", () => {
   const glyphs: 基本字形数据[] = [5925, 58234].map((id) => ({
     id,

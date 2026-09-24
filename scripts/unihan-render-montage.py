@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import io
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -141,19 +142,64 @@ def thin(binary: np.ndarray) -> np.ndarray:
 def topology_points(binary: np.ndarray):
     """Return endpoint/junction centers and the one-pixel raster skeleton."""
     skeleton = thin(binary)
-    neighbours = cv2.filter2D(
-        skeleton.astype(np.uint8),
-        cv2.CV_16S,
-        np.ones((3, 3), dtype=np.uint8),
-        borderType=cv2.BORDER_CONSTANT,
-    ) - skeleton.astype(np.int16)
-    endpoints = _point_centers(skeleton & (neighbours == 1))
-    junction_mask = skeleton & (neighbours >= 3)
+    padded = np.pad(skeleton, 1)
+    ring = [
+        padded[:-2, 1:-1],
+        padded[:-2, 2:],
+        padded[1:-1, 2:],
+        padded[2:, 2:],
+        padded[2:, 1:-1],
+        padded[2:, :-2],
+        padded[1:-1, :-2],
+        padded[:-2, :-2],
+    ]
+    transitions = sum(
+        (~ring[index]) & ring[(index + 1) % len(ring)] for index in range(len(ring))
+    )
+    # The circular transition count is invariant to diagonal adjacency. A
+    # right-angle turn has two branches, not the three raw 8-neighbours that
+    # would otherwise make it look like a junction.
+    endpoints = _point_centers(skeleton & (transitions == 1))
+    junction_mask = skeleton & (transitions >= 3)
     junction_mask = (
         cv2.dilate(junction_mask.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
     )
     junctions = _point_centers(junction_mask)
     return endpoints, junctions, skeleton
+
+
+def corner_points(
+    skeleton: np.ndarray,
+    endpoints: list[tuple[int, int]],
+    junctions: list[tuple[int, int]],
+):
+    """Find strong direction changes that are neither endpoints nor junctions.
+
+    Graph degree alone deliberately treats an L-shaped turn as an ordinary
+    degree-two pixel. Shi-Tomasi corners add that missing geometric information
+    while nearby endpoint/junction detections are suppressed to keep the legend
+    categories disjoint.
+    """
+    detected = cv2.goodFeaturesToTrack(
+        skeleton.astype(np.uint8) * 255,
+        maxCorners=64,
+        qualityLevel=0.08,
+        minDistance=8,
+        blockSize=7,
+        useHarrisDetector=False,
+    )
+    if detected is None:
+        return []
+    graph_nodes = [*endpoints, *junctions]
+    corners = []
+    for point in detected.reshape(-1, 2):
+        x, y = (int(round(float(value))) for value in point)
+        if any(
+            math.hypot(x - node_x, y - node_y) <= 7 for node_x, node_y in graph_nodes
+        ):
+            continue
+        corners.append((x, y))
+    return corners
 
 
 def _cluster_axis(values: list[float], maximum_gap: float) -> list[float]:
@@ -374,6 +420,7 @@ def choose_split_stroke_candidate(pdf_evidence: dict, candidate_topology: dict) 
 def topology_panel(image: Image.Image) -> Image.Image:
     gray = np.asarray(image.convert("L"))
     endpoints, junctions, skeleton = topology_points(gray < 224)
+    corners = corner_points(skeleton, endpoints, junctions)
     canvas = Image.new("RGB", image.size, "white")
     array = np.asarray(canvas).copy()
     array[skeleton] = (55, 65, 81)
@@ -383,6 +430,8 @@ def topology_panel(image: Image.Image) -> Image.Image:
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(220, 38, 38))
     for x, y in junctions:
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(2, 132, 199))
+    for x, y in corners:
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(217, 119, 6))
     return canvas
 
 
@@ -390,6 +439,7 @@ def topology_signature(image: Image.Image):
     endpoints, junctions, skeleton = topology_points(
         np.asarray(image.convert("L")) < 224
     )
+    corners = corner_points(skeleton, endpoints, junctions)
     components = cv2.connectedComponents(skeleton.astype(np.uint8), 8)[0] - 1
     ink_points = np.argwhere(skeleton)
     if ink_points.size:
@@ -421,8 +471,10 @@ def topology_signature(image: Image.Image):
         "components": int(components),
         "endpoints": len(endpoints),
         "junctions": len(junctions),
+        "corners": len(corners),
         "endpointPositions": normalize(endpoints),
         "junctionPositions": normalize(junctions),
+        "cornerPositions": normalize(corners),
         "skeletonPositions": normalize(sampled_skeleton),
         "orientationHistogram": [
             round(count / orientation_total, 6) if orientation_total else 0.0
@@ -731,6 +783,7 @@ def main():
                 topology_inputs = [panels[0]]
                 topology_target_inputs = []
                 labels = [f"PDF {record['source']}"]
+                candidate_set_warning = bool(result.get("candidateSetIncomplete"))
                 for glyph_id in ids:
                     if glyph_id not in svg_images:
                         svg_images[glyph_id] = render_svg_review_image(
@@ -776,6 +829,12 @@ def main():
                 for index, (panel, label) in enumerate(zip(panels, labels)):
                     montage.paste(panel, (index * 256, 36))
                     draw.text((index * 256 + 8, 10), label, fill="black")
+                if candidate_set_warning:
+                    draw.text(
+                        (8, 23),
+                        "REVIEW: all candidates may share a wrong component",
+                        fill=(194, 65, 12),
+                    )
                 if args.topology_row:
                     if args.focus_color or args.focus_differences:
                         if args.focus_color:
@@ -793,11 +852,11 @@ def main():
                             ]
                     draw.text(
                         (8, 306),
-                        "Raster topology (colored-leaf ROI): red=endpoints, blue=junctions"
+                        "Topology (colored-leaf ROI): red=end, blue=branch/cross, amber=degree-2 sharp turn"
                         if args.focus_color
-                        else "Raster topology (candidate-difference ROI): red=endpoints, blue=junctions"
+                        else "Topology (candidate-difference ROI): red=end, blue=branch/cross, amber=degree-2 sharp turn"
                         if args.focus_differences
-                        else "Raster topology: red=endpoints, blue=junctions",
+                        else "Topology: red=end, blue=branch/cross, amber=degree-2 sharp turn",
                         fill="black",
                     )
                     for index, panel in enumerate(topology_inputs):

@@ -12,6 +12,53 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RenderMatchTest(unittest.TestCase):
+    def test_shared_residual_flags_a_branch_moved_to_the_other_side(self):
+        candidate = np.zeros((64, 64), dtype=bool)
+        candidate[24:51, 32] = True
+        candidate[24, 18:33] = True
+        pdf = np.zeros((64, 64), dtype=bool)
+        pdf[24:51, 32] = True
+        pdf[24, 32:47] = True
+
+        report = MODULE.shared_structure_residual(pdf, [candidate, candidate])
+
+        self.assertTrue(report["suspected"])
+        self.assertEqual(report["reason"], "directional-corner-mismatch")
+        self.assertGreater(len(report["directionalCornerMismatches"]), 0)
+
+    def test_shared_residual_accepts_matching_common_geometry(self):
+        candidate = np.zeros((64, 64), dtype=bool)
+        candidate[24:51, 32] = True
+        candidate[24, 18:33] = True
+
+        report = MODULE.shared_structure_residual(candidate, [candidate, candidate])
+
+        self.assertFalse(report["suspected"])
+
+    def test_shared_residual_ignores_unvalidated_vertical_turn_reversal(self):
+        candidate = np.zeros((64, 64), dtype=bool)
+        candidate[24:51, 32] = True
+        candidate[24, 18:33] = True
+        pdf = np.zeros((64, 64), dtype=bool)
+        pdf[12:25, 32] = True
+        pdf[24, 18:33] = True
+
+        report = MODULE.shared_structure_residual(pdf, [candidate, candidate])
+
+        self.assertFalse(report["suspected"])
+
+    def test_candidate_consensus_tolerates_one_pixel_raster_shift(self):
+        first = np.zeros((64, 64), dtype=bool)
+        first[24:51, 32] = True
+        first[24, 18:33] = True
+        shifted = np.zeros((64, 64), dtype=bool)
+        shifted[25:52, 33] = True
+        shifted[25, 19:34] = True
+
+        consensus = MODULE.candidate_consensus([first, shifted])
+
+        self.assertTrue(np.array_equal(consensus, first))
+
     def test_acceptance_summary_keeps_held_out_denominator(self):
         held_out = [{"correct": True}, {"correct": False}, {"correct": True}]
         summary = MODULE.acceptance_summary(held_out, [held_out[0]])

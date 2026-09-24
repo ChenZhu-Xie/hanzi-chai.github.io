@@ -310,6 +310,17 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     replacementId: 569,
   },
 
+  // These J-source 月 forms keep 569 with two inner horizontal strokes. They
+  // are not the two-dot sibling 126894 used by some compressed parents.
+  ...([0x6714, 0x6715, 0x6717, 0x6ed5, 0x80ba, 0x9a30] as const).map(
+    (unicode) => ({
+      unicode,
+      source: "J" as const,
+      referenceId: 569,
+      replacementId: 569,
+    }),
+  ),
+
   // U+6752 杒: J keeps G's 刃 component 395, whose third stroke falls down
   // and left; T uses sibling 397, whose third stroke extends down and right.
   {
@@ -372,6 +383,16 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
   })),
   {
     unicode: 0x808e,
+    source: "T",
+    referenceId: 504,
+    replacementId: 579,
+  },
+
+  // U+9AA8 骨: T uses 月 sibling 579 (撇 + inner 点/捺 + 横). Its upper
+  // component is reviewed separately because the inner folded horizontal is
+  // topologically reversed from component 752.
+  {
+    unicode: 0x9aa8,
     source: "T",
     referenceId: 504,
     replacementId: 579,
