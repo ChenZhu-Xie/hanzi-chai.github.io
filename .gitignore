@@ -32,3 +32,9 @@ data/
 .dev.vars
 package/hanzi-chai/src/data
 /U4E00.pdf
+
+# Local Unicode inputs, generated review evidence, and test artifacts
+/.local/
+/artifacts/
+__pycache__/
+/test-results/

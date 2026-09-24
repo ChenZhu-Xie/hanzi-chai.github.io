@@ -2,7 +2,6 @@ import { parseArgs } from "node:util";
 import type { 基本字形数据, 字符数据 } from "hanzi-chai";
 import { 字形库 } from "hanzi-chai";
 import {
-  glyphLeafOccurrences,
   glyphLeafReviewColor,
   glyphLeafStrokeIds,
   glyphToSvgMarkup,
@@ -76,6 +75,97 @@ for (const id of parent.keys()) {
 for (const family of familyByRoot.values()) family.sort((a, b) => a - b);
 const familyKey = (id: number) =>
   familyByRoot.get(find(id))?.join("/") ?? `${id}`;
+
+interface HierarchyStrokeOwner {
+  leafId: number;
+  occurrenceKey: string;
+  hierarchyIds: number[];
+}
+
+interface HierarchyOccurrence {
+  leafId: number;
+  occurrence: number;
+  strokeIndices: number[];
+  hierarchy: {
+    id: number;
+    type: "component" | "compound" | "glyph";
+    label: string;
+    familyKey: string;
+  }[];
+}
+
+const hierarchyNode = (
+  id: number,
+  rootId: number,
+): HierarchyOccurrence["hierarchy"][number] => {
+  const glyph = glyphById.get(id);
+  if (!glyph) throw new Error(`字形 ${id} 不存在`);
+  const type = id === rootId ? "glyph" : glyph.type;
+  const label =
+    glyph.type === "component" ? (glyph.name ?? "末级部件") : glyph.operator;
+  return { id, type, label, familyKey: familyKey(id) };
+};
+
+const hierarchyStrokeOwners = (
+  id: number,
+  rootId: number,
+  path: string,
+  ancestors: number[] = [],
+  seen = new Set<number>(),
+): HierarchyStrokeOwner[] => {
+  if (seen.has(id)) throw new Error(`字形 ${id} 存在循环引用`);
+  const glyph = glyphById.get(id);
+  if (!glyph) throw new Error(`字形 ${id} 不存在`);
+  const hierarchyIds = [id, ...ancestors];
+  if (glyph.type === "component") {
+    return glyph.strokes.map(() => ({
+      leafId: id,
+      occurrenceKey: path,
+      hierarchyIds,
+    }));
+  }
+  const nextSeen = new Set(seen).add(id);
+  const parts = glyph.references.map(({ id: referenceId }, index) =>
+    hierarchyStrokeOwners(
+      referenceId,
+      rootId,
+      `${path}/${index}:${referenceId}`,
+      hierarchyIds,
+      nextSeen,
+    ),
+  );
+  if (!glyph.strokes?.length) return parts.flat();
+  return glyph.strokes.flatMap(({ index, from, to }) => {
+    const part = parts[index] ?? [];
+    return part.slice(from ?? 0, (to ?? part.length - 1) + 1);
+  });
+};
+
+const glyphHierarchyOccurrences = (id: number): HierarchyOccurrence[] => {
+  const owners = hierarchyStrokeOwners(id, id, `${id}`);
+  const byKey = new Map<string, HierarchyOccurrence>();
+  const countByLeaf = new Map<number, number>();
+  for (const [strokeIndex, owner] of owners.entries()) {
+    let occurrence = byKey.get(owner.occurrenceKey);
+    if (!occurrence) {
+      const occurrenceIndex = countByLeaf.get(owner.leafId) ?? 0;
+      countByLeaf.set(owner.leafId, occurrenceIndex + 1);
+      occurrence = {
+        leafId: owner.leafId,
+        occurrence: occurrenceIndex,
+        strokeIndices: [],
+        hierarchy: owner.hierarchyIds.map((nodeId) =>
+          hierarchyNode(nodeId, id),
+        ),
+      };
+      byKey.set(owner.occurrenceKey, occurrence);
+    }
+    const resolvedOccurrence = occurrence;
+    if (!resolvedOccurrence) throw new Error(`字形 ${id} 的层级实例生成失败`);
+    resolvedOccurrence.strokeIndices.push(strokeIndex);
+  }
+  return [...byKey.values()];
+};
 
 // These visually difficult families are held out in full. No character using
 // one of them can leak into calibration through another source or parent.
@@ -208,15 +298,15 @@ const renderedRows = rows.flatMap((row) => {
       candidateLeafSvgs: Object.fromEntries(
         rendered.map(([id, glyph]) => [
           id,
-          glyphLeafOccurrences(id, glyphById).map((leaf) => ({
+          glyphHierarchyOccurrences(id).map((leaf) => ({
             ...leaf,
             familyKey: familyKey(leaf.leafId),
             color: colorFor(leaf.leafId),
             svg: glyphToSvgMarkup(glyph.图形盒子, false, {
               strokeWidthScale: 0.5,
               strokeColors: leafIds[id]!.map(() => colorFor(leaf.leafId)),
-              strokeVisibility: leafIds[id]!.map(
-                (_leafId, strokeIndex) => leaf.strokeIndices.includes(strokeIndex),
+              strokeVisibility: leafIds[id]!.map((_leafId, strokeIndex) =>
+                leaf.strokeIndices.includes(strokeIndex),
               ),
             }),
           })),
