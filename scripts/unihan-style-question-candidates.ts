@@ -2,6 +2,8 @@ import { parseArgs } from "node:util";
 import type { 基本字形数据, 矢量笔画数据 } from "hanzi-chai";
 import { 图形盒子 } from "hanzi-chai";
 import {
+  glyphLeafOccurrences,
+  glyphLeafReviewColor,
   glyphLeafStrokeIds,
   glyphToSvgMarkup,
 } from "../src/components/glyph-svg";
@@ -22,6 +24,19 @@ const payload = (await Bun.file(values.input).json()) as {
   rows: Array<{
     candidates: Record<string, 矢量笔画数据[]>;
     candidateSvgs: Record<string, string>;
+    candidateScoringSvgs?: Record<string, string>;
+    candidateLeafColors?: Record<string, string>;
+    candidateLeafSvgs?: Record<
+      string,
+      Array<{
+        leafId: number;
+        occurrence: number;
+        strokeIndices: number[];
+        familyKey: string;
+        color: string;
+        svg: string;
+      }>
+    >;
     candidateFocusSvgs?: Record<string, string>;
     candidateTopologySvgs?: Record<string, string>;
     candidateFocusIds?: Record<string, number[]>;
@@ -56,15 +71,6 @@ const glyphById = new Map(
     glyph,
   ]),
 );
-const palette = [
-  // Deliberately exclude the topology-node red, blue, and gray.
-  "#f59e0b",
-  "#7c3aed",
-  "#db2777",
-  "#92400e",
-  "#ca8a04",
-  "#c2410c",
-];
 const focusColor = "#f59e0b";
 const familyById = new Map<number, string>();
 const colorByFamily = new Map<string, string>();
@@ -74,13 +80,13 @@ for (const [index, family] of (definitions.siblingFamilies ?? []).entries()) {
     .sort((a, b) => a - b)
     .join("/");
   for (const id of family) familyById.set(id, key);
-  colorByFamily.set(key, palette[index % palette.length]!);
+  colorByFamily.set(key, glyphLeafReviewColor(index));
 }
 const colorFor = (id: number) => {
   const family = familyById.get(id) ?? `${id}`;
   let color = colorByFamily.get(family);
   if (!color) {
-    color = palette[colorByFamily.size % palette.length]!;
+    color = glyphLeafReviewColor(colorByFamily.size);
     colorByFamily.set(family, color);
   }
   return color;
@@ -165,6 +171,38 @@ for (const row of payload.rows) {
             : undefined,
       }),
     ]),
+  );
+  row.candidateScoringSvgs = Object.fromEntries(
+    Object.entries(row.candidates).map(([id, strokes]) => [
+      id,
+      glyphToSvgMarkup(图形盒子.从笔画列表构建(strokes)),
+    ]),
+  );
+  row.candidateLeafColors = Object.fromEntries(
+    [
+      ...new Set(Object.values(row.candidateLeafStrokeIds).flat()),
+    ].map((leafId) => [leafId, colorFor(leafId)]),
+  );
+  row.candidateLeafSvgs = Object.fromEntries(
+    Object.entries(row.candidates).map(([id, strokes]) => {
+      const leafIds = row.candidateLeafStrokeIds![id]!;
+      const glyph = 图形盒子.从笔画列表构建(strokes);
+      return [
+        id,
+        glyphLeafOccurrences(Number(id), glyphById).map((leaf) => ({
+          ...leaf,
+          familyKey: familyById.get(leaf.leafId) ?? `${leaf.leafId}`,
+          color: colorFor(leaf.leafId),
+          svg: glyphToSvgMarkup(glyph, false, {
+            strokeWidthScale: 0.5,
+            strokeColors: leafIds.map(() => colorFor(leaf.leafId)),
+            strokeVisibility: leafIds.map(
+              (_leafId, strokeIndex) => leaf.strokeIndices.includes(strokeIndex),
+            ),
+          }),
+        })),
+      ];
+    }),
   );
   row.candidateFocusSvgs = Object.fromEntries(
     Object.entries(row.candidates).map(([id, strokes]) => {

@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { 图形盒子, type 矢量笔画数据 } from "hanzi-chai";
 import { glyphToSvgMarkup, strokeToSvgPath } from "./glyph-svg";
-import { glyphLeafStrokeIds } from "./glyph-svg";
+import {
+  glyphLeafOccurrences,
+  glyphLeafReviewColor,
+  glyphLeafStrokeIds,
+} from "./glyph-svg";
 
 describe("glyph SVG rendering", () => {
   const strokes: 矢量笔画数据[] = [
@@ -108,12 +112,37 @@ describe("glyph SVG rendering", () => {
         ],
         ambiguous: false,
       },
+      {
+        id: 4,
+        type: "compound" as const,
+        operator: "⿰" as const,
+        references: [{ id: 1 }, { id: 1 }],
+        strokes: [],
+        ambiguous: false,
+      },
     ];
-
-    expect(glyphLeafStrokeIds(3, new Map(glyphs.map((x) => [x.id, x])))).toEqual([
+    const glyphById = new Map(glyphs.map((x) => [x.id, x]));
+    expect(glyphLeafStrokeIds(3, glyphById)).toEqual([
       2,
       1,
       2,
     ]);
+    expect(glyphLeafOccurrences(3, glyphById)).toEqual([
+      { leafId: 2, occurrence: 0, strokeIndices: [0, 2] },
+      { leafId: 1, occurrence: 0, strokeIndices: [1] },
+    ]);
+    expect(glyphLeafOccurrences(4, glyphById)).toEqual([
+      { leafId: 1, occurrence: 0, strokeIndices: [0] },
+      { leafId: 1, occurrence: 1, strokeIndices: [1] },
+    ]);
+  });
+
+  test("does not alias leaf colors after the preset palette is exhausted", () => {
+    const colors = Array.from({ length: 32 }, (_, index) =>
+      glyphLeafReviewColor(index),
+    );
+
+    expect(new Set(colors).size).toBe(colors.length);
+    expect(colors.every((color) => /^#[0-9a-f]{6}$/i.test(color))).toBeTrue();
   });
 });

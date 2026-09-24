@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import html
 import importlib.util
 import io
 import json
@@ -649,6 +651,171 @@ def mask_panel(mask: np.ndarray, size=256):
     return canvas.convert("RGB")
 
 
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    value = color.removeprefix("#")
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
+
+
+def _translate_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    matrix = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+    return MATCHER.warp_mask(mask, matrix)
+
+
+def leaf_separation_offsets(
+    masks: list[np.ndarray], distance: int = 18
+) -> list[tuple[int, int]]:
+    """Move terminal occurrences apart without changing their own geometry."""
+    if not masks:
+        return []
+    union = np.logical_or.reduce(masks)
+    union_points = np.argwhere(union)
+    if union_points.size:
+        center_y, center_x = union_points.mean(axis=0)
+    else:
+        center_y = (masks[0].shape[0] - 1) / 2
+        center_x = (masks[0].shape[1] - 1) / 2
+    offsets = []
+    for index, mask in enumerate(masks):
+        points = np.argwhere(mask)
+        if points.size:
+            leaf_y, leaf_x = points.mean(axis=0)
+        else:
+            leaf_y, leaf_x = center_y, center_x
+        vector_x = float(leaf_x - center_x)
+        vector_y = float(leaf_y - center_y)
+        length = math.hypot(vector_x, vector_y)
+        if length < 3:
+            angle = 2 * math.pi * index / max(1, len(masks))
+            vector_x, vector_y = math.cos(angle), math.sin(angle)
+            length = 1
+        offsets.append(
+            (
+                round(distance * vector_x / length),
+                round(distance * vector_y / length),
+            )
+        )
+    return offsets
+
+
+def attribute_pdf_to_leaf_masks(
+    pdf_mask: np.ndarray,
+    aligned_leaf_masks: list[np.ndarray],
+    max_distance: float = 18,
+) -> list[np.ndarray]:
+    """Project chart ink onto a candidate hypothesis without claiming ground truth."""
+    if not aligned_leaf_masks:
+        return []
+    distances = np.stack(
+        [PDF.distance_transform_edt(~mask) for mask in aligned_leaf_masks]
+    )
+    nearest = distances.argmin(axis=0)
+    minimum = distances.min(axis=0)
+    attributed = []
+    for index in range(len(aligned_leaf_masks)):
+        attributed.append(pdf_mask & (nearest == index) & (minimum <= max_distance))
+    return attributed
+
+
+def _draw_leaf_labels(
+    panel: Image.Image, masks: list[np.ndarray], entries: list[dict]
+) -> Image.Image:
+    draw = ImageDraw.Draw(panel)
+    for mask, entry in zip(masks, entries):
+        points = np.argwhere(mask)
+        if not points.size:
+            continue
+        top, left = points.min(axis=0)
+        label = f"{entry['leafId']}:{entry.get('occurrence', 0) + 1}"
+        x, y = max(1, int(left)), max(1, int(top) - 12)
+        box = draw.textbbox((x, y), label)
+        draw.rectangle(box, fill="white")
+        draw.text((x, y), label, fill=_hex_rgb(entry["color"]))
+    return panel
+
+
+def colored_leaf_topology_panel(
+    masks: list[np.ndarray],
+    entries: list[dict],
+    offsets: list[tuple[int, int]],
+    unassigned_mask: np.ndarray | None = None,
+) -> Image.Image:
+    """Color and analyze each separated terminal leaf independently."""
+    moved = [
+        _translate_mask(mask, dx, dy)
+        for mask, (dx, dy) in zip(masks, offsets)
+    ]
+    canvas = Image.new("RGB", (masks[0].shape[1], masks[0].shape[0]), "white")
+    pixels = np.asarray(canvas).copy()
+    if unassigned_mask is not None:
+        pixels[unassigned_mask] = (148, 163, 184)
+    for mask, entry in zip(moved, entries):
+        pixels[mask] = _hex_rgb(entry["color"])
+    canvas = Image.fromarray(pixels)
+    # Compute nodes per leaf. Contacts between different leaves can therefore
+    # never manufacture a false branch/cross node.
+    for mask in moved:
+        endpoints, junctions, skeleton = topology_points(mask)
+        corners = corner_points(skeleton, endpoints, junctions)
+        canvas = draw_topology_markers(
+            canvas, endpoints, junctions, corners, radius=5
+        )
+    return _draw_leaf_labels(canvas, moved, entries)
+
+
+def recursive_leaf_hypothesis_panels(
+    pdf_image: Image.Image,
+    scoring_svg: str,
+    leaf_entries: list[dict],
+    size: int = 256,
+) -> tuple[Image.Image, Image.Image, dict]:
+    """Return PDF-attributed and candidate leaf panels for one hypothesis."""
+    if not leaf_entries:
+        raise ValueError("recursive leaf rendering requires candidateLeafSvgs")
+    pdf_mask = np.asarray(pdf_image.convert("L")) < 224
+    candidate = render_svg_review_image(scoring_svg, size=size)
+    candidate_mask = np.asarray(candidate.convert("L")) < 224
+    leaf_masks = [
+        np.asarray(
+            render_svg_review_image(entry["svg"], size=size).convert("L")
+        )
+        < 224
+        for entry in leaf_entries
+    ]
+    _aligned, alignment = MATCHER.align_candidates_to_pdf(pdf_mask, [candidate_mask])
+    matrix = MATCHER.alignment_matrix(alignment, pdf_mask.shape)
+    aligned_leaves = [MATCHER.warp_mask(mask, matrix) for mask in leaf_masks]
+    attributed = attribute_pdf_to_leaf_masks(pdf_mask, aligned_leaves)
+    offsets = leaf_separation_offsets(aligned_leaves)
+    attributed_union = np.logical_or.reduce(attributed)
+    unassigned = pdf_mask & ~attributed_union
+    # Keep unexplained chart ink visible. It is evidence against this candidate,
+    # not noise to erase; unlike attributed leaves it is not moved or analyzed.
+    source_panel = colored_leaf_topology_panel(
+        attributed, leaf_entries, offsets, unassigned
+    )
+    candidate_panel = colored_leaf_topology_panel(
+        aligned_leaves, leaf_entries, offsets
+    )
+    coverage = (
+        float(attributed_union.sum()) / max(1, int(pdf_mask.sum()))
+    )
+    return source_panel, candidate_panel, {
+        "alignment": alignment,
+        "pdfInkCoverage": round(coverage, 4),
+        "leafCount": len(leaf_entries),
+        "leafIds": [entry["leafId"] for entry in leaf_entries],
+        "leaves": [
+            {
+                "id": entry["leafId"],
+                "occurrence": entry.get("occurrence", 0) + 1,
+                "color": entry["color"],
+            }
+            for entry in leaf_entries
+        ],
+        "offsets": offsets,
+    }
+
+
 def structure_guided_focus(
     pdf_image: Image.Image,
     candidate_images: list[Image.Image],
@@ -828,6 +995,69 @@ def draw_feature_annotations(
     return annotated
 
 
+def build_review_html(cards: list[dict]) -> str:
+    """Build a self-contained review tab; no sidecar images are required."""
+    def leaf_legend(card: dict) -> str:
+        hypotheses = card.get("hypotheses", [])
+        if not hypotheses:
+            return ""
+        groups = []
+        for hypothesis in hypotheses:
+            leaves = "".join(
+                f'''<span class="leaf"><i style="background:{html.escape(leaf["color"])}"></i>{leaf["id"]}:{leaf["occurrence"]}</span>'''
+                for leaf in hypothesis["leaves"]
+            )
+            groups.append(
+                f'''<div><b>Candidate {html.escape(hypothesis["candidate"])} · coverage {hypothesis["coverage"]:.1%}</b>{leaves}</div>'''
+            )
+        return f'<div class="leaf-legend">{"".join(groups)}</div>'
+
+    sections = "\n".join(
+        f'''<section class="case" id="{html.escape(card["filename"])}">
+  <h2>{html.escape(card["title"])}</h2>
+  <p>原始字源在左；A/B/C 为候选。下方每行是“PDF→该候选”的递归叶归属与分离后的候选叶拓扑。</p>
+  <img loading="eager" width="{card["width"]}" height="{card["height"]}"
+       src="data:image/webp;base64,{card["data"]}" alt="{html.escape(card["title"])} review evidence" />
+  {leaf_legend(card)}
+</section>'''
+        for card in cards
+    )
+    return f'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Unihan 递归叶部件视觉验收</title>
+<style>
+  :root {{ color-scheme: light; font-family: system-ui, "Microsoft YaHei", sans-serif; }}
+  body {{ margin: 0; padding: 24px; background: #eef2f7; color: #172033; }}
+  header, .case {{ max-width: 1500px; margin: 0 auto 24px; }}
+  header {{ position: sticky; top: 0; z-index: 2; padding: 12px 16px;
+            background: rgba(255,255,255,.96); border: 1px solid #ccd5e2; border-radius: 12px; }}
+  h1 {{ margin: 0 0 6px; font-size: 22px; }} h2 {{ margin: 0 0 4px; font-size: 19px; }}
+  p {{ margin: 4px 0 10px; color: #475569; }}
+  .legend span {{ display: inline-block; margin-right: 16px; font-weight: 650; }}
+  .endpoint {{ color: rgb(220,38,38); }} .junction {{ color: rgb(2,132,199); }}
+  .corner {{ color: rgb(34,197,94); }} .unassigned {{ color: rgb(100,116,139); }}
+  .case {{ padding: 16px; overflow: auto; background: white; border: 1px solid #ccd5e2;
+           border-radius: 12px; box-shadow: 0 5px 18px rgba(15,23,42,.08); }}
+  img {{ display: block; width: min(100%, 1152px); height: auto;
+         border-top: 1px solid #e2e8f0; }}
+  .leaf-legend {{ display: grid; gap: 7px; margin-top: 12px; font-size: 13px; }}
+  .leaf-legend b {{ display: inline-block; min-width: 190px; }}
+  .leaf {{ display: inline-flex; align-items: center; margin: 2px 10px 2px 0; }}
+  .leaf i {{ width: 13px; height: 13px; margin-right: 4px; border: 1px solid #fff;
+             outline: 1px solid #94a3b8; border-radius: 3px; }}
+</style>
+</head>
+<body>
+<header><h1>Unihan 递归叶部件视觉验收</h1>
+<p>每种候选都先递归到终端叶部件，再整体分离；PDF 颜色是对应候选假设下的墨迹归属，不冒充既定真值。</p>
+<div class="legend"><span class="endpoint">红点＝端点</span><span class="junction">蓝点＝分叉/交叉</span><span class="corner">绿叉＝二度锐转折</span><span class="unassigned">灰线＝该候选未解释的 PDF 墨迹</span></div></header>
+{sections}
+</body></html>'''
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
@@ -835,13 +1065,28 @@ def main():
     parser.add_argument("--pdf", type=Path)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--html-output",
+        type=Path,
+        help="write one self-contained browser review page (up to any selected rows)",
+    )
+    parser.add_argument(
+        "--html-only",
+        action="store_true",
+        help="embed WebP panels in HTML without retaining individual PNG files",
+    )
     parser.add_argument("--split", choices=("train", "test"))
     parser.add_argument("--only-errors", action="store_true")
     parser.add_argument("--blind", action="store_true")
     parser.add_argument("--answer-key", type=Path)
     parser.add_argument("--review-template", type=Path)
     parser.add_argument("--topology-row", action="store_true")
+    parser.add_argument(
+        "--recursive-leaf-panels",
+        action="store_true",
+        help="show per-candidate PDF leaf attribution and recursively split leaves",
+    )
     parser.add_argument("--focus-differences", action="store_true")
     parser.add_argument("--focus-color")
     parser.add_argument("--topology-report", type=Path)
@@ -849,6 +1094,10 @@ def main():
     args = parser.parse_args()
     if args.pdf is None and args.pages_dir is None:
         parser.error("one of --pdf or --pages-dir is required")
+    if args.html_only and args.html_output is None:
+        parser.error("--html-only requires --html-output")
+    if not args.html_only and args.output_dir is None:
+        parser.error("--output-dir is required unless --html-only is used")
 
     candidate_rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
     rows_by_unicode = {row["unicode"]: row for row in candidate_rows}
@@ -871,10 +1120,12 @@ def main():
     answer_key = {}
     review_template = {}
     topology_report = {}
+    html_cards = []
     annotations = (
         json.loads(args.annotations.read_text("utf-8")) if args.annotations else {}
     )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.html_only:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     for page_number, page_records in sorted(records_by_page.items()):
         page_svg = (
             MATCHER.load_pdf_page_svg(args.pdf, page_number)
@@ -906,6 +1157,7 @@ def main():
                 )
                 topology_inputs = [pdf_topology_panel]
                 topology_target_inputs = []
+                leaf_hypotheses = []
                 labels = [f"PDF {record['source']}"]
                 candidate_set_warning = bool(result.get("candidateSetIncomplete"))
                 for glyph_id in ids:
@@ -918,7 +1170,7 @@ def main():
                         )
                         svg_images[glyph_id] = (
                             topology_overlay(candidate_image)
-                            if args.topology_row
+                            if args.topology_row and not args.recursive_leaf_panels
                             else candidate_image
                         )
                     panels.append(ImageOps.contain(svg_images[glyph_id], (256, 256)))
@@ -936,6 +1188,23 @@ def main():
                     topology_target_inputs.append(
                         render_svg_review_image(without_review_points(target_svg))
                     )
+                    if args.recursive_leaf_panels:
+                        leaf_entries = row.get("candidateLeafSvgs", {}).get(
+                            str(glyph_id), []
+                        )
+                        scoring_svg = row.get("candidateScoringSvgs", {}).get(
+                            str(glyph_id), without_review_points(row["candidateSvgs"][str(glyph_id)])
+                        )
+                        if leaf_entries:
+                            leaf_hypotheses.append(
+                                recursive_leaf_hypothesis_panels(
+                                    pdf_topology_panel,
+                                    scoring_svg,
+                                    leaf_entries,
+                                )
+                            )
+                        else:
+                            leaf_hypotheses.append(None)
                     if args.blind:
                         candidate = chr(65 + len(labels) - 1)
                         focus_ids = row.get("candidateFocusIds", {}).get(
@@ -955,7 +1224,10 @@ def main():
                             flags.append("predicted")
                         labels.append(f"{glyph_id} {'/'.join(flags)}".strip())
                 width = 256 * len(panels)
-                height = 580 if args.topology_row else 300
+                if args.recursive_leaf_panels:
+                    height = 300 + 288 * len(ids)
+                else:
+                    height = 580 if args.topology_row else 300
                 montage = Image.new("RGB", (width, height), "white")
                 draw = ImageDraw.Draw(montage)
                 for index, (panel, label) in enumerate(zip(panels, labels)):
@@ -967,7 +1239,7 @@ def main():
                         "REVIEW: all candidates may share a wrong component",
                         fill=(194, 65, 12),
                     )
-                if args.topology_row:
+                if args.topology_row and not args.recursive_leaf_panels:
                     if args.focus_color or args.focus_differences:
                         if args.focus_color:
                             topology_inputs = structure_guided_focus(
@@ -994,9 +1266,30 @@ def main():
                     )
                     for index, panel in enumerate(topology_inputs):
                         montage.paste(topology_panel(panel), (index * 256, 324))
+                if args.recursive_leaf_panels:
+                    for candidate_index, hypothesis in enumerate(leaf_hypotheses):
+                        if hypothesis is None:
+                            continue
+                        source_leaf_panel, candidate_leaf_panel, metadata = hypothesis
+                        y = 324 + candidate_index * 288
+                        candidate = chr(65 + candidate_index)
+                        draw.text(
+                            (8, y - 18),
+                            f"PDF -> Candidate {candidate} leaf hypothesis "
+                            f"(coverage {metadata['pdfInkCoverage']:.1%})",
+                            fill=(30, 64, 175),
+                        )
+                        montage.paste(source_leaf_panel, (0, y))
+                        montage.paste(candidate_leaf_panel, (256, y))
+                        draw.text((8, y + 4), f"PDF->{candidate}", fill="black")
+                        draw.text(
+                            (264, y + 4),
+                            f"Candidate {candidate} leaves",
+                            fill="black",
+                        )
                 codepoint = f"U+{record['unicode']:04X}"
                 filename = f"{codepoint}-{record['source']}.png"
-                if args.topology_row:
+                if args.topology_row and not args.recursive_leaf_panels:
                     topology_report[filename] = {
                         label: topology_signature(panel)
                         for label, panel in zip(labels, topology_inputs)
@@ -1013,10 +1306,41 @@ def main():
                             row.get("candidateFocusTopology", {}),
                         )
                     )
+                if args.recursive_leaf_panels:
+                    topology_report.setdefault(filename, {})[
+                        "recursiveLeafHypotheses"
+                    ] = {
+                        chr(65 + index): hypothesis[2]
+                        for index, hypothesis in enumerate(leaf_hypotheses)
+                        if hypothesis is not None
+                    }
                 montage = draw_feature_annotations(
                     montage, annotations.get(filename, []), args.topology_row
                 )
-                montage.save(args.output_dir / filename)
+                if not args.html_only:
+                    montage.save(args.output_dir / filename)
+                if args.html_output:
+                    encoded = io.BytesIO()
+                    montage.save(encoded, format="WEBP", quality=92, method=6)
+                    data = base64.b64encode(encoded.getvalue()).decode("ascii")
+                    html_cards.append(
+                        {
+                            "title": f"{codepoint} {chr(record['unicode'])} · {record['source']} source",
+                            "filename": filename,
+                            "width": montage.width,
+                            "height": montage.height,
+                            "data": data,
+                            "hypotheses": [
+                                {
+                                    "candidate": chr(65 + index),
+                                    "coverage": hypothesis[2]["pdfInkCoverage"],
+                                    "leaves": hypothesis[2]["leaves"],
+                                }
+                                for index, hypothesis in enumerate(leaf_hypotheses)
+                                if hypothesis is not None
+                            ],
+                        }
+                    )
                 expected_index = ids.index(result["expectedGlyphId"])
                 predicted_id = result.get("predictedGlyphId")
                 prediction = (
@@ -1040,6 +1364,9 @@ def main():
             json.dumps(answer_key, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+    if args.html_output:
+        args.html_output.parent.mkdir(parents=True, exist_ok=True)
+        args.html_output.write_text(build_review_html(html_cards), encoding="utf-8")
     if args.review_template:
         args.review_template.parent.mkdir(parents=True, exist_ok=True)
         args.review_template.write_text(
