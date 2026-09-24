@@ -487,4 +487,25 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 928,
     replacementId: 62022,
   },
+
+  // U+72D1 狑: H/T use 令 sibling 775 (横 + 横撇/点), J/K use 774
+  // (横 + 横折钩/竖), and KP(N) keeps 779 (点 + 横撇/点).
+  ...(["H", "T"] as const).map((source) => ({
+    unicode: 0x72d1,
+    source,
+    referenceId: 779,
+    replacementId: 775,
+  })),
+  ...(["J", "K"] as const).map((source) => ({
+    unicode: 0x72d1,
+    source,
+    referenceId: 779,
+    replacementId: 774,
+  })),
+  {
+    unicode: 0x72d1,
+    source: "N",
+    referenceId: 779,
+    replacementId: 779,
+  },
 ].map((decision) => ({ ...decision, provenance: "manual" }));

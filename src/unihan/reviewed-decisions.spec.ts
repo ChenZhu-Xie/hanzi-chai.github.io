@@ -45,6 +45,24 @@ test("records the reviewed U+9AA8 upper-component source groups", () => {
   ]);
 });
 
+test("splits U+72D1 令 into the reviewed source groups", () => {
+  for (const [source, replacementId] of [
+    ["H", 775],
+    ["T", 775],
+    ["J", 774],
+    ["K", 774],
+    ["N", 779],
+  ] as const) {
+    expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
+      unicode: 0x72d1,
+      source,
+      referenceId: 779,
+      replacementId,
+      provenance: "manual",
+    });
+  }
+});
+
 test("resolves the reviewed T-source 尼 variant for U+6635", () => {
   const glyphs: 基本字形数据[] = [5925, 58234].map((id) => ({
     id,

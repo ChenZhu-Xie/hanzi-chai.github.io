@@ -263,7 +263,7 @@ def main():
                 ]
                 pdf = MONTAGE.pdf_cell(page, record["bbox"], page_sizes[page_number])
                 focused_masks = MONTAGE.target_window_focus_masks(
-                    pdf, candidate_images, "2563eb", candidate_target_images
+                    pdf, candidate_images, "f59e0b", candidate_target_images
                 )
                 focused = [MONTAGE.mask_panel(mask) for mask in focused_masks]
                 signatures = [MONTAGE.topology_signature(image) for image in focused]

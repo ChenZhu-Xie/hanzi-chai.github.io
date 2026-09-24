@@ -184,7 +184,7 @@ const renderedRows = rows.flatMap((row) => {
           id,
           glyphToSvgMarkup(glyph.图形盒子, false, {
             strokeColors: leafIds[id]!.map((leafId) =>
-              focus.has(leafId) ? "#2563eb" : "black",
+              focus.has(leafId) ? "#f59e0b" : "black",
             ),
           }),
         ]),
@@ -193,7 +193,7 @@ const renderedRows = rows.flatMap((row) => {
         rendered.map(([id, glyph]) => [
           id,
           glyphToSvgMarkup(glyph.图形盒子, false, {
-            strokeColors: leafIds[id]!.map(() => "#2563eb"),
+            strokeColors: leafIds[id]!.map(() => "#f59e0b"),
             strokeVisibility: leafIds[id]!.map((leafId) => focus.has(leafId)),
           }),
         ]),

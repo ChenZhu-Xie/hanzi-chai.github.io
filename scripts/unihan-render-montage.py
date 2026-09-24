@@ -32,7 +32,7 @@ cv2 = MATCHER.cv2
 TOPOLOGY_COLORS = {
     "endpoint": (220, 38, 38),
     "junction": (2, 132, 199),
-    "corner": (22, 163, 74),
+    "corner": (107, 114, 128),
 }
 
 
@@ -179,29 +179,60 @@ def corner_points(
     endpoints: list[tuple[int, int]],
     junctions: list[tuple[int, int]],
 ):
-    """Find strong direction changes that are neither endpoints nor junctions.
-
-    Graph degree alone deliberately treats an L-shaped turn as an ordinary
-    degree-two pixel. Shi-Tomasi corners add that missing geometric information
-    while nearby endpoint/junction detections are suppressed to keep the legend
-    categories disjoint.
-    """
-    detected = cv2.goodFeaturesToTrack(
-        skeleton.astype(np.uint8) * 255,
-        maxCorners=64,
-        qualityLevel=0.08,
-        minDistance=8,
-        blockSize=7,
-        useHarrisDetector=False,
-    )
-    if detected is None:
-        return []
+    """Find genuine degree-two turns, ignoring diagonal raster stair-steps."""
     graph_nodes = [*endpoints, *junctions]
-    corners = []
-    for point in detected.reshape(-1, 2):
-        x, y = (int(round(float(value))) for value in point)
+    radius = max(9, round(min(skeleton.shape) * 0.045))
+    inner = max(3, round(radius * 0.28))
+    candidates = []
+    height, width = skeleton.shape
+    for y, x in np.argwhere(skeleton):
         if any(
-            math.hypot(x - node_x, y - node_y) <= 7 for node_x, node_y in graph_nodes
+            math.hypot(x - node_x, y - node_y) <= radius
+            for node_x, node_y in graph_nodes
+        ):
+            continue
+        left, right = max(0, x - radius), min(width, x + radius + 1)
+        top, bottom = max(0, y - radius), min(height, y + radius + 1)
+        local = skeleton[top:bottom, left:right].copy()
+        yy, xx = np.ogrid[top:bottom, left:right]
+        distance2 = (xx - x) ** 2 + (yy - y) ** 2
+        ring = local & (distance2 > inner**2) & (distance2 <= radius**2)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            ring.astype(np.uint8), 8
+        )
+        branches = []
+        for label in range(1, count):
+            component = labels == label
+            if stats[label, cv2.CC_STAT_AREA] < inner:
+                continue
+            component_distances = distance2[component]
+            if component_distances.min() > (inner + 2) ** 2:
+                continue
+            points = np.argwhere(component)
+            farthest = points[
+                component_distances >= np.percentile(component_distances, 75)
+            ]
+            target_y, target_x = farthest.mean(axis=0)
+            branches.append(
+                np.array([target_x + left - x, target_y + top - y], dtype=float)
+            )
+        if len(branches) != 2:
+            continue
+        first, second = branches
+        denominator = np.linalg.norm(first) * np.linalg.norm(second)
+        if denominator == 0:
+            continue
+        cosine = float(np.clip(np.dot(first, second) / denominator, -1, 1))
+        angle = math.degrees(math.acos(cosine))
+        if angle <= 135:
+            candidates.append((angle, int(x), int(y)))
+
+    corners = []
+    minimum_distance = max(16, round(min(skeleton.shape) * 0.075))
+    for _angle, x, y in sorted(candidates):
+        if any(
+            math.hypot(x - other_x, y - other_y) < minimum_distance
+            for other_x, other_y in corners
         ):
             continue
         corners.append((x, y))
@@ -436,7 +467,6 @@ def draw_topology_markers(
     for points, color in (
         (endpoints, TOPOLOGY_COLORS["endpoint"]),
         (junctions, TOPOLOGY_COLORS["junction"]),
-        (corners, TOPOLOGY_COLORS["corner"]),
     ):
         for x, y in points:
             draw.ellipse(
@@ -449,6 +479,24 @@ def draw_topology_markers(
                 fill="white",
             )
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+    # Degree-two turns are geometric hints rather than graph nodes.  Keep the
+    # underlying skeleton visible through an intentionally hollow gray ring.
+    for x, y in corners:
+        draw.ellipse(
+            (
+                x - radius - 2,
+                y - radius - 2,
+                x + radius + 2,
+                y + radius + 2,
+            ),
+            outline="white",
+            width=4,
+        )
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            outline=TOPOLOGY_COLORS["corner"],
+            width=3,
+        )
     return canvas
 
 
@@ -896,11 +944,11 @@ def main():
                             ]
                     draw.text(
                         (8, 306),
-                        "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn"
+                        "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn"
                         if args.focus_color
-                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn"
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn"
                         if args.focus_differences
-                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green=degree-2 sharp turn",
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn",
                         fill="black",
                     )
                     for index, panel in enumerate(topology_inputs):
