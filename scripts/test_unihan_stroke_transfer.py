@@ -93,6 +93,31 @@ class StrokeTransferTest(unittest.TestCase):
         self.assertGreaterEqual(path.count("M "), 2)
         self.assertGreaterEqual(path.count("Z"), 2)
 
+    def test_candidate_ranking_exposes_method_prior_and_distance_disagreement(self):
+        row = {"candidateSvgs": {"10": "", "20": ""}}
+        result = {
+            "predictionMethod": "topology-rule",
+            "predictedGlyphId": 20,
+            "candidates": [
+                {"id": 10, "distance": 1.0},
+                {"id": 20, "distance": 3.0},
+            ],
+            "correct": True,
+        }
+        evidence = {
+            "results": [
+                result,
+                {"predictionMethod": "topology-rule", "correct": True},
+                {"predictionMethod": "topology-rule", "correct": False},
+            ]
+        }
+        ranked = MODULE.rank_candidates(row, result, evidence)
+        self.assertEqual([item["id"] for item in ranked], [20, 10])
+        self.assertAlmostEqual(ranked[0]["relativeWeight"], 0.6)
+        self.assertLess(ranked[0]["distanceWeight"], ranked[1]["distanceWeight"])
+        self.assertEqual(ranked[0]["methodPrior"]["correct"], 2)
+        self.assertEqual(ranked[0]["methodPrior"]["total"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

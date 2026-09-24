@@ -8,7 +8,9 @@ The outline alone cannot uniquely recover overlapping stroke order.
 from __future__ import annotations
 
 import argparse
+import colorsys
 import copy
+import hashlib
 import html
 import importlib.util
 import json
@@ -211,6 +213,22 @@ def candidate_strokes(row: dict, glyph_id: int) -> list[dict]:
                 "componentId": leaf["leafId"],
                 "familyKey": leaf["familyKey"],
                 "color": leaf["color"],
+                "occurrence": leaf.get("occurrence", 0),
+                "hierarchy": leaf.get("hierarchy")
+                or [
+                    {
+                        "id": leaf["leafId"],
+                        "type": "component",
+                        "label": "末级部件",
+                        "familyKey": leaf["familyKey"],
+                    },
+                    {
+                        "id": glyph_id,
+                        "type": "glyph",
+                        "label": "整字字形",
+                        "familyKey": str(glyph_id),
+                    },
+                ],
                 "points": points,
                 "bendFractions": bend_fractions,
             }
@@ -623,6 +641,180 @@ def marker_svg(centerlines: list[np.ndarray], canvas: int, strokes: list[dict]) 
     return "".join(parts)
 
 
+def hierarchy_color(key: str) -> str:
+    """Return a stable, readable color for non-leaf hierarchy rows."""
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    hue = int.from_bytes(digest[:2], "big") / 65535
+    saturation = 0.56 + digest[2] / 255 * 0.14
+    lightness = 0.42 + digest[3] / 255 * 0.10
+    red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+
+
+def enrich_hierarchy(hierarchy: list[dict], leaf_color: str) -> list[dict]:
+    output = []
+    for index, node in enumerate(hierarchy):
+        family_key = str(node.get("familyKey", node["id"]))
+        output.append(
+            {
+                **node,
+                "familyKey": family_key,
+                "color": leaf_color if index == 0 else hierarchy_color(family_key),
+            }
+        )
+    return output
+
+
+def interactive_candidate_svg(
+    row: dict,
+    glyph_id: int,
+    registry: dict[str, dict],
+    *,
+    instance: str,
+) -> str:
+    """Attach real leaf/ancestor metadata to each candidate stroke path."""
+    candidate_key = str(glyph_id)
+    root = ET.fromstring(row["candidateSvgs"][candidate_key])
+    root.set("class", "candidate-svg")
+    paths = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "path"]
+    by_stroke: dict[int, tuple[str, dict]] = {}
+    for leaf in row["candidateLeafSvgs"][candidate_key]:
+        part_key = (
+            f"candidate:{instance}:{glyph_id}:{leaf['leafId']}:{leaf.get('occurrence', 0)}"
+        )
+        hierarchy = enrich_hierarchy(
+            leaf.get("hierarchy")
+            or [
+                {
+                    "id": leaf["leafId"],
+                    "type": "component",
+                    "label": "末级部件",
+                    "familyKey": leaf["familyKey"],
+                },
+                {
+                    "id": glyph_id,
+                    "type": "glyph",
+                    "label": "整字字形",
+                    "familyKey": str(glyph_id),
+                },
+            ],
+            leaf["color"],
+        )
+        registry[part_key] = {
+            "leafId": leaf["leafId"],
+            "familyKey": leaf["familyKey"],
+            "glyphId": glyph_id,
+            "color": leaf["color"],
+            "hierarchy": hierarchy,
+        }
+        for stroke_index in leaf["strokeIndices"]:
+            by_stroke[int(stroke_index)] = (part_key, registry[part_key])
+    if len(paths) != len(row["candidates"][candidate_key]):
+        raise ValueError(f"candidate {glyph_id} SVG path count mismatch")
+    for stroke_index, path in enumerate(paths):
+        part_key, part = by_stroke[stroke_index]
+        path.set("class", "interactive-part candidate-part")
+        path.set("data-part-key", part_key)
+        path.set("data-family-key", str(part["familyKey"]))
+        path.set("data-component-id", str(part["leafId"]))
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    return ET.tostring(root, encoding="unicode")
+
+
+def evidence_for_record(evidence: dict | None, unicode: int, source: str) -> dict | None:
+    if not evidence:
+        return None
+    return next(
+        (
+            item
+            for item in evidence.get("results", [])
+            if item.get("unicode") == unicode and item.get("source") == source
+        ),
+        None,
+    )
+
+
+def rank_candidates(row: dict, result: dict | None, evidence: dict | None) -> list[dict]:
+    candidate_ids = [int(value) for value in row["candidateSvgs"]]
+    evidence_by_id = {
+        int(item["id"]): item for item in (result or {}).get("candidates", [])
+    }
+    raw_distances = {
+        glyph_id: float(evidence_by_id.get(glyph_id, {}).get("distance", 999.0))
+        for glyph_id in candidate_ids
+    }
+    finite = [value for value in raw_distances.values() if value < 999]
+    baseline = min(finite, default=0.0)
+    distance_weights = {
+        glyph_id: math.exp(-min(40.0, max(0.0, distance - baseline)))
+        if distance < 999
+        else 0.0
+        for glyph_id, distance in raw_distances.items()
+    }
+    distance_total = sum(distance_weights.values()) or 1.0
+    predicted = (result or {}).get("predictedGlyphId")
+    method = (result or {}).get("predictionMethod")
+    method_rows = [
+        item
+        for item in (evidence or {}).get("results", [])
+        if method and item.get("predictionMethod") == method
+    ]
+    method_correct = sum(item.get("correct") is True for item in method_rows)
+    method_total = len(method_rows)
+    decision_weights = {
+        glyph_id: distance_weights[glyph_id] / distance_total
+        for glyph_id in candidate_ids
+    }
+    if predicted in candidate_ids and method_total:
+        predicted_prior = (method_correct + 1) / (method_total + 2)
+        other_ids = [glyph_id for glyph_id in candidate_ids if glyph_id != predicted]
+        other_total = sum(distance_weights[glyph_id] for glyph_id in other_ids) or 1.0
+        decision_weights = {
+            glyph_id: (
+                predicted_prior
+                if glyph_id == predicted
+                else (1 - predicted_prior)
+                * distance_weights[glyph_id]
+                / other_total
+            )
+            for glyph_id in candidate_ids
+        }
+    ordered = sorted(
+        candidate_ids,
+        key=lambda glyph_id: (
+            -decision_weights[glyph_id],
+            glyph_id,
+        ),
+    )
+    return [
+        {
+            "id": glyph_id,
+            "rank": index + 1,
+            "recommended": glyph_id == predicted,
+            "relativeWeight": decision_weights[glyph_id],
+            "distanceWeight": distance_weights[glyph_id] / distance_total,
+            "methodPrior": {
+                "method": method,
+                "correct": method_correct,
+                "total": method_total,
+                "laplaceAccuracy": (method_correct + 1) / (method_total + 2)
+                if method_total
+                else None,
+            },
+            **evidence_by_id.get(glyph_id, {}),
+        }
+        for index, glyph_id in enumerate(ordered)
+    ]
+
+
+def format_metric(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
 def annotation_editor_script(metadata: dict) -> str:
     payload = json.dumps(metadata, ensure_ascii=False)
     return r'''
@@ -784,6 +976,119 @@ def annotation_editor_script(metadata: dict) -> str:
     '''.replace("__METADATA__", payload)
 
 
+def interaction_script(registry: dict[str, dict]) -> str:
+    payload = json.dumps(registry, ensure_ascii=False).replace("</", "<\\/")
+    return r'''
+    (() => {
+      const parts = __PARTS__;
+      const tip = document.querySelector('#hierarchy-tip');
+      const picker = document.querySelector('#component-picker');
+      const labelInput = document.querySelector('#component-label');
+      let activeFamily = null;
+
+      const readableText = color => {
+        const value = color.replace('#', '');
+        const [r, g, b] = [0, 2, 4].map(index => parseInt(value.slice(index, index + 2), 16));
+        return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? '#111827' : '#fff';
+      };
+      const hierarchyRows = part => part.hierarchy.map((node, index) => {
+        const kind = index === 0 ? '末级部件' : node.type === 'glyph' ? '字 / 字形' : '上级部件';
+        return `<div class="hierarchy-row" style="background:${node.color};color:${readableText(node.color)}"><span>${kind} · ${node.label || ''}</span><b>ID ${node.id}</b></div>`;
+      }).join('');
+      const familyMatches = (part, family) => part && part.hierarchy.some(node => node.familyKey === family);
+      const highlight = family => {
+        activeFamily = family;
+        document.querySelectorAll('.interactive-part').forEach(element => {
+          const part = parts[element.dataset.partKey];
+          element.classList.toggle('linked-highlight', familyMatches(part, family));
+          element.classList.toggle('linked-dim', !familyMatches(part, family));
+        });
+      };
+      const clearHighlight = () => {
+        activeFamily = null;
+        document.querySelectorAll('.interactive-part').forEach(element => element.classList.remove('linked-highlight', 'linked-dim'));
+      };
+      const moveFloating = (element, event) => {
+        const left = Math.min(innerWidth - element.offsetWidth - 12, event.clientX + 14);
+        const top = Math.min(innerHeight - element.offsetHeight - 12, event.clientY + 14);
+        element.style.left = `${Math.max(8, left)}px`;
+        element.style.top = `${Math.max(8, top)}px`;
+      };
+      const copyId = async id => {
+        try { await navigator.clipboard.writeText(String(id)); }
+        catch (_error) {
+          const area = document.createElement('textarea');
+          area.value = String(id); document.body.append(area); area.select();
+          document.execCommand('copy'); area.remove();
+        }
+      };
+      const pickerOptions = part => {
+        const seen = new Set();
+        return part.hierarchy.flatMap(node => {
+          const ids = String(node.familyKey).split('/').map(Number).filter(Number.isFinite);
+          const members = ids.length ? ids : [node.id];
+          return members.flatMap(id => {
+            const key = `${node.familyKey}:${id}`;
+            if (seen.has(key)) return [];
+            seen.add(key);
+            return [{ ...node, id, sibling: id !== node.id }];
+          });
+        });
+      };
+      const openPicker = (element, part, event) => {
+        const fill = Boolean(element.closest('[data-selection-mode="fill"]'));
+        picker.innerHTML = `<div class="picker-title">${fill ? '选中后直接填入部件标签' : '选中后复制 ID'}</div>`;
+        for (const option of pickerOptions(part)) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'picker-option';
+          button.style.background = option.color;
+          button.style.color = readableText(option.color);
+          button.innerHTML = `<span>${option.sibling ? '同族候选' : option.type === 'glyph' ? '字 / 字形' : '部件'} · ${option.label || ''}</span><b>ID ${option.id}</b>`;
+          button.onclick = async clickEvent => {
+            clickEvent.stopPropagation();
+            if (fill) {
+              labelInput.value = String(option.id);
+              labelInput.dispatchEvent(new Event('input', { bubbles: true }));
+            } else await copyId(option.id);
+            picker.hidden = true;
+          };
+          picker.append(button);
+        }
+        picker.hidden = false;
+        moveFloating(picker, event);
+      };
+
+      document.querySelectorAll('.interactive-part').forEach(element => {
+        const part = parts[element.dataset.partKey];
+        if (!part) return;
+        element.addEventListener('pointerenter', event => {
+          highlight(part.familyKey);
+          tip.innerHTML = `<div class="tip-position">鼠标：${Math.round(event.clientX)}, ${Math.round(event.clientY)} · glyph ${part.glyphId}</div>${hierarchyRows(part)}`;
+          tip.hidden = false;
+          moveFloating(tip, event);
+        });
+        element.addEventListener('pointermove', event => moveFloating(tip, event));
+        element.addEventListener('pointerleave', () => {
+          if (!picker.matches(':hover')) clearHighlight();
+          tip.hidden = true;
+        });
+        element.addEventListener('click', event => {
+          event.stopPropagation();
+          highlight(part.familyKey);
+          openPicker(element, part, event);
+        });
+      });
+      document.addEventListener('click', event => {
+        if (!picker.contains(event.target)) picker.hidden = true;
+      });
+      picker.addEventListener('pointerleave', () => {
+        if (activeFamily) clearHighlight();
+      });
+    })();
+    '''.replace("__PARTS__", payload)
+
+
 def build_html(
     record: dict,
     glyph: dict,
@@ -794,12 +1099,79 @@ def build_html(
     ambiguous: np.ndarray,
     metrics: dict,
     canvas: int,
-    candidate_svg: str,
+    row: dict,
+    evidence: dict | None,
 ) -> str:
     stroke_palette = (
         "#e11d48", "#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0891b2",
         "#ca8a04", "#4f46e5", "#db2777", "#15803d", "#c2410c", "#7c3aed",
         "#0369a1", "#be123c", "#65a30d", "#a21caf",
+    )
+    registry: dict[str, dict] = {}
+    result = evidence_for_record(evidence, record["unicode"], record["source"])
+    ranked = rank_candidates(row, result, evidence)
+    sources_by_glyph: dict[int, list[str]] = {}
+    for source, candidate_id in row.get("sourceGlyphs", {}).items():
+        sources_by_glyph.setdefault(int(candidate_id), []).append(source)
+
+    recursive = (result or {}).get("recursiveTopology") or {}
+    recursive_ids = recursive.get("candidateGlyphIds", [])
+    recursive_details = recursive.get("candidateDetails", [])
+    recursive_by_id = {
+        int(candidate_id): recursive_details[index]
+        for index, candidate_id in enumerate(recursive_ids)
+        if index < len(recursive_details)
+    }
+
+    def evidence_card(entry: dict, *, compact: bool, instance: str) -> str:
+        candidate_id = int(entry["id"])
+        candidate_svg = interactive_candidate_svg(
+            row, candidate_id, registry, instance=instance
+        )
+        sources = "/".join(sources_by_glyph.get(candidate_id, [])) or "未分配"
+        selected = " · 当前算法最终推荐" if entry.get("recommended") else ""
+        details = recursive_by_id.get(candidate_id, {})
+        flags = []
+        if entry.get("recommended"):
+            flags.append(f"方法：{(result or {}).get('predictionMethod', '无评测记录')}")
+        if (result or {}).get("topologyGatePrediction") == candidate_id:
+            flags.append("拓扑门控支持")
+        if (result or {}).get("topologyGateOverride") and entry.get("recommended"):
+            flags.append("拓扑门控覆盖了纯距离顺序")
+        exact_component = recursive.get("exactComponentCandidateIndex")
+        if (
+            isinstance(exact_component, int)
+            and exact_component < len(recursive_ids)
+            and recursive_ids[exact_component] == candidate_id
+        ):
+            flags.append("PDF 连通分量数精确匹配")
+        evidence_payload = {
+            "candidate": entry,
+            "recursiveCandidateDetail": details or None,
+            "globalDecision": {
+                "predictedGlyphId": (result or {}).get("predictedGlyphId"),
+                "predictionMethod": (result or {}).get("predictionMethod"),
+                "bestDistance": (result or {}).get("bestDistance"),
+                "secondDistance": (result or {}).get("secondDistance"),
+                "margin": (result or {}).get("margin"),
+                "topologyGatePrediction": (result or {}).get("topologyGatePrediction"),
+                "topologyGateOverride": (result or {}).get("topologyGateOverride"),
+                "alignment": (result or {}).get("alignment"),
+            },
+        }
+        if compact:
+            return f'''<article class="editor-candidate" data-selection-mode="fill"><div class="candidate-heading"><b>#{entry['rank']} · glyph {candidate_id}</b><span>{entry['relativeWeight'] * 100:.1f}% 经验权重</span></div><div class="compact-candidate-body">{candidate_svg}<div><div>来源：{html.escape(sources)}</div><div>总距离：{format_metric(entry.get('distance'))}</div><div>纯距离权重：{entry['distanceWeight'] * 100:.1f}%</div><div>{html.escape('；'.join(flags) or '未获最终规则加权')}</div></div></div></article>'''
+        prior = entry["methodPrior"]
+        prior_text = (
+            f"{prior['correct']}/{prior['total']}；Laplace {prior['laplaceAccuracy'] * 100:.1f}%"
+            if prior["total"]
+            else "无同方法历史样本"
+        )
+        return f'''<article class="candidate-card" data-selection-mode="fill"><h3>#{entry['rank']} · glyph {candidate_id} · 来源 {html.escape(sources)}{html.escape(selected)}</h3><div class="candidate-visual">{candidate_svg}</div><div class="weight"><b>{entry['relativeWeight'] * 100:.1f}%</b> 经验决策权重（非校准概率）</div><dl class="evidence-grid"><dt>总距离</dt><dd>{format_metric(entry.get('distance'))}</dd><dt>纯距离权重</dt><dd>{entry['distanceWeight'] * 100:.1f}%</dd><dt>视觉距离</dt><dd>{format_metric(entry.get('visualDistance'))}</dd><dt>拓扑距离</dt><dd>{format_metric(entry.get('topologyDistance'))}</dd><dt>递归拓扑</dt><dd>{format_metric(entry.get('recursiveTopologyDistance'))}</dd><dt>方法历史命中</dt><dd>{html.escape(prior_text)}</dd><dt>递归 forward</dt><dd>{format_metric(details.get('forward'))}</dd><dt>递归 reverse</dt><dd>{format_metric(details.get('reverse'))}</dd></dl><div class="evidence-flags">{html.escape('；'.join(flags) or '当前候选没有最终规则加权')}</div><details><summary>全部原始证据参数</summary><pre>{html.escape(json.dumps(evidence_payload, ensure_ascii=False, indent=2))}</pre></details></article>'''
+
+    top_candidates = "".join(
+        evidence_card(entry, compact=False, instance=f"top-{entry['id']}")
+        for entry in ranked
     )
     layers = []
     medians = []
@@ -809,12 +1181,21 @@ def build_html(
             f"第 {index + 1} 笔 {stroke['feature']} · 部件 {stroke['componentId']} "
             f"· 兄弟族 {stroke['familyKey']}"
         )
+        part_key = f"pdf:{glyph_id}:{stroke['componentId']}:{stroke['occurrence']}"
+        if part_key not in registry:
+            registry[part_key] = {
+                "leafId": stroke["componentId"],
+                "familyKey": stroke["familyKey"],
+                "glyphId": glyph_id,
+                "color": stroke["color"],
+                "hierarchy": enrich_hierarchy(stroke["hierarchy"], stroke["color"]),
+            }
         layers.append(
-            f'''<path class="source-stroke" data-stroke-index="{index}" data-component-id="{stroke['componentId']}" data-label="{html.escape(label, quote=True)}" d="{path_data}" style="--component-color:{stroke['color']};--stroke-color:{stroke_palette[index % len(stroke_palette)]}" fill-rule="evenodd" clip-rule="evenodd"/>'''
+            f'''<path class="source-stroke interactive-part" data-part-key="{part_key}" data-family-key="{stroke['familyKey']}" data-stroke-index="{index}" data-component-id="{stroke['componentId']}" data-label="{html.escape(label, quote=True)}" d="{path_data}" style="--component-color:{stroke['color']};--stroke-color:{stroke_palette[index % len(stroke_palette)]}" fill-rule="evenodd" clip-rule="evenodd"/>'''
         )
         median_path = polyline_path(centerline, canvas)
         medians.append(
-            f'<path class="median" data-stroke-index="{index}" d="{median_path}" stroke="{stroke["color"]}"/>'
+            f'<path class="median interactive-part" data-part-key="{part_key}" data-family-key="{stroke["familyKey"]}" data-stroke-index="{index}" d="{median_path}" stroke="{stroke["color"]}"/>'
         )
     ambiguity_path = mask_svg_path(ambiguous, canvas)
     nodes = marker_svg(centerlines, canvas, strokes)
@@ -834,19 +1215,19 @@ def build_html(
         }
     )
     original_use = f'''<use class="source-use" href="{glyph['useAttributes']['href']}" x="{glyph['useAttributes'].get('x', 0)}" y="{glyph['useAttributes'].get('y', 0)}"/>'''
+    interaction_js = interaction_script(registry)
+    decision_method = (result or {}).get("predictionMethod", "未载入历史评测证据")
+    decision_margin = format_metric((result or {}).get("margin"))
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
-    body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:14px 22px;background:#0f172a;color:white}}header button,.toolbar button{{margin:10px 7px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:5px}}main{{padding:18px;display:grid;grid-template-columns:repeat(4,minmax(250px,1fr));gap:14px}}article{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}h3{{font-size:14px;margin:0;padding:9px;background:#f1f5f9}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-stroke:hover{{filter:drop-shadow(0 0 1.5px #111);stroke:#111;stroke-width:.25}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.75}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}pre{{margin:0;padding:12px;white-space:pre-wrap;font-size:12px}}#tip{{position:fixed;z-index:5;display:none;pointer-events:none;background:#111827;color:white;padding:6px 8px;border-radius:6px;font-size:12px}}.editor{{grid-column:1/-1}}.editor-layout{{display:grid;grid-template-columns:minmax(600px,1fr) 360px;gap:14px;padding:14px}}.board-wrap{{border:1px solid #94a3b8;border-radius:8px;background:white;overflow:hidden}}#annotation-board{{touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.toolbar{{padding:0 10px 10px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar label{{display:inline-flex;align-items:center;gap:5px;margin:8px 9px 0 0}}.toolbar input[type=text]{{width:150px;padding:5px;border:1px solid #94a3b8;border-radius:5px}}.editor-help{{font-size:13px;line-height:1.55}}.editor-help code{{background:#e2e8f0;padding:1px 4px}}#annotation-status{{padding:8px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.sequence{{max-height:290px;overflow:auto;padding:8px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc}}@media(max-width:1050px){{main{{grid-template-columns:1fr 1fr}}.editor-layout{{grid-template-columns:1fr}}}}
-    .jump{{display:inline-block;margin:10px 7px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none;cursor:pointer}}.editor{{scroll-margin-top:12px}}
-    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供的是假设笔数与笔序。当前系统尚未识别出 PDF 的真实笔画。</div><div class="warning">候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按候选笔槽着色（非真实拆笔）</button><button id="node-mode" class="active">显示拓扑节点</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
-    <article><h3>PDF 原始矢量轮廓</h3><svg viewBox="0 0 100 100"><defs>{glyph['definitions']}</defs><g class="source-fit">{original_use}</g></svg></article>
-    <article><h3>hanzi-chai 候选（递归到叶部件）</h3>{candidate_svg}</article>
-    <article><h3>候选驱动的 PDF 墨迹归属假设（不是已识别笔画）</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g mask="url(#pdf-outline-mask)">{''.join(layers)}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg></article>
-    <article><h3>拟合后的逐笔中心线</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></article>
-    <article class="editor"><h3>人工真值标注板：请直接圈部件，或按真实笔顺逐笔画中心线</h3><div class="toolbar"><button type="button" data-tool="stroke" class="active">画真实笔画中心线</button><button type="button" data-tool="lasso">圈部件区域</button><button type="button" data-tool="erase">点选删除</button><label>部件标签 <input id="component-label" type="text" placeholder="例如：匕 / 1128"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出 JSON</button><button type="button" id="import-annotations">导入 JSON</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="editor-layout"><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><aside class="editor-help"><div id="annotation-status"></div><p><b>操作：</b>“画真实笔画中心线”时，每次按下并拖动是一笔，松开后自动编号；请按真实笔序画。“圈部件区域”时沿部件外圈拖动，标签取左侧输入框。“点选删除”可删错线。</p><p><b>保存：</b>每次落笔自动保存在本页浏览器的 localStorage；“导出 JSON”可把真值交给算法。</p><p><b>PDF 真值：</b>笔数未知、笔序未知，等待你的标注。<br><b>candidate：</b>{len(strokes)} 笔。</p><div class="sequence"><b>candidate 笔序</b><br>{html.escape(candidate_order)}</div></aside></div></article>
-    </main><div id="tip"></div><script>
+    *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:0 8px 7px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar button{{font-size:11px;padding:4px 6px;margin:6px 3px 0 0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:6px 4px 0 0;font-size:11px}}.toolbar input[type=text]{{width:112px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:250px;max-width:390px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
+    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供的是假设笔数与笔序。当前系统尚未识别出 PDF 的真实笔画。</div><div class="warning">候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按候选笔槽着色（非真实拆笔）</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
+    <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
+    <section class="review-section"><h2 class="section-title">第 2 行 · PDF 归属假设、拟合中心线、人工真值标注</h2><div class="vector-row"><article class="vector-card"><h3>候选驱动的 PDF 墨迹归属假设（不是已识别笔画）</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">点击部件后选择层级 ID：复制到剪贴板。页首“归属图 / 原始 PDF”可切换。</div></article><article class="vector-card"><h3>拟合后的逐笔中心线</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article><article class="vector-card editor"><h3>人工真值标注板（点击第一行候选可回填）</h3><div class="toolbar"><button type="button" data-tool="stroke" class="active">画笔画</button><button type="button" data-tool="lasso">圈部件</button><button type="button" data-tool="erase">删除</button><label>部件标签 <input id="component-label" type="text" placeholder="点上方候选"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出</button><button type="button" id="import-annotations">导入</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="annotation-status"></div><div class="help-box"><b>候选笔序：</b>{html.escape(candidate_order)}</div></div></article></div></section>
+    </main><div id="hierarchy-tip" class="hierarchy-float" hidden></div><div id="component-picker" class="hierarchy-float" hidden></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
-    document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const tip=document.querySelector('#tip');document.querySelectorAll('.source-stroke').forEach(el=>{{el.addEventListener('pointerenter',()=>{{tip.textContent=el.dataset.label;tip.style.display='block'}});el.addEventListener('pointermove',e=>{{tip.style.left=`${{e.clientX+12}}px`;tip.style.top=`${{e.clientY+12}}px`}});el.addEventListener('pointerleave',()=>tip.style.display='none')}});const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
+    document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode'),sourceButton=document.querySelector('#source-view-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};sourceButton.onclick=()=>{{document.body.classList.toggle('original-source-mode');sourceButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
     {annotation_js}
+    {interaction_js}
     </script></body></html>'''
 
 
@@ -855,6 +1236,11 @@ def main():
     parser.add_argument("--bbox-cache", type=Path, required=True)
     parser.add_argument("--pdf", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
+    parser.add_argument(
+        "--evidence",
+        type=Path,
+        help="optional reviewed vector benchmark with per-candidate scoring evidence",
+    )
     parser.add_argument("--unicode", required=True, help="hex codepoint, e.g. 6418")
     parser.add_argument("--source", required=True)
     parser.add_argument("--glyph-id", type=int, required=True)
@@ -864,6 +1250,11 @@ def main():
 
     codepoint = int(args.unicode.removeprefix("U+").removeprefix("u+"), 16)
     candidate_rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
+    evidence = (
+        json.loads(args.evidence.read_text("utf-8"))
+        if args.evidence and args.evidence.exists()
+        else None
+    )
     row = next(item for item in candidate_rows if item["unicode"] == codepoint)
     records, _sizes = PDF.parse_pdf_cells(args.bbox_cache)
     record = next(
@@ -905,7 +1296,8 @@ def main():
         ambiguous,
         metrics,
         args.canvas,
-        row["candidateSvgs"][str(args.glyph_id)],
+        row,
+        evidence,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, "utf-8")
