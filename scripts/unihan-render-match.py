@@ -210,6 +210,265 @@ def discriminative_distance(
     return [PDF.chamfer_distance(pdf_roi, candidate & roi) for candidate in candidates]
 
 
+def _residual_components(mask: np.ndarray, minimum_pixels=2) -> list[dict]:
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), 8
+    )
+    return [
+        {
+            "pixels": int(stats[label, cv2.CC_STAT_AREA]),
+            "bbox": [
+                int(stats[label, cv2.CC_STAT_LEFT]),
+                int(stats[label, cv2.CC_STAT_TOP]),
+                int(stats[label, cv2.CC_STAT_WIDTH]),
+                int(stats[label, cv2.CC_STAT_HEIGHT]),
+            ],
+            "center": [round(float(value), 2) for value in centroids[label]],
+        }
+        for label in range(1, count)
+        if stats[label, cv2.CC_STAT_AREA] >= minimum_pixels
+    ]
+
+
+def _strong_corners(mask: np.ndarray) -> list[tuple[int, int]]:
+    detected = cv2.goodFeaturesToTrack(
+        mask.astype(np.uint8) * 255,
+        maxCorners=64,
+        qualityLevel=0.08,
+        minDistance=5,
+        blockSize=5,
+        useHarrisDetector=False,
+    )
+    if detected is None:
+        return []
+    return [
+        (int(round(float(point[0]))), int(round(float(point[1]))))
+        for point in detected.reshape(-1, 2)
+    ]
+
+
+def _cardinal_branches(mask: np.ndarray, x: int, y: int, radius=6) -> list[str]:
+    height, width = mask.shape
+
+    def count(left, top, right, bottom):
+        return int(
+            mask[
+                max(0, top) : min(height, bottom),
+                max(0, left) : min(width, right),
+            ].sum()
+        )
+
+    bands = {
+        "left": count(x - radius, y - 2, x - 1, y + 3),
+        "right": count(x + 2, y - 2, x + radius + 1, y + 3),
+        "up": count(x - 2, y - radius, x + 3, y - 1),
+        "down": count(x - 2, y + 2, x + 3, y + radius + 1),
+    }
+    return sorted(direction for direction, pixels in bands.items() if pixels >= 3)
+
+
+def _directional_corners(mask: np.ndarray) -> list[dict]:
+    opposite = ({"left", "right"}, {"up", "down"})
+    by_branches: dict[tuple[str, ...], np.ndarray] = {}
+    for y, x in np.argwhere(mask):
+        branches = tuple(_cardinal_branches(mask, int(x), int(y)))
+        if len(branches) != 2 or set(branches) in opposite:
+            continue
+        by_branches.setdefault(branches, np.zeros_like(mask, dtype=np.uint8))[y, x] = 1
+    corners = []
+    for branches, pixels in by_branches.items():
+        # Consecutive skeleton pixels describe one geometric turn.  Clustering
+        # them avoids making detector sampling density part of the evidence.
+        clustered = cv2.dilate(pixels, np.ones((3, 3), np.uint8))
+        count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+            clustered, 8
+        )
+        for label in range(1, count):
+            if stats[label, cv2.CC_STAT_AREA] < 2:
+                continue
+            x, y = centroids[label]
+            corners.append(
+                {
+                    "point": [int(round(float(x))), int(round(float(y)))],
+                    "branches": list(branches),
+                }
+            )
+    return corners
+
+
+def directional_corner_mismatches(pdf: np.ndarray, candidate: np.ndarray) -> list[dict]:
+    """Find a nearby sharp turn whose outgoing side is reversed in the PDF."""
+    pdf_corners = _directional_corners(pdf)
+    mismatches = []
+    for candidate_corner in _directional_corners(candidate):
+        candidate_x, candidate_y = candidate_corner["point"]
+        candidate_branches = candidate_corner["branches"]
+        nearby = sorted(
+            (
+                math.hypot(candidate_x - pdf_x, candidate_y - pdf_y),
+                pdf_x,
+                pdf_y,
+                pdf_corner["branches"],
+            )
+            for pdf_corner in pdf_corners
+            for pdf_x, pdf_y in [pdf_corner["point"]]
+            if math.hypot(candidate_x - pdf_x, candidate_y - pdf_y) <= 5
+        )
+        if not nearby:
+            continue
+        separation, pdf_x, pdf_y, pdf_branches = nearby[0]
+        if pdf_branches == candidate_branches:
+            continue
+        shared = set(pdf_branches) & set(candidate_branches)
+        changed = set(pdf_branches) ^ set(candidate_branches)
+        # Only promote the topology invariant established by the 骨 review:
+        # the vertical continuation stays the same while a horizontal branch
+        # moves from one side to the other.  Treating every nearby turn-angle
+        # change as structural produces many font-style false positives.
+        if shared not in ({"up"}, {"down"}) or changed != {"left", "right"}:
+            continue
+        mismatches.append(
+            {
+                "candidatePoint": [candidate_x, candidate_y],
+                "candidateBranches": candidate_branches,
+                "pdfPoint": [pdf_x, pdf_y],
+                "pdfBranches": pdf_branches,
+                "separation": round(separation, 3),
+            }
+        )
+    return mismatches
+
+
+def candidate_consensus(candidates: list[np.ndarray], tolerance=2.0) -> np.ndarray:
+    """Keep base-candidate ink that every candidate has within raster tolerance."""
+    consensus = candidates[0].copy()
+    for candidate in candidates[1:]:
+        distance = PDF.distance_transform_edt(~candidate)
+        consensus &= distance <= tolerance
+    return consensus
+
+
+def residual_supports_side_reversal(
+    candidate_only: np.ndarray, pdf_only: np.ndarray, mismatch: dict
+) -> dict | None:
+    """Require unmatched ink on both claimed sides of a reversed branch."""
+
+    def side_pixels(mask: np.ndarray, point: list[int], side: str) -> int:
+        x, y = point
+        height, width = mask.shape
+        if side == "left":
+            left, right = x - 13, x - 2
+        else:
+            left, right = x + 2, x + 13
+        return int(
+            mask[
+                max(0, y - 2) : min(height, y + 3),
+                max(0, left) : min(width, right),
+            ].sum()
+        )
+
+    candidate_side = next(
+        side for side in ("left", "right") if side in mismatch["candidateBranches"]
+    )
+    pdf_side = next(
+        side for side in ("left", "right") if side in mismatch["pdfBranches"]
+    )
+    candidate_pixels = side_pixels(
+        candidate_only, mismatch["candidatePoint"], candidate_side
+    )
+    pdf_pixels = side_pixels(pdf_only, mismatch["pdfPoint"], pdf_side)
+    if candidate_pixels < 4 or pdf_pixels < 4:
+        return None
+    return {
+        **mismatch,
+        "candidateOnlyBranchPixels": candidate_pixels,
+        "pdfOnlyBranchPixels": pdf_pixels,
+    }
+
+
+def shared_structure_residual(
+    pdf: np.ndarray,
+    candidates: list[np.ndarray],
+    distance_tolerance=2.0,
+) -> dict:
+    """Detect a structured mismatch shared by every supplied candidate.
+
+    A common error cancels from candidate ranking. Nearby candidate-only and
+    PDF-only ink instead signals a relocated branch and a possibly incomplete
+    sibling set. This evidence is review-only and never enables a write.
+    """
+    if not candidates:
+        return {"suspected": False, "reason": "no-candidates"}
+    # Exact pixel intersection loses genuinely shared parts after tiny layout or
+    # rasterization shifts.  A tolerant consensus preserves the shared subtree
+    # whose wrong geometry candidate ranking would otherwise never question.
+    common = candidate_consensus(candidates)
+    union = np.logical_or.reduce(candidates)
+    if not common.any():
+        return {"suspected": False, "reason": "no-common-ink"}
+    varying = union & ~common
+    candidate_distance = PDF.distance_transform_edt(~common)
+    pdf_distance = PDF.distance_transform_edt(~pdf)
+    shared_zone = cv2.dilate(
+        common.astype(np.uint8), np.ones((13, 13), np.uint8)
+    ).astype(bool)
+    if varying.any():
+        shared_zone &= ~cv2.dilate(
+            varying.astype(np.uint8), np.ones((7, 7), np.uint8)
+        ).astype(bool)
+    candidate_only = common & (pdf_distance > distance_tolerance)
+    pdf_only = pdf & shared_zone & (candidate_distance > distance_tolerance)
+    candidate_parts = _residual_components(candidate_only)
+    pdf_parts = _residual_components(pdf_only)
+    corner_mismatches = [
+        supported
+        for mismatch in directional_corner_mismatches(pdf, common)
+        if (
+            supported := residual_supports_side_reversal(
+                candidate_only, pdf_only, mismatch
+            )
+        )
+        is not None
+    ]
+    pairs = []
+    for candidate_part in candidate_parts:
+        for pdf_part in pdf_parts:
+            separation = math.dist(candidate_part["center"], pdf_part["center"])
+            if separation > 14:
+                continue
+            combined_pixels = candidate_part["pixels"] + pdf_part["pixels"]
+            if combined_pixels < 6:
+                continue
+            pairs.append(
+                {
+                    "candidateOnly": candidate_part,
+                    "pdfOnly": pdf_part,
+                    "separation": round(separation, 3),
+                    "combinedPixels": combined_pixels,
+                }
+            )
+    pairs.sort(key=lambda item: (-item["combinedPixels"], item["separation"]))
+    common_pixels = int(common.sum())
+    residual_ratio = (int(candidate_only.sum()) + int(pdf_only.sum())) / common_pixels
+    suspected = bool(corner_mismatches)
+    return {
+        "suspected": suspected,
+        "reason": (
+            "directional-corner-mismatch" if suspected else "no-stable-paired-residual"
+        ),
+        "commonPixels": common_pixels,
+        "candidateOnlyPixels": int(candidate_only.sum()),
+        "pdfOnlyPixels": int(pdf_only.sum()),
+        "residualRatio": round(residual_ratio, 4),
+        "candidateOnlyComponents": candidate_parts[:8],
+        "pdfOnlyComponents": pdf_parts[:8],
+        "pairs": pairs[:8],
+        "candidateDirectionalCorners": _directional_corners(common),
+        "pdfDirectionalCorners": _directional_corners(pdf),
+        "directionalCornerMismatches": corner_mismatches,
+    }
+
+
 def warp_mask(mask: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     height, width = mask.shape
     return (
@@ -587,6 +846,12 @@ def main():
                     candidate_images, alignment = align_candidates_to_pdf(
                         pdf_skeleton, candidate_images
                     )
+                # Audit the registered common geometry with a tolerant
+                # consensus. Exact pixel intersection used to erase a shared
+                # misplaced branch after tiny per-candidate layout shifts.
+                shared_residual = shared_structure_residual(
+                    pdf_skeleton, candidate_images
+                )
                 visual_scores = discriminative_distance(pdf_skeleton, candidate_images)
                 candidate_strokes = [
                     row["candidates"][str(glyph_id)] for glyph_id in candidate_ids
@@ -620,6 +885,8 @@ def main():
                         "secondDistance": round(second_distance, 4),
                         "margin": round(second_distance - best_distance, 4),
                         "alignment": alignment,
+                        "candidateSetIncomplete": shared_residual["suspected"],
+                        "sharedStructureResidual": shared_residual,
                         "candidates": [
                             {
                                 "id": glyph_id,
@@ -671,6 +938,9 @@ def main():
             # an apply threshold. Only heldOutAcceptance tests train calibration.
             "inSampleHighConfidence": confidence_threshold(results),
             "automaticWriteEnabled": False,
+            "candidateSetIncompleteReview": sum(
+                item["candidateSetIncomplete"] for item in results
+            ),
             "splits": {
                 "train": summarize_results(train_results),
                 "test": summarize_results(test_results),
