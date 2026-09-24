@@ -15,6 +15,55 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_directed_stroke_features_change_when_arc_is_reversed(self):
+        forward = np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]])
+        normal = MODULE.directed_stroke_features(forward, 100)
+        reversed_arc = MODULE.directed_stroke_features(forward[::-1], 100)
+
+        self.assertEqual(normal["start"], reversed_arc["end"])
+        self.assertEqual(normal["end"], reversed_arc["start"])
+        self.assertEqual(normal["startTangent"]["angleDegrees"], 0.0)
+        self.assertEqual(reversed_arc["startTangent"]["angleDegrees"], -90.0)
+        self.assertEqual(normal["signedTurnsDegrees"], [90.0])
+        self.assertEqual(reversed_arc["signedTurnsDegrees"], [-90.0])
+
+    def test_candidate_svg_rebuilds_all_topology_marker_types(self):
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<path d="M 10 50 H 90"/><path d="M 50 10 V 50 H 80"/>'
+            '<circle cx="10" cy="50" r="1.5" fill="red"/></svg>'
+        )
+        row = {
+            "candidateSvgs": {"42": svg},
+            "candidates": {"42": [{"feature": "横"}, {"feature": "折"}]},
+            "candidateLeafSvgs": {
+                "42": [
+                    {
+                        "leafId": 1,
+                        "familyKey": "1",
+                        "color": "#f59e0b",
+                        "occurrence": 0,
+                        "strokeIndices": [0],
+                        "svg": '<svg xmlns="http://www.w3.org/2000/svg"><path d="M 10 50 H 90"/></svg>',
+                    },
+                    {
+                        "leafId": 2,
+                        "familyKey": "2",
+                        "color": "#7c3aed",
+                        "occurrence": 0,
+                        "strokeIndices": [1],
+                        "svg": '<svg xmlns="http://www.w3.org/2000/svg"><path d="M 50 10 V 50 H 80"/></svg>',
+                    },
+                ]
+            },
+        }
+        output = MODULE.interactive_candidate_svg(row, 42, {}, instance="test")
+
+        self.assertIn('class="node endpoint"', output)
+        self.assertIn('class="node contact"', output)
+        self.assertIn('class="node bend"', output)
+        self.assertNotIn('fill="red"', output)
+
     def test_human_annotations_normalize_a_sibling_to_selected_leaf(self):
         candidate = [
             {
