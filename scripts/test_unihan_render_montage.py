@@ -44,15 +44,15 @@ class PdfCellTests(unittest.TestCase):
             color = MONTAGE.TOPOLOGY_COLORS[key]
             matches = np.all(pixels == color, axis=2)
             self.assertGreater(matches.sum(), 40)
-        gray = MONTAGE.TOPOLOGY_COLORS["corner"]
-        gray_pixels = np.all(pixels == gray, axis=2)
-        self.assertGreater(gray_pixels.sum(), 10)
+        turn_color = MONTAGE.TOPOLOGY_COLORS["corner"]
+        turn_pixels = np.all(pixels == turn_color, axis=2)
+        self.assertGreater(turn_pixels.sum(), 10)
         endpoints, junctions, skeleton = MONTAGE.topology_points(
             np.asarray(image.convert("L")) < 224
         )
         corners = MONTAGE.corner_points(skeleton, endpoints, junctions)
         x, y = corners[0]
-        self.assertNotEqual(overlay.getpixel((x, y)), gray)
+        self.assertEqual(overlay.getpixel((x, y)), turn_color)
 
     def test_marks_a_degree_two_right_angle_as_a_corner(self):
         binary = np.zeros((128, 128), dtype=bool)
