@@ -12,6 +12,91 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RenderMatchTest(unittest.TestCase):
+    def test_vector_page_crop_changes_only_root_viewbox(self):
+        page = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="612pt" '
+            'height="792pt" viewBox="0 0 612 792"><defs><path id="g"/></defs>'
+            '<use href="#g" x="10" y="20"/></svg>'
+        )
+
+        cropped = MODULE.crop_page_svg(page, [100, 200, 120, 230], margin=0)
+
+        self.assertIn('width="30.0000pt"', cropped)
+        self.assertIn('height="30.0000pt"', cropped)
+        self.assertIn('viewBox="95.0000 200.0000 30.0000 30.0000"', cropped)
+        self.assertIn('<use href="#g" x="10" y="20"/>', cropped)
+
+    def test_chart_glyph_bbox_removes_lower_source_reference(self):
+        self.assertEqual(
+            MODULE.chart_glyph_bbox([10, 20, 30, 120]),
+            [10, 20, 30, 98.0],
+        )
+
+    def test_graph_signature_distinguishes_line_from_t_junction(self):
+        line = np.zeros((64, 64), dtype=bool)
+        line[32, 10:55] = True
+        tee = line.copy()
+        tee[15:33, 32] = True
+
+        line_signature = MODULE.graph_topology_signature(line)
+        tee_signature = MODULE.graph_topology_signature(tee)
+
+        self.assertEqual(line_signature["endpoints"], 2)
+        self.assertEqual(line_signature["junctions"], 0)
+        self.assertEqual(tee_signature["endpoints"], 3)
+        self.assertEqual(tee_signature["junctions"], 1)
+
+    def test_principal_axis_separates_horizontal_from_falling_stroke(self):
+        horizontal = np.zeros((64, 64), dtype=bool)
+        horizontal[32, 10:55] = True
+        falling = np.zeros((64, 64), dtype=bool)
+        for offset in range(40):
+            falling[10 + offset, 50 - offset] = True
+
+        horizontal_angle = MODULE.principal_axis_angle(horizontal)
+        falling_angle = MODULE.principal_axis_angle(falling)
+
+        self.assertLess(MODULE.axis_angle_distance(horizontal_angle, 0), 1)
+        self.assertGreater(
+            MODULE.axis_angle_distance(horizontal_angle, falling_angle), 30
+        )
+
+    def test_topology_signature_requires_all_invariants_to_agree(self):
+        target = {"components": 6, "endpoints": 16, "junctions": 6}
+        decision = MODULE.topology_signature_choice(
+            target,
+            [
+                {"components": 3, "endpoints": 7, "junctions": 1},
+                {"components": 5, "endpoints": 12, "junctions": 2},
+            ],
+        )
+
+        self.assertEqual(decision["candidateIndex"], 1)
+        self.assertGreater(decision["margin"], 3)
+
+    def test_topology_signature_abstains_when_invariants_disagree(self):
+        self.assertIsNone(
+            MODULE.topology_signature_choice(
+                {"components": 2, "endpoints": 8, "junctions": 1},
+                [
+                    {"components": 2, "endpoints": 2, "junctions": 0},
+                    {"components": 5, "endpoints": 8, "junctions": 4},
+                ],
+            )
+        )
+
+    def test_closest_component_rejects_larger_neighbouring_noise(self):
+        mask = np.zeros((64, 64), dtype=bool)
+        mask[10:30, 8] = True
+        mask[40:44, 40] = True
+        anchor = np.zeros((64, 64), dtype=bool)
+        anchor[40:44, 41] = True
+
+        selected = MODULE.closest_component(mask, anchor)
+
+        self.assertEqual(int(selected.sum()), 4)
+        self.assertTrue(selected[40, 40])
+
     def test_shared_residual_flags_a_branch_moved_to_the_other_side(self):
         candidate = np.zeros((64, 64), dtype=bool)
         candidate[24:51, 32] = True
@@ -67,6 +152,17 @@ class RenderMatchTest(unittest.TestCase):
         self.assertEqual(summary["accepted"], 1)
         self.assertEqual(summary["coverage"], 1 / 3)
         self.assertEqual(summary["accuracyWhenAccepted"], 1)
+
+    def test_confidence_threshold_never_splits_an_equal_margin_group(self):
+        threshold = MODULE.confidence_threshold(
+            [
+                {"margin": 5, "correct": True},
+                {"margin": 5, "correct": False},
+                {"margin": 4, "correct": True},
+            ]
+        )
+
+        self.assertIsNone(threshold)
 
     def test_unmatched_strokes_use_topology_before_location(self):
         horizontal_fall = {

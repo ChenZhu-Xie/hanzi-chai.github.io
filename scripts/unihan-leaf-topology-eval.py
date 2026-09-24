@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
@@ -240,7 +241,8 @@ def calibrate_threshold(train: list[dict]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
-    parser.add_argument("--pages-dir", type=Path, required=True)
+    parser.add_argument("--pages-dir", type=Path)
+    parser.add_argument("--pdf", type=Path)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -249,6 +251,8 @@ def main():
         help="skip calibration when only categorical subtree topology is needed",
     )
     args = parser.parse_args()
+    if args.pdf is None and args.pages_dir is None:
+        parser.error("one of --pdf or --pages-dir is required")
 
     payload = json.loads(args.candidates.read_text("utf-8"))
     rows_by_unicode = {row["unicode"]: row for row in payload["rows"]}
@@ -261,7 +265,17 @@ def main():
 
     raw = []
     for page_number, page_records in sorted(records_by_page.items()):
-        with Image.open(args.pages_dir / f"page-{page_number:03d}.pbm") as page:
+        page_svg = (
+            MONTAGE.MATCHER.load_pdf_page_svg(args.pdf, page_number)
+            if args.pdf is not None
+            else None
+        )
+        page_context = (
+            contextlib.nullcontext(None)
+            if page_svg is not None
+            else Image.open(args.pages_dir / f"page-{page_number:03d}.pbm")
+        )
+        with page_context as page:
             for record in page_records:
                 row = rows_by_unicode[record["unicode"]]
                 candidate_ids = [int(value) for value in row["candidates"]]
@@ -277,7 +291,15 @@ def main():
                     )
                     for glyph_id in candidate_ids
                 ]
-                pdf = MONTAGE.pdf_cell(page, record["bbox"], page_sizes[page_number])
+                pdf = (
+                    MONTAGE.pdf_vector_cell(
+                        page_svg, record["bbox"], glyph_only=True
+                    )
+                    if page_svg is not None
+                    else MONTAGE.pdf_cell(
+                        page, record["bbox"], page_sizes[page_number]
+                    )
+                )
                 focused_masks = MONTAGE.target_window_focus_masks(
                     pdf, candidate_images, "f59e0b", candidate_target_images
                 )

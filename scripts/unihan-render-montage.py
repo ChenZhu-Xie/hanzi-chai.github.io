@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import io
 import json
@@ -59,6 +60,21 @@ def pdf_cell(page, bbox, page_size, size=256):
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.Resampling.LANCZOS,
     )
+    canvas = Image.new("L", (size, size), "white")
+    canvas.paste(image, ((size - image.width) // 2, (size - image.height) // 2))
+    return canvas.convert("RGB")
+
+
+def pdf_vector_cell(
+    page_svg: str, bbox, size=256, glyph_only=False
+) -> Image.Image:
+    """Render a chart cell directly from its page SVG vector outlines."""
+    evidence_bbox = MATCHER.chart_glyph_bbox(bbox) if glyph_only else bbox
+    grayscale = MATCHER.render_pdf_vector_cell(
+        page_svg, evidence_bbox, size=max(512, size * 4)
+    )
+    image = Image.fromarray(grayscale, mode="L")
+    image.thumbnail((size, size), Image.Resampling.LANCZOS)
     canvas = Image.new("L", (size, size), "white")
     canvas.paste(image, ((size - image.width) // 2, (size - image.height) // 2))
     return canvas.convert("RGB")
@@ -815,7 +831,8 @@ def draw_feature_annotations(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
-    parser.add_argument("--pages-dir", type=Path, required=True)
+    parser.add_argument("--pages-dir", type=Path)
+    parser.add_argument("--pdf", type=Path)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -830,6 +847,8 @@ def main():
     parser.add_argument("--topology-report", type=Path)
     parser.add_argument("--annotations", type=Path)
     args = parser.parse_args()
+    if args.pdf is None and args.pages_dir is None:
+        parser.error("one of --pdf or --pages-dir is required")
 
     candidate_rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
     rows_by_unicode = {row["unicode"]: row for row in candidate_rows}
@@ -857,14 +876,35 @@ def main():
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for page_number, page_records in sorted(records_by_page.items()):
-        with Image.open(args.pages_dir / f"page-{page_number:03d}.pbm") as page:
+        page_svg = (
+            MATCHER.load_pdf_page_svg(args.pdf, page_number)
+            if args.pdf is not None
+            else None
+        )
+        page_context = (
+            contextlib.nullcontext(None)
+            if page_svg is not None
+            else Image.open(args.pages_dir / f"page-{page_number:03d}.pbm")
+        )
+        with page_context as page:
             for record in page_records:
                 result = selected[(record["unicode"], record["source"])]
                 row = rows_by_unicode[record["unicode"]]
                 ids = [int(value) for value in row["candidates"]]
-                panels = [pdf_cell(page, record["bbox"], page_sizes[page_number])]
-                full_pdf_crossing_evidence = horizontal_crossing_consensus(panels[0])
-                topology_inputs = [panels[0]]
+                panels = [
+                    pdf_vector_cell(page_svg, record["bbox"])
+                    if page_svg is not None
+                    else pdf_cell(page, record["bbox"], page_sizes[page_number])
+                ]
+                pdf_topology_panel = (
+                    pdf_vector_cell(page_svg, record["bbox"], glyph_only=True)
+                    if page_svg is not None
+                    else panels[0]
+                )
+                full_pdf_crossing_evidence = horizontal_crossing_consensus(
+                    pdf_topology_panel
+                )
+                topology_inputs = [pdf_topology_panel]
                 topology_target_inputs = []
                 labels = [f"PDF {record['source']}"]
                 candidate_set_warning = bool(result.get("candidateSetIncomplete"))

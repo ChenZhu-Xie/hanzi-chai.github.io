@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
+import re
 import shutil
 import subprocess
 from collections import defaultdict
@@ -27,6 +29,95 @@ def load_pdf_module():
 
 
 PDF = load_pdf_module()
+
+
+def load_pdf_page_svg(pdf_path: Path, page_number: int) -> str:
+    """Export one PDF page as vector outlines without reusing its font assets."""
+    executable = shutil.which("pdftocairo")
+    if executable is None:
+        raise RuntimeError("vector PDF evidence requires pdftocairo on PATH")
+    completed = subprocess.run(
+        [
+            executable,
+            "-f",
+            str(page_number),
+            "-l",
+            str(page_number),
+            "-svg",
+            str(pdf_path),
+            "-",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.stdout.decode("utf-8")
+
+
+def crop_page_svg(page_svg: str, bbox: list[float], margin=1.5) -> str:
+    """Crop a page SVG by viewBox while retaining its vector glyph outlines."""
+    left, top, right, bottom = bbox
+    left -= margin
+    top -= margin
+    right += margin
+    bottom += margin
+    width = right - left
+    height = bottom - top
+    side = max(width, height)
+    left -= (side - width) / 2
+    top -= (side - height) / 2
+
+    match = re.search(r"<svg\b[^>]*>", page_svg)
+    if match is None:
+        raise ValueError("page SVG has no root element")
+    root = match.group(0)
+
+    def attribute(markup: str, name: str, value: str) -> str:
+        pattern = rf'\s{name}="[^"]*"'
+        replacement = f' {name}="{value}"'
+        if re.search(pattern, markup):
+            return re.sub(pattern, replacement, markup, count=1)
+        return markup[:-1] + replacement + ">"
+
+    root = attribute(root, "width", f"{side:.4f}pt")
+    root = attribute(root, "height", f"{side:.4f}pt")
+    root = attribute(root, "viewBox", f"{left:.4f} {top:.4f} {side:.4f} {side:.4f}")
+    return page_svg[: match.start()] + root + page_svg[match.end() :]
+
+
+def chart_glyph_bbox(bbox: list[float], glyph_fraction=0.78) -> list[float]:
+    """Remove the small IRG source-reference text printed below each glyph."""
+    left, top, right, bottom = bbox
+    return [left, top, right, top + (bottom - top) * glyph_fraction]
+
+
+def render_pdf_vector_cell(
+    page_svg: str, bbox: list[float], size=1024
+) -> np.ndarray:
+    """Render only one chart cell, preserving vector detail until the last step."""
+    cropped = crop_page_svg(page_svg, bbox)
+    match = re.search(r"<svg\b[^>]*>", cropped)
+    if match is None:
+        raise ValueError("cropped page SVG has no root element")
+    root = match.group(0)
+    root = re.sub(r'\swidth="[^"]*"', f' width="{size}px"', root, count=1)
+    root = re.sub(r'\sheight="[^"]*"', f' height="{size}px"', root, count=1)
+    cropped = cropped[: match.start()] + root + cropped[match.end() :]
+    return render_svg_image(cropped, size=size)
+
+
+def pdf_vector_skeleton(
+    page_svg: str, bbox: list[float], output_size=128
+) -> np.ndarray:
+    evidence_size = max(512, output_size * 8)
+    return normalize_skeleton(
+        render_pdf_vector_cell(
+            page_svg, chart_glyph_bbox(bbox), evidence_size
+        ) < 224,
+        output_size,
+    )
 
 
 def sample_cubic(start, parameters, steps=24):
@@ -124,14 +215,114 @@ def render_stroke_layers(
 
 
 def skeletonize(binary: np.ndarray) -> np.ndarray:
-    image = binary.astype(np.uint8) * 255
-    skeleton = np.zeros_like(image)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    while cv2.countNonZero(image) > 0:
-        opened = cv2.morphologyEx(image, cv2.MORPH_OPEN, element)
-        skeleton = cv2.bitwise_or(skeleton, cv2.subtract(image, opened))
-        image = cv2.erode(image, element)
-    return skeleton > 0
+    """Zhang-Suen thinning that preserves connectivity of filled outlines."""
+    image = binary.astype(bool).copy()
+    while True:
+        changed = False
+        for first_pass in (True, False):
+            padded = np.pad(image, 1)
+            p2 = padded[:-2, 1:-1]
+            p3 = padded[:-2, 2:]
+            p4 = padded[1:-1, 2:]
+            p5 = padded[2:, 2:]
+            p6 = padded[2:, 1:-1]
+            p7 = padded[2:, :-2]
+            p8 = padded[1:-1, :-2]
+            p9 = padded[:-2, :-2]
+            neighbours = [p2, p3, p4, p5, p6, p7, p8, p9]
+            count = sum(neighbours)
+            transitions = sum(
+                (~left) & right
+                for left, right in zip(neighbours, neighbours[1:] + neighbours[:1])
+            )
+            if first_pass:
+                preserve1 = ~(p2 & p4 & p6)
+                preserve2 = ~(p4 & p6 & p8)
+            else:
+                preserve1 = ~(p2 & p4 & p8)
+                preserve2 = ~(p2 & p6 & p8)
+            remove = (
+                image
+                & (count >= 2)
+                & (count <= 6)
+                & (transitions == 1)
+                & preserve1
+                & preserve2
+            )
+            if remove.any():
+                image[remove] = False
+                changed = True
+        if not changed:
+            return image
+
+
+def graph_topology_signature(binary: np.ndarray) -> dict[str, int]:
+    """Count robust graph invariants: components, ends, and branch/cross nodes."""
+    skeleton = skeletonize(binary)
+    component_count, _labels = cv2.connectedComponents(
+        skeleton.astype(np.uint8), connectivity=8
+    )
+    padded = np.pad(skeleton, 1)
+    ring = [
+        padded[:-2, 1:-1],
+        padded[:-2, 2:],
+        padded[1:-1, 2:],
+        padded[2:, 2:],
+        padded[2:, 1:-1],
+        padded[2:, :-2],
+        padded[1:-1, :-2],
+        padded[:-2, :-2],
+    ]
+    transitions = sum(
+        (~ring[index]) & ring[(index + 1) % len(ring)]
+        for index in range(len(ring))
+    )
+
+    def cluster_count(mask: np.ndarray, dilate=False) -> int:
+        if dilate:
+            mask = cv2.dilate(
+                mask.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
+            ).astype(bool)
+        count, _ = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+        return max(0, int(count) - 1)
+
+    return {
+        "components": max(0, int(component_count) - 1),
+        "endpoints": cluster_count(skeleton & (transitions == 1)),
+        "junctions": cluster_count(skeleton & (transitions >= 3), dilate=True),
+    }
+
+
+def topology_signature_choice(
+    target: dict[str, int], candidates: list[dict[str, int]]
+) -> dict | None:
+    """Choose only when every independent graph invariant names one candidate."""
+    if len(candidates) < 2:
+        return None
+    keys = ("components", "endpoints", "junctions")
+    winners = []
+    per_metric = {}
+    for key in keys:
+        distances = [abs(candidate[key] - target[key]) for candidate in candidates]
+        ordered = sorted((value, index) for index, value in enumerate(distances))
+        if len(ordered) < 2 or ordered[0][0] == ordered[1][0]:
+            return None
+        winners.append(ordered[0][1])
+        per_metric[key] = distances
+    if len(set(winners)) != 1:
+        return None
+    weights = {"components": 2.0, "endpoints": 0.5, "junctions": 1.0}
+    scores = [
+        sum(abs(candidate[key] - target[key]) * weights[key] for key in keys)
+        for candidate in candidates
+    ]
+    ordered_scores = sorted((value, index) for index, value in enumerate(scores))
+    return {
+        "candidateIndex": winners[0],
+        "scores": [round(value, 3) for value in scores],
+        "margin": round(ordered_scores[1][0] - ordered_scores[0][0], 3),
+        "perMetricDistances": per_metric,
+    }
 
 
 def normalize_skeleton(binary: np.ndarray, output_size=64) -> np.ndarray:
@@ -626,6 +817,48 @@ def orientation_maps(mask: np.ndarray) -> list[np.ndarray]:
     ]
 
 
+def closest_component(mask: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    """Select residual ink nearest the candidate disagreement, not largest noise."""
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), 8
+    )
+    if count <= 1:
+        return mask
+    anchor_distance = PDF.distance_transform_edt(~anchor)
+    viable = [
+        label
+        for label in range(1, count)
+        if stats[label, cv2.CC_STAT_AREA] >= 2
+    ]
+    if not viable:
+        return mask
+    label = min(
+        viable,
+        key=lambda value: (
+            float(anchor_distance[labels == value].mean()),
+            -int(stats[value, cv2.CC_STAT_AREA]),
+        ),
+    )
+    return labels == label
+
+
+def principal_axis_angle(mask: np.ndarray) -> float | None:
+    """Return the dominant centerline angle in [0, 180) degrees."""
+    points = np.argwhere(skeletonize(mask))
+    if len(points) < 3:
+        return None
+    xy = points[:, [1, 0]].astype(float)
+    covariance = np.cov(xy - xy.mean(axis=0), rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    return float(math.degrees(math.atan2(direction[1], direction[0])) % 180)
+
+
+def axis_angle_distance(left: float, right: float) -> float:
+    difference = abs(left - right) % 180
+    return min(difference, 180 - difference)
+
+
 def topology_distances(
     pdf: np.ndarray,
     candidate_strokes: list[list[dict]],
@@ -785,18 +1018,35 @@ def recursive_unique_stroke_indices(
         ):
             ordered = sorted(candidate_indices)
             local_strokes = [strokes[index] for index in ordered]
-            remaining: set[int] = set()
+            # Within an already isolated terminal component, compare stroke
+            # topology in sequence and ignore parent-layout translation/scale.
+            # This removes the common hook from 匕 siblings even when one parent
+            # compresses it enough to exceed the global 10-unit position gate.
+            common = set(range(len(local_strokes)))
             for other_index, (other_strokes, other_indices) in enumerate(
                 zip(candidate_strokes, leaf_unique)
             ):
                 if candidate_index == other_index:
                     continue
                 other_ordered = sorted(other_indices)
-                remaining |= unmatched_stroke_indices(
-                    local_strokes,
-                    [other_strokes[index] for index in other_ordered],
-                )
-            refined.append({ordered[index] for index in remaining})
+                other_local = [other_strokes[index] for index in other_ordered]
+                if max(len(local_strokes), len(other_local)) <= 3:
+                    common &= _lcs_left_indices(
+                        [stroke_kind(stroke) for stroke in local_strokes],
+                        [stroke_kind(stroke) for stroke in other_local],
+                    )
+                else:
+                    common -= unmatched_stroke_indices(
+                        local_strokes,
+                        other_local,
+                    )
+            refined.append(
+                {
+                    ordered[index]
+                    for index in range(len(local_strokes))
+                    if index not in common
+                }
+            )
         # An empty side represents an absent stroke rather than a directly
         # observable stroke class. Preserve the complete differing subtree so
         # absence is judged from the full local topology, not from an infinity
@@ -911,6 +1161,18 @@ def recursive_stroke_distances(
     ).astype(bool)
     pdf_component_count = component_count(pdf & topology_window)
     candidate_component_counts = [component_count(mask) for mask in subtree_masks]
+    pdf_topology_signature = graph_topology_signature(pdf & topology_window)
+    candidate_topology_signatures = [
+        graph_topology_signature(mask) for mask in subtree_masks
+    ]
+    topology_signature_decision = topology_signature_choice(
+        pdf_topology_signature, candidate_topology_signatures
+    )
+    exact_topology_indices = [
+        index
+        for index, signature in enumerate(candidate_topology_signatures)
+        if signature == pdf_topology_signature
+    ]
     exact_component_indices = [
         index
         for index, count in enumerate(candidate_component_counts)
@@ -923,6 +1185,30 @@ def recursive_stroke_distances(
             "uniqueStrokeIndices": [sorted(value) for value in unique_indices],
             "terminalLeafGroups": leaf_groups,
         }
+
+    principal_axis_report = None
+    if (
+        len(unique_indices) == 2
+        and all(len(indices) == 1 for indices in unique_indices)
+    ):
+        principal_target = closest_component(pdf_difference, unique_union)
+        pdf_axis = principal_axis_angle(principal_target)
+        candidate_axes = [principal_axis_angle(mask) for mask in unique_masks]
+        if pdf_axis is not None and all(axis is not None for axis in candidate_axes):
+            axis_distances = [
+                axis_angle_distance(pdf_axis, axis) for axis in candidate_axes
+            ]
+            ordered_axes = sorted(
+                (distance, index) for index, distance in enumerate(axis_distances)
+            )
+            principal_axis_report = {
+                "pdfAngle": round(pdf_axis, 2),
+                "candidateAngles": [round(axis, 2) for axis in candidate_axes],
+                "distances": [round(value, 2) for value in axis_distances],
+                "candidateIndex": ordered_axes[0][1],
+                "margin": round(ordered_axes[1][0] - ordered_axes[0][0], 2),
+                "targetPixels": int(principal_target.sum()),
+            }
 
     scores = []
     details = []
@@ -964,6 +1250,13 @@ def recursive_stroke_distances(
         "candidateDetails": details,
         "pdfComponentCount": pdf_component_count,
         "candidateComponentCounts": candidate_component_counts,
+        "pdfTopologySignature": pdf_topology_signature,
+        "candidateTopologySignatures": candidate_topology_signatures,
+        "topologySignatureDecision": topology_signature_decision,
+        "principalAxis": principal_axis_report,
+        "exactTopologyCandidateIndex": (
+            exact_topology_indices[0] if len(exact_topology_indices) == 1 else None
+        ),
         "exactComponentCandidateIndex": (
             exact_component_indices[0] if len(exact_component_indices) == 1 else None
         ),
@@ -974,17 +1267,23 @@ def confidence_threshold(results: list[dict], precision_target=0.995):
     ordered = sorted(results, key=lambda item: item["margin"], reverse=True)
     correct = 0
     selected = None
-    for index, item in enumerate(ordered, start=1):
-        correct += item["correct"]
-        precision = correct / index
+    index = 0
+    while index < len(ordered):
+        margin = ordered[index]["margin"]
+        group_end = index
+        while group_end < len(ordered) and ordered[group_end]["margin"] == margin:
+            correct += ordered[group_end]["correct"]
+            group_end += 1
+        precision = correct / group_end
         if precision >= precision_target:
             selected = {
-                "minimumMargin": item["margin"],
-                "accepted": index,
+                "minimumMargin": margin,
+                "accepted": group_end,
                 "correct": correct,
                 "precision": precision,
-                "coverage": index / len(results),
+                "coverage": group_end / len(results),
             }
+        index = group_end
     if selected is None:
         return None
     return selected
@@ -1115,7 +1414,12 @@ def candidate_absence_probe(train_results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
-    parser.add_argument("--pages-dir", type=Path, required=True)
+    parser.add_argument("--pages-dir", type=Path)
+    parser.add_argument(
+        "--pdf",
+        type=Path,
+        help="use direct vector page/cell evidence instead of pre-rendered PBM pages",
+    )
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -1124,10 +1428,23 @@ def main():
     parser.add_argument("--alignment", choices=("none", "common"), default="none")
     parser.add_argument("--topology-weight", type=float, default=0.0)
     parser.add_argument("--evidence-size", type=int, default=128)
+    parser.add_argument(
+        "--unicode",
+        action="append",
+        type=lambda value: int(value, 0),
+        help="limit an experiment to one or more decimal/0x-prefixed codepoints",
+    )
     args = parser.parse_args()
+    if args.pdf is None and args.pages_dir is None:
+        parser.error("one of --pdf or --pages-dir is required")
     evidence_size = args.evidence_size
 
     candidate_rows = json.loads(args.candidates.read_text(encoding="utf-8"))["rows"]
+    if args.unicode:
+        selected_codepoints = set(args.unicode)
+        candidate_rows = [
+            row for row in candidate_rows if row["unicode"] in selected_codepoints
+        ]
     candidates_by_unicode = {row["unicode"]: row for row in candidate_rows}
     records, page_sizes = PDF.parse_pdf_cells(args.bbox_cache)
     records_by_page = defaultdict(list)
@@ -1166,17 +1483,33 @@ def main():
 
     results = []
     for page_number, page_records in sorted(records_by_page.items()):
-        with Image.open(args.pages_dir / f"page-{page_number:03d}.pbm") as page:
+        page_svg = (
+            load_pdf_page_svg(args.pdf, page_number) if args.pdf is not None else None
+        )
+        page_context = (
+            contextlib.nullcontext(None)
+            if page_svg is not None
+            else Image.open(args.pages_dir / f"page-{page_number:03d}.pbm")
+        )
+        with page_context as page:
             for record in page_records:
                 row = candidates_by_unicode[record["unicode"]]
                 expected = row["sourceGlyphs"].get(record["source"])
                 if expected is None:
                     continue
-                pdf_skeleton = PDF.normalized_skeleton(
-                    page,
-                    record["bbox"],
-                    page_sizes[page_number],
-                    size=evidence_size,
+                pdf_skeleton = (
+                    pdf_vector_skeleton(
+                        page_svg,
+                        record["bbox"],
+                        output_size=evidence_size,
+                    )
+                    if page_svg is not None
+                    else PDF.normalized_skeleton(
+                        page,
+                        record["bbox"],
+                        page_sizes[page_number],
+                        size=evidence_size,
+                    )
                 )
                 candidate_ids = [int(glyph_id) for glyph_id in row["candidates"]]
                 candidate_images = [rendered[glyph_id] for glyph_id in candidate_ids]
@@ -1222,6 +1555,11 @@ def main():
                     or row.get("candidateLeafIds")
                     else None,
                 )
+                # All indices inside recursiveTopology refer to this stable
+                # repository order. The human-readable candidate list below is
+                # sorted by optical distance and must never be used to decode
+                # those indices.
+                recursive_report["candidateGlyphIds"] = candidate_ids
                 scores = [
                     visual + args.topology_weight * topology
                     for visual, topology in zip(visual_scores, topology_scores)
@@ -1350,7 +1688,8 @@ def main():
                 "topologyGate": topology_gate,
                 "candidateAbsence": candidate_absence_probe(train_results),
             },
-            "fontOutlinesExtracted": False,
+            "pdfVectorEvidence": args.pdf is not None,
+            "fontOutlinesReusedAsProjectData": False,
         },
         "results": results,
     }
