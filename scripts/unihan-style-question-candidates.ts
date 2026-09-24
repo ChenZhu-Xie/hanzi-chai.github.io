@@ -149,7 +149,7 @@ for (const row of payload.rows) {
       id,
       glyphToSvgMarkup(图形盒子.从笔画列表构建(strokes), false, {
         strokeWidthScale: 0.5,
-        showStrokePoints: true,
+        showStrokeBoundaryPoints: true,
         strokeColors:
           glyphById.size > 0
             ? glyphLeafStrokeIds(Number(id), glyphById).map(colorFor)
@@ -169,7 +169,7 @@ for (const row of payload.rows) {
         id,
         glyphToSvgMarkup(图形盒子.从笔画列表构建(strokes), false, {
           strokeWidthScale: 0.5,
-          showStrokePoints: true,
+          showStrokeBoundaryPoints: true,
           strokeColors: glyphLeafStrokeIds(glyphId, glyphById).map((leafId) =>
             targetLeaves.has(leafId) ? "#2563eb" : "black",
           ),
@@ -189,7 +189,7 @@ for (const row of payload.rows) {
         id,
         glyphToSvgMarkup(图形盒子.从笔画列表构建(strokes), false, {
           strokeWidthScale: 0.5,
-          showStrokePoints: false,
+          showStrokeBoundaryPoints: false,
           // Remove non-target paths from the SVG DOM. A transparent SVG path
           // can retain black RGB under alpha and reappear when rasterized.
           strokeColors: glyphLeafStrokeIds(glyphId, glyphById).map(

@@ -181,7 +181,9 @@ def render_svg_image(svg: str, size=256) -> np.ndarray:
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
-    image = cv2.imdecode(np.frombuffer(completed.stdout, np.uint8), cv2.IMREAD_GRAYSCALE)
+    image = cv2.imdecode(
+        np.frombuffer(completed.stdout, np.uint8), cv2.IMREAD_GRAYSCALE
+    )
     if image is None:
         raise RuntimeError("ImageMagick returned an unreadable SVG raster")
     return image
@@ -196,22 +198,16 @@ def discriminative_distance(
 ) -> list[float]:
     kernel = np.ones((5, 5), dtype=np.uint8)
     dilated = [
-        cv2.dilate(candidate.astype(np.uint8), kernel) > 0
-        for candidate in candidates
+        cv2.dilate(candidate.astype(np.uint8), kernel) > 0 for candidate in candidates
     ]
     common = np.logical_and.reduce(dilated)
     union = np.logical_or.reduce(candidates)
     difference = union & ~common
-    roi = cv2.dilate(
-        difference.astype(np.uint8), np.ones((11, 11), dtype=np.uint8)
-    ) > 0
+    roi = cv2.dilate(difference.astype(np.uint8), np.ones((11, 11), dtype=np.uint8)) > 0
     if not roi.any():
         return [PDF.chamfer_distance(pdf, candidate) for candidate in candidates]
     pdf_roi = pdf & roi
-    return [
-        PDF.chamfer_distance(pdf_roi, candidate & roi)
-        for candidate in candidates
-    ]
+    return [PDF.chamfer_distance(pdf_roi, candidate & roi) for candidate in candidates]
 
 
 def warp_mask(mask: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -243,12 +239,7 @@ def align_candidates_to_pdf(
     def score(scale_x, scale_y, dx, dy):
         ys = np.rint((points[:, 0] - center_y) * scale_y + center_y + dy).astype(int)
         xs = np.rint((points[:, 1] - center_x) * scale_x + center_x + dx).astype(int)
-        inside = (
-            (ys >= 0)
-            & (ys < pdf.shape[0])
-            & (xs >= 0)
-            & (xs < pdf.shape[1])
-        )
+        inside = (ys >= 0) & (ys < pdf.shape[0]) & (xs >= 0) & (xs < pdf.shape[1])
         if inside.mean() < 0.98:
             return math.inf
         return float(target_distance[ys[inside], xs[inside]].mean())
@@ -258,7 +249,13 @@ def align_candidates_to_pdf(
         for scale_y in (0.9, 1.0, 1.1):
             for dx in range(-6, 7, 2):
                 for dy in range(-6, 7, 2):
-                    candidate = (score(scale_x, scale_y, dx, dy), scale_x, scale_y, dx, dy)
+                    candidate = (
+                        score(scale_x, scale_y, dx, dy),
+                        scale_x,
+                        scale_y,
+                        dx,
+                        dy,
+                    )
                     if candidate < best:
                         best = candidate
     _, coarse_x, coarse_y, coarse_dx, coarse_dy = best
@@ -266,7 +263,13 @@ def align_candidates_to_pdf(
         for scale_y in np.arange(coarse_y - 0.04, coarse_y + 0.041, 0.02):
             for dx in range(coarse_dx - 2, coarse_dx + 3):
                 for dy in range(coarse_dy - 2, coarse_dy + 3):
-                    candidate = (score(scale_x, scale_y, dx, dy), scale_x, scale_y, dx, dy)
+                    candidate = (
+                        score(scale_x, scale_y, dx, dy),
+                        scale_x,
+                        scale_y,
+                        dx,
+                        dy,
+                    )
                     if candidate < best:
                         best = candidate
     alignment_score, scale_x, scale_y, dx, dy = best
@@ -415,6 +418,18 @@ def summarize_results(results: list[dict]):
     }
 
 
+def acceptance_summary(all_results: list[dict], accepted: list[dict]):
+    """Report accepted accuracy without losing the held-out denominator."""
+    correct = sum(item["correct"] for item in accepted)
+    return {
+        "evaluated": len(all_results),
+        "accepted": len(accepted),
+        "correct": correct,
+        "accuracyWhenAccepted": correct / len(accepted) if accepted else None,
+        "coverage": len(accepted) / len(all_results) if all_results else None,
+    }
+
+
 def topology_gate_choice(result: dict, minimum_topology_margin, maximum_visual_margin):
     visual = sorted(
         (candidate["visualDistance"], candidate["id"])
@@ -470,9 +485,7 @@ def calibrate_topology_gate(train_results):
                     summary,
                 )
             )
-    _, _, minimum_topology_margin, negative_visual_margin, summary = max(
-        candidates
-    )
+    _, _, minimum_topology_margin, negative_visual_margin, summary = max(candidates)
     return {
         "minimumTopologyMargin": minimum_topology_margin,
         "maximumVisualMargin": -negative_visual_margin,
@@ -503,8 +516,7 @@ def candidate_absence_probe(train_results):
         "reason": "absolute residuals overlap; keep no-match cases for review",
         "evaluated": len(positive),
         "expectedCloser": sum(
-            expected < alternative
-            for expected, alternative in zip(positive, withheld)
+            expected < alternative for expected, alternative in zip(positive, withheld)
         ),
         "expectedDistance": {
             "minimum": min(positive) if positive else None,
@@ -528,15 +540,11 @@ def main():
     parser.add_argument(
         "--renderer", choices=("centerline", "svg"), default="centerline"
     )
-    parser.add_argument(
-        "--alignment", choices=("none", "common"), default="none"
-    )
+    parser.add_argument("--alignment", choices=("none", "common"), default="none")
     parser.add_argument("--topology-weight", type=float, default=0.0)
     args = parser.parse_args()
 
-    candidate_rows = json.loads(
-        args.candidates.read_text(encoding="utf-8")
-    )["rows"]
+    candidate_rows = json.loads(args.candidates.read_text(encoding="utf-8"))["rows"]
     candidates_by_unicode = {row["unicode"]: row for row in candidate_rows}
     records, page_sizes = PDF.parse_pdf_cells(args.bbox_cache)
     records_by_page = defaultdict(list)
@@ -579,9 +587,7 @@ def main():
                     candidate_images, alignment = align_candidates_to_pdf(
                         pdf_skeleton, candidate_images
                     )
-                visual_scores = discriminative_distance(
-                    pdf_skeleton, candidate_images
-                )
+                visual_scores = discriminative_distance(pdf_skeleton, candidate_images)
                 candidate_strokes = [
                     row["candidates"][str(glyph_id)] for glyph_id in candidate_ids
                 ]
@@ -640,10 +646,7 @@ def main():
             for item in test_results
             if item["margin"] >= calibration["minimumMargin"]
         ]
-        held_out_acceptance = {
-            **summarize_results(accepted),
-            "coverage": len(accepted) / len(test_results),
-        }
+        held_out_acceptance = acceptance_summary(test_results, accepted)
     topology_gate = calibrate_topology_gate(train_results)
     if topology_gate is not None:
         topology_gate["test"] = summarize_topology_gate(
@@ -651,6 +654,15 @@ def main():
             topology_gate["minimumTopologyMargin"],
             topology_gate["maximumVisualMargin"],
         )
+        for result in results:
+            prediction, override = topology_gate_choice(
+                result,
+                topology_gate["minimumTopologyMargin"],
+                topology_gate["maximumVisualMargin"],
+            )
+            result["topologyGatePrediction"] = prediction
+            result["topologyGateOverride"] = override
+            result["topologyGateCorrect"] = prediction == result["expectedGlyphId"]
     payload = {
         "metadata": {
             "method": f"candidate-difference-region repository {args.renderer} render with {args.alignment} alignment, topology weight {args.topology_weight}",
