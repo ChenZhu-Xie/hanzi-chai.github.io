@@ -63,6 +63,24 @@ test("splits U+72D1 令 into the reviewed source groups", () => {
   }
 });
 
+test("records the reviewed 蒙-family source forms", () => {
+  for (const [unicode, source, replacementId] of [
+    [0x66da, "J", 6054],
+    [0x66da, "N", 48986],
+    [0x6726, "J", 6054],
+    [0x6726, "N", 48986],
+    [0x6aac, "J", 6054],
+  ] as const) {
+    expect(REVIEWED_SOURCE_DECISIONS).toContainEqual({
+      unicode,
+      source,
+      referenceId: 6054,
+      replacementId,
+      provenance: "manual",
+    });
+  }
+});
+
 test("resolves the reviewed T-source 尼 variant for U+6635", () => {
   const glyphs: 基本字形数据[] = [5925, 58234].map((id) => ({
     id,

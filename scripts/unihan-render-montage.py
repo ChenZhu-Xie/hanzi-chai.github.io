@@ -32,7 +32,7 @@ cv2 = MATCHER.cv2
 TOPOLOGY_COLORS = {
     "endpoint": (220, 38, 38),
     "junction": (2, 132, 199),
-    "corner": (107, 114, 128),
+    "corner": (34, 197, 94),
 }
 
 
@@ -479,24 +479,17 @@ def draw_topology_markers(
                 fill="white",
             )
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
-    # Degree-two turns are geometric hints rather than graph nodes.  Keep the
-    # underlying skeleton visible through an intentionally hollow gray ring.
+    # Degree-two turns are geometric hints rather than graph nodes. A compact
+    # grass-green X stays visible without looking like a draggable node disk.
     for x, y in corners:
-        draw.ellipse(
-            (
-                x - radius - 2,
-                y - radius - 2,
-                x + radius + 2,
-                y + radius + 2,
-            ),
-            outline="white",
-            width=4,
-        )
-        draw.ellipse(
+        arms = (
             (x - radius, y - radius, x + radius, y + radius),
-            outline=TOPOLOGY_COLORS["corner"],
-            width=3,
+            (x - radius, y + radius, x + radius, y - radius),
         )
+        for line in arms:
+            draw.line(line, fill="white", width=7)
+        for line in arms:
+            draw.line(line, fill=TOPOLOGY_COLORS["corner"], width=3)
     return canvas
 
 
@@ -944,11 +937,11 @@ def main():
                             ]
                     draw.text(
                         (8, 306),
-                        "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn"
+                        "Topology markers (also on SVG): red=end, blue=branch/cross, green X=degree-2 sharp turn"
                         if args.focus_color
-                        else "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn"
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green X=degree-2 sharp turn"
                         if args.focus_differences
-                        else "Topology markers (also on SVG): red=end, blue=branch/cross, gray ring=degree-2 sharp turn",
+                        else "Topology markers (also on SVG): red=end, blue=branch/cross, green X=degree-2 sharp turn",
                         fill="black",
                     )
                     for index, panel in enumerate(topology_inputs):

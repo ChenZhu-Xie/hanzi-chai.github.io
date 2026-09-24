@@ -508,4 +508,20 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
     referenceId: 779,
     replacementId: 779,
   },
+
+  // 蒙 family: the reviewed J forms of 曚/朦/檬 keep 6054, while the two
+  // reviewed KP(N) forms use 48986. Component 1035 inside 6054 remains atomic:
+  // rewriting it as ⿱(1,982) changes repository layout geometry.
+  ...([0x66da, 0x6726, 0x6aac] as const).map((unicode) => ({
+    unicode,
+    source: "J" as const,
+    referenceId: 6054,
+    replacementId: 6054,
+  })),
+  ...([0x66da, 0x6726] as const).map((unicode) => ({
+    unicode,
+    source: "N" as const,
+    referenceId: 6054,
+    replacementId: 48986,
+  })),
 ].map((decision) => ({ ...decision, provenance: "manual" }));

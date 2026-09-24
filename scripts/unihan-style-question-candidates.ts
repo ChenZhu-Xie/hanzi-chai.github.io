@@ -60,9 +60,9 @@ const palette = [
   "#f59e0b",
   "#7c3aed",
   "#db2777",
-  "#0f766e",
-  "#65a30d",
   "#92400e",
+  "#ca8a04",
+  "#c2410c",
 ];
 const focusColor = "#f59e0b";
 const familyById = new Map<number, string>();
