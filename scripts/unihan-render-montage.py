@@ -149,9 +149,9 @@ def topology_points(binary: np.ndarray):
     ) - skeleton.astype(np.int16)
     endpoints = _point_centers(skeleton & (neighbours == 1))
     junction_mask = skeleton & (neighbours >= 3)
-    junction_mask = cv2.dilate(
-        junction_mask.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
-    ) > 0
+    junction_mask = (
+        cv2.dilate(junction_mask.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
+    )
     junctions = _point_centers(junction_mask)
     return endpoints, junctions, skeleton
 
@@ -180,9 +180,7 @@ def _branch_angle_at(
     dy = points[:, 0] - y
     dx = points[:, 1] - x
     local = points[
-        (np.abs(dx) <= radius_x)
-        & (np.abs(dy) <= radius_y)
-        & (np.abs(dy) >= 4)
+        (np.abs(dx) <= radius_x) & (np.abs(dy) <= radius_y) & (np.abs(dy) >= 4)
     ]
     if len(local) < 6:
         return None
@@ -225,8 +223,7 @@ def horizontal_crossing_evidence(binary: np.ndarray) -> dict:
         }
         for label in range(1, count)
         if stats[label, cv2.CC_STAT_WIDTH] >= width * 0.18
-        and stats[label, cv2.CC_STAT_WIDTH]
-        >= stats[label, cv2.CC_STAT_HEIGHT] * 3
+        and stats[label, cv2.CC_STAT_WIDTH] >= stats[label, cv2.CC_STAT_HEIGHT] * 3
     ]
     if not horizontal_lines:
         return {"decision": "abstain", "reason": "no-long-horizontal"}
@@ -267,9 +264,7 @@ def horizontal_crossing_evidence(binary: np.ndarray) -> dict:
             ],
             max(7, width * 0.045),
         )
-        angles = [
-            _branch_angle_at(skeleton, x, row["y"]) for x in crossing_xs
-        ]
+        angles = [_branch_angle_at(skeleton, x, row["y"]) for x in crossing_xs]
         candidates.append(
             {
                 "horizontalY": round(row["y"], 1),
@@ -286,9 +281,7 @@ def horizontal_crossing_evidence(binary: np.ndarray) -> dict:
         for row in candidates
         if len(row["crossingXs"]) >= 2
         and row["crossingXs"][-1] - row["crossingXs"][0] >= width * 0.08
-        and any(
-            angle is not None and angle >= 72 for angle in row["crossingAngles"]
-        )
+        and any(angle is not None and angle >= 72 for angle in row["crossingAngles"])
     ]
     if not qualified:
         return {
@@ -398,10 +391,43 @@ def topology_signature(image: Image.Image):
         np.asarray(image.convert("L")) < 224
     )
     components = cv2.connectedComponents(skeleton.astype(np.uint8), 8)[0] - 1
+    ink_points = np.argwhere(skeleton)
+    if ink_points.size:
+        top, left = ink_points.min(axis=0)
+        bottom, right = ink_points.max(axis=0)
+        x_span = max(1, int(right - left))
+        y_span = max(1, int(bottom - top))
+
+        def normalize(points):
+            return [
+                [round((x - left) / x_span, 4), round((y - top) / y_span, 4)]
+                for x, y in points
+            ]
+
+        sample_step = max(1, len(ink_points) // 128)
+        sampled_skeleton = [
+            (int(x), int(y)) for y, x in ink_points[::sample_step][:128]
+        ]
+    else:
+
+        def normalize(_points):
+            return []
+
+        sampled_skeleton = []
+    orientation_maps = MATCHER.orientation_maps(skeleton)
+    orientation_counts = [int(value.sum()) for value in orientation_maps]
+    orientation_total = sum(orientation_counts)
     return {
         "components": int(components),
         "endpoints": len(endpoints),
         "junctions": len(junctions),
+        "endpointPositions": normalize(endpoints),
+        "junctionPositions": normalize(junctions),
+        "skeletonPositions": normalize(sampled_skeleton),
+        "orientationHistogram": [
+            round(count / orientation_total, 6) if orientation_total else 0.0
+            for count in orientation_counts
+        ],
         "horizontalCrossingEvidence": horizontal_crossing_consensus(image),
     }
 
@@ -485,6 +511,19 @@ def structure_guided_focus(
     candidate_target_images: list[Image.Image] | None = None,
 ):
     """Attribute PDF ink to a leaf after aligning on all invariant leaves."""
+    masks = structure_guided_focus_masks(
+        pdf_image, candidate_images, color, candidate_target_images
+    )
+    return [mask_panel(mask) for mask in masks]
+
+
+def structure_guided_focus_masks(
+    pdf_image: Image.Image,
+    candidate_images: list[Image.Image],
+    color: str,
+    candidate_target_images: list[Image.Image] | None = None,
+):
+    """Return attributed PDF ink and aligned target leaves in one coordinate space."""
     pdf = np.asarray(pdf_image.convert("L")) < 224
     visible_targets = [color_mask(image, color) for image in candidate_images]
     targets = [
@@ -494,27 +533,20 @@ def structure_guided_focus(
     full = [np.asarray(image.convert("L")) < 224 for image in candidate_images]
     kernel = np.ones((5, 5), dtype=np.uint8)
     non_targets = [
-        ink
-        & ~(
-            cv2.dilate(target.astype(np.uint8), kernel, iterations=1).astype(bool)
-        )
+        ink & ~(cv2.dilate(target.astype(np.uint8), kernel, iterations=1).astype(bool))
         for ink, target in zip(full, visible_targets)
     ]
-    _aligned_non_targets, alignment = MATCHER.align_candidates_to_pdf(
-        pdf, non_targets
-    )
+    _aligned_non_targets, alignment = MATCHER.align_candidates_to_pdf(pdf, non_targets)
     global_matrix = MATCHER.alignment_matrix(alignment, pdf.shape)
-    aligned_targets = [
-        MATCHER.warp_mask(target, global_matrix) for target in targets
-    ]
-    aligned_others = [
-        MATCHER.warp_mask(other, global_matrix) for other in non_targets
-    ]
+    aligned_targets = [MATCHER.warp_mask(target, global_matrix) for target in targets]
+    aligned_others = [MATCHER.warp_mask(other, global_matrix) for other in non_targets]
     target_union = np.logical_or.reduce(aligned_targets)
     other_union = np.logical_or.reduce(aligned_others)
     target_distance = PDF.distance_transform_edt(~target_union)
     other_distance = PDF.distance_transform_edt(~other_union)
-    pixel_attribution = pdf & (target_distance <= other_distance) & (target_distance <= 10)
+    pixel_attribution = (
+        pdf & (target_distance <= other_distance) & (target_distance <= 10)
+    )
     attributed = np.zeros_like(pdf)
     count, labels = cv2.connectedComponents(pdf.astype(np.uint8), 8)
     for label in range(1, count):
@@ -531,7 +563,42 @@ def structure_guided_focus(
             continue
         else:
             attributed |= component & pixel_attribution
-    return [mask_panel(attributed), *[mask_panel(target) for target in targets]]
+    return [attributed, *aligned_targets]
+
+
+def target_window_focus_masks(
+    pdf_image: Image.Image,
+    candidate_images: list[Image.Image],
+    color: str,
+    candidate_target_images: list[Image.Image] | None = None,
+    margin: int = 12,
+):
+    """Keep chart ink in the aligned target-leaf window without classifying it.
+
+    This deliberately tolerates overlapping/adjacent parent strokes. It avoids
+    turning a difficult attribution decision into an empty observation.
+    """
+    pdf = np.asarray(pdf_image.convert("L")) < 224
+    visible_targets = [color_mask(image, color) for image in candidate_images]
+    targets = [
+        color_mask(image, color)
+        for image in (candidate_target_images or candidate_images)
+    ]
+    full = [np.asarray(image.convert("L")) < 224 for image in candidate_images]
+    kernel = np.ones((5, 5), dtype=np.uint8)
+    non_targets = [
+        ink & ~cv2.dilate(target.astype(np.uint8), kernel, iterations=1).astype(bool)
+        for ink, target in zip(full, visible_targets)
+    ]
+    _aligned_non_targets, alignment = MATCHER.align_candidates_to_pdf(pdf, non_targets)
+    matrix = MATCHER.alignment_matrix(alignment, pdf.shape)
+    aligned_targets = [MATCHER.warp_mask(target, matrix) for target in targets]
+    target_union = np.logical_or.reduce(aligned_targets)
+    window = cv2.dilate(
+        target_union.astype(np.uint8),
+        np.ones((margin * 2 + 1, margin * 2 + 1), np.uint8),
+    ).astype(bool)
+    return [pdf & window, *aligned_targets]
 
 
 def focus_panel(image: Image.Image, box, size=256):
@@ -676,9 +743,7 @@ def main():
                         else None
                     ) or row["candidateSvgs"][str(glyph_id)]
                     topology_inputs.append(
-                        render_svg_review_image(
-                            without_review_points(topology_svg)
-                        )
+                        render_svg_review_image(without_review_points(topology_svg))
                     )
                     target_svg = row.get("candidateTopologySvgs", {}).get(
                         str(glyph_id), topology_svg
@@ -761,13 +826,17 @@ def main():
                 )
                 montage.save(args.output_dir / filename)
                 expected_index = ids.index(result["expectedGlyphId"])
+                predicted_id = result.get("predictedGlyphId")
+                prediction = (
+                    chr(65 + ids.index(predicted_id))
+                    if predicted_id in ids
+                    else "abstain"
+                )
                 answer_key[filename] = {
                     "expected": chr(65 + expected_index),
                     "expectedGlyphId": result["expectedGlyphId"],
-                    "algorithmPrediction": chr(
-                        65 + ids.index(result["predictedGlyphId"])
-                    ),
-                    "algorithmGlyphId": result["predictedGlyphId"],
+                    "algorithmPrediction": prediction,
+                    "algorithmGlyphId": predicted_id,
                 }
                 review_template[filename] = {
                     "choice": "uncertain",

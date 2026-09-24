@@ -39,13 +39,17 @@ describe("glyph SVG rendering", () => {
     const svg = glyphToSvgMarkup(
       图形盒子.从笔画列表构建(strokes),
       false,
-      { strokeWidthScale: 0.5, showStrokePoints: true },
+      { strokeWidthScale: 0.5, showStrokeBoundaryPoints: true },
     );
 
     expect(svg).toContain('stroke-width="3.5"');
     expect(svg).toContain('<circle cx="20" cy="15" r="1.5" fill="red"/>');
     expect(svg).toContain('<circle cx="80" cy="15" r="1.5" fill="red"/>');
     expect(svg).toContain('<circle cx="8" cy="93" r="1.5" fill="red"/>');
+    expect(svg.match(/<circle/g)).toHaveLength(5);
+    // Cubic control points are editor handles, not stroke boundaries.
+    expect(svg).not.toContain('<circle cx="74" cy="45"');
+    expect(svg).not.toContain('<circle cx="50" cy="75"');
   });
 
   test("can color strokes by their recursively resolved leaf component", () => {

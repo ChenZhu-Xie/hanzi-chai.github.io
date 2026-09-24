@@ -17,7 +17,34 @@ def load_montage():
 MONTAGE = load_montage()
 
 
+def load_leaf_evaluator():
+    path = Path(__file__).with_name("unihan-leaf-topology-eval.py")
+    spec = importlib.util.spec_from_file_location("unihan_leaf_topology_eval", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+LEAF_EVAL = load_leaf_evaluator()
+
+
 class PdfCellTests(unittest.TestCase):
+    def test_topology_point_distance_uses_positions_not_only_counts(self):
+        same = [[0.1, 0.2], [0.8, 0.9]]
+        shifted = [[0.1, 0.8], [0.8, 0.2]]
+
+        self.assertEqual(LEAF_EVAL.point_set_distance(same, same), 0)
+        self.assertGreater(LEAF_EVAL.point_set_distance(same, shifted), 0)
+
+    def test_full_skeleton_distance_distinguishes_line_direction(self):
+        horizontal = Image.new("L", (128, 128), "white")
+        ImageDraw.Draw(horizontal).line((15, 64, 113, 64), fill="black", width=5)
+        vertical = Image.new("L", (128, 128), "white")
+        ImageDraw.Draw(vertical).line((64, 15, 64, 113), fill="black", width=5)
+
+        self.assertEqual(LEAF_EVAL.raster_skeleton_distance(horizontal, horizontal), 0)
+        self.assertGreater(LEAF_EVAL.raster_skeleton_distance(horizontal, vertical), 0)
+
     def test_enlarges_a_small_pdf_glyph_for_human_review(self):
         page = Image.new("L", (100, 100), "white")
         ImageDraw.Draw(page).rectangle((42, 42, 57, 57), fill="black")
@@ -31,10 +58,10 @@ class PdfCellTests(unittest.TestCase):
         self.assertGreater(bottom - top, 180)
 
     def test_review_svg_keeps_red_annotation_points(self):
-        svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        svg = b"""<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
           <rect width="100" height="100" fill="white"/>
           <circle cx="50" cy="50" r="20" fill="red"/>
-        </svg>'''
+        </svg>"""
 
         image = MONTAGE.render_svg_review_image(svg.decode("utf-8"), size=100)
 
@@ -52,6 +79,20 @@ class PdfCellTests(unittest.TestCase):
 
         self.assertEqual(len(endpoints), 3)
         self.assertEqual(len(junctions), 1)
+
+        signature = MONTAGE.topology_signature(
+            Image.fromarray((~binary).astype(np.uint8) * 255)
+        )
+        self.assertEqual(len(signature["endpointPositions"]), 3)
+        self.assertEqual(len(signature["junctionPositions"]), 1)
+        self.assertGreater(len(signature["skeletonPositions"]), 3)
+        self.assertTrue(
+            all(
+                0 <= coordinate <= 1
+                for point in signature["skeletonPositions"]
+                for coordinate in point
+            )
+        )
 
     def test_local_topology_rejects_one_curved_stroke_as_split_strokes(self):
         image = Image.new("L", (160, 160), "white")
@@ -75,9 +116,7 @@ class PdfCellTests(unittest.TestCase):
 
         evidence = MONTAGE.horizontal_crossing_consensus(image)
 
-        self.assertEqual(
-            evidence["decision"], "split-vertical-and-falling-strokes"
-        )
+        self.assertEqual(evidence["decision"], "split-vertical-and-falling-strokes")
         self.assertIn(evidence["consensus"], {"2/3", "3/3"})
 
     def test_combines_pdf_crossings_with_candidate_stroke_identity(self):
@@ -103,7 +142,9 @@ class PdfCellTests(unittest.TestCase):
 
         self.assertEqual(choice["decision"], "abstain")
 
-    def test_structure_guided_focus_abstains_instead_of_claiming_touching_other_part(self):
+    def test_structure_guided_focus_abstains_instead_of_claiming_touching_other_part(
+        self,
+    ):
         size = 128
         pdf = Image.new("RGB", (size, size), "white")
         draw = ImageDraw.Draw(pdf)
@@ -114,9 +155,7 @@ class PdfCellTests(unittest.TestCase):
         draw.line((32, 12, 32, 92), fill="#2563eb", width=7)
         draw.line((32, 70, 110, 70), fill="#16a34a", width=7)
 
-        focused = MONTAGE.structure_guided_focus(
-            pdf, [candidate, candidate], "2563eb"
-        )
+        focused = MONTAGE.structure_guided_focus(pdf, [candidate, candidate], "2563eb")
         pdf_mask = np.asarray(focused[0].convert("L")) < 224
 
         self.assertFalse(pdf_mask[120:136, 180:].any())
@@ -132,9 +171,7 @@ class PdfCellTests(unittest.TestCase):
         draw.line((32, 12, 32, 60), fill="#2563eb", width=7)
         draw.line((60, 80, 110, 80), fill="#16a34a", width=7)
 
-        focused = MONTAGE.structure_guided_focus(
-            pdf, [candidate, candidate], "2563eb"
-        )
+        focused = MONTAGE.structure_guided_focus(pdf, [candidate, candidate], "2563eb")
         pdf_mask = np.asarray(focused[0].convert("L")) < 224
 
         self.assertTrue(pdf_mask.any())
@@ -152,14 +189,10 @@ class PdfCellTests(unittest.TestCase):
         full_draw.rectangle((52, 58, 76, 70), fill="black")
 
         target_only = Image.new("RGB", (size, size), "white")
-        ImageDraw.Draw(target_only).line(
-            (15, 64, 113, 64), fill="#2563eb", width=7
-        )
+        ImageDraw.Draw(target_only).line((15, 64, 113, 64), fill="#2563eb", width=7)
 
         occluded = MONTAGE.structure_guided_focus(pdf, [full], "2563eb")
-        isolated = MONTAGE.structure_guided_focus(
-            pdf, [full], "2563eb", [target_only]
-        )
+        isolated = MONTAGE.structure_guided_focus(pdf, [full], "2563eb", [target_only])
         occluded_ink = (np.asarray(occluded[1].convert("L")) < 224).sum()
         isolated_ink = (np.asarray(isolated[1].convert("L")) < 224).sum()
 
@@ -191,8 +224,12 @@ class PdfCellTests(unittest.TestCase):
         glyph_y = 36 + round(0.75 * 256)
         topology_y = 324 + round(0.68 * 256)
         x = 2 * 256 + round(0.5 * 256)
-        self.assertTrue((pixels[glyph_y - 12 : glyph_y + 13, x - 12 : x + 13] != 255).any())
-        self.assertTrue((pixels[topology_y - 12 : topology_y + 13, x - 12 : x + 13] != 255).any())
+        self.assertTrue(
+            (pixels[glyph_y - 12 : glyph_y + 13, x - 12 : x + 13] != 255).any()
+        )
+        self.assertTrue(
+            (pixels[topology_y - 12 : topology_y + 13, x - 12 : x + 13] != 255).any()
+        )
 
 
 if __name__ == "__main__":

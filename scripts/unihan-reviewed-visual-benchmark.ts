@@ -189,6 +189,15 @@ const renderedRows = rows.flatMap((row) => {
           }),
         ]),
       ),
+      candidateTopologySvgs: Object.fromEntries(
+        rendered.map(([id, glyph]) => [
+          id,
+          glyphToSvgMarkup(glyph.图形盒子, false, {
+            strokeColors: leafIds[id]!.map(() => "#2563eb"),
+            strokeVisibility: leafIds[id]!.map((leafId) => focus.has(leafId)),
+          }),
+        ]),
+      ),
     },
   ];
 });

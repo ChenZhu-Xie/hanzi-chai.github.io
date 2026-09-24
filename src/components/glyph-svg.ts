@@ -138,8 +138,8 @@ export function strokeToSvgPath(
 export interface GlyphSvgOptions {
   /** Scale the normal repository stroke width without changing geometry. */
   strokeWidthScale?: number;
-  /** Mark every stroke start and segment boundary for human topology review. */
-  showStrokePoints?: boolean;
+  /** Mark stroke starts and segment endpoints, never Bezier control points. */
+  showStrokeBoundaryPoints?: boolean;
   /** Optional per-stroke colors used by leaf-aware human review panels. */
   strokeColors?: string[];
   /** Omit non-target strokes while retaining the full glyph coordinate box. */
@@ -183,7 +183,7 @@ export function glyphToSvgMarkup(
           : `<path d="${strokeToSvgPath(stroke, index, strokes)}" stroke="${options.strokeColors?.[index] ?? "black"}" stroke-width="${serializedStrokeWidth}" fill="none" stroke-linecap="square"/>`,
     )
     .join("");
-  const points = options.showStrokePoints
+  const points = options.showStrokeBoundaryPoints
     ? strokes
         .flatMap((stroke, index) =>
           options.strokeVisibility?.[index] === false
