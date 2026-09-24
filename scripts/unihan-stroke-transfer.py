@@ -623,6 +623,167 @@ def marker_svg(centerlines: list[np.ndarray], canvas: int, strokes: list[dict]) 
     return "".join(parts)
 
 
+def annotation_editor_script(metadata: dict) -> str:
+    payload = json.dumps(metadata, ensure_ascii=False)
+    return r'''
+    (() => {
+      document.querySelector('.editor').id = 'human-editor';
+      const metadata = __METADATA__;
+      const storageKey = `unihan-human-annotations:${metadata.reviewKey}`;
+      const board = document.querySelector('#annotation-board');
+      const layer = document.querySelector('#annotation-layer');
+      const status = document.querySelector('#annotation-status');
+      const labelInput = document.querySelector('#component-label');
+      const colorInput = document.querySelector('#annotation-color');
+      const fileInput = document.querySelector('#annotation-file');
+      let tool = 'stroke';
+      let current = null;
+      let annotations = [];
+
+      try {
+        const saved = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        if (Array.isArray(saved)) annotations = saved;
+      } catch (_error) {}
+
+      const svgElement = (name, attributes = {}) => {
+        const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+        for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+        return element;
+      };
+      const pointsText = points => points.map(point => `${point[0].toFixed(3)},${point[1].toFixed(3)}`).join(' ');
+      const drawingPoint = event => {
+        const point = board.createSVGPoint();
+        point.x = event.clientX;
+        point.y = event.clientY;
+        const mapped = point.matrixTransform(board.getScreenCTM().inverse());
+        return [Math.max(0, Math.min(100, mapped.x)), Math.max(0, Math.min(100, mapped.y))];
+      };
+      const strokeNumber = annotation => annotations.filter(item => item.type === 'stroke').indexOf(annotation) + 1;
+      const persist = () => {
+        localStorage.setItem(storageKey, JSON.stringify(annotations));
+        const strokes = annotations.filter(item => item.type === 'stroke').length;
+        const regions = annotations.filter(item => item.type === 'lasso').length;
+        status.innerHTML = `<b>人工真值：</b>${strokes} 笔，${regions} 个部件圈。PDF 的真实笔数现在由你的 ${strokes} 条中心线定义。`;
+      };
+      const centroid = points => [
+        points.reduce((sum, point) => sum + point[0], 0) / points.length,
+        points.reduce((sum, point) => sum + point[1], 0) / points.length,
+      ];
+      const appendAnnotation = (annotation, index, preview = false) => {
+        if (!annotation.points.length) return;
+        let shape;
+        if (annotation.type === 'lasso') {
+          shape = svgElement('polygon', {
+            points: pointsText(annotation.points), fill: annotation.color,
+            'fill-opacity': preview ? '.08' : '.16', stroke: annotation.color,
+            'stroke-width': '.55', 'stroke-dasharray': '1.2 .7',
+          });
+        } else {
+          shape = svgElement('polyline', {
+            points: pointsText(annotation.points), fill: 'none', stroke: annotation.color,
+            'stroke-width': '1.05', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          });
+        }
+        shape.classList.add('annotation-shape');
+        if (!preview) {
+          shape.dataset.annotationIndex = String(index);
+          shape.addEventListener('pointerdown', event => {
+            if (tool !== 'erase') return;
+            event.stopPropagation();
+            annotations.splice(Number(shape.dataset.annotationIndex), 1);
+            persist();
+            render();
+          });
+        }
+        layer.append(shape);
+        if (preview) return;
+        const anchor = annotation.type === 'stroke' ? annotation.points[0] : centroid(annotation.points);
+        const text = svgElement('text', {
+          x: anchor[0], y: anchor[1] - 1.2, fill: annotation.color, class: 'annotation-label',
+          'text-anchor': annotation.type === 'stroke' ? 'start' : 'middle',
+        });
+        const prefix = annotation.type === 'stroke' ? `第${strokeNumber(annotation)}笔` : '部件';
+        text.textContent = annotation.label ? `${prefix} · ${annotation.label}` : prefix;
+        layer.append(text);
+      };
+      const render = () => {
+        layer.replaceChildren();
+        annotations.forEach((annotation, index) => appendAnnotation(annotation, index));
+        if (current) appendAnnotation(current, -1, true);
+      };
+      const simplifyPoints = points => points.filter((point, index) => {
+        if (index === 0 || index === points.length - 1) return true;
+        const previous = points[index - 1];
+        return Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .3;
+      });
+
+      board.addEventListener('pointerdown', event => {
+        if (tool === 'erase') return;
+        board.setPointerCapture(event.pointerId);
+        current = {
+          type: tool, color: colorInput.value, label: labelInput.value.trim(),
+          points: [drawingPoint(event)], createdAt: new Date().toISOString(),
+        };
+        render();
+      });
+      board.addEventListener('pointermove', event => {
+        if (!current) return;
+        const point = drawingPoint(event);
+        const previous = current.points[current.points.length - 1];
+        if (Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .18) {
+          current.points.push(point);
+          render();
+        }
+      });
+      const finish = event => {
+        if (!current) return;
+        if (board.hasPointerCapture(event.pointerId)) board.releasePointerCapture(event.pointerId);
+        current.points = simplifyPoints(current.points);
+        if (current.points.length > 1) annotations.push(current);
+        current = null;
+        persist();
+        render();
+      };
+      board.addEventListener('pointerup', finish);
+      board.addEventListener('pointercancel', finish);
+
+      document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => {
+        tool = button.dataset.tool;
+        document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
+        board.style.cursor = tool === 'erase' ? 'not-allowed' : 'crosshair';
+      }));
+      document.querySelector('#undo-annotation').onclick = () => { annotations.pop(); persist(); render(); };
+      document.querySelector('#clear-annotations').onclick = () => {
+        if (!annotations.length || confirm('清空本字源的全部人工标注？')) {
+          annotations = [];
+          persist();
+          render();
+        }
+      };
+      document.querySelector('#export-annotations').onclick = () => {
+        const output = { format: 'hanzi-chai-pdf-stroke-review-v1', metadata, annotations };
+        const blob = new Blob([JSON.stringify(output, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `${metadata.reviewKey}-annotations.json`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      };
+      document.querySelector('#import-annotations').onclick = () => fileInput.click();
+      fileInput.addEventListener('change', async () => {
+        const documentValue = JSON.parse(await fileInput.files[0].text());
+        if (!Array.isArray(documentValue.annotations)) throw new Error('JSON 缺少 annotations 数组');
+        annotations = documentValue.annotations;
+        persist();
+        render();
+        fileInput.value = '';
+      });
+      persist();
+      render();
+    })();
+    '''.replace("__METADATA__", payload)
+
+
 def build_html(
     record: dict,
     glyph: dict,
@@ -657,17 +818,35 @@ def build_html(
         )
     ambiguity_path = mask_svg_path(ambiguous, canvas)
     nodes = marker_svg(centerlines, canvas, strokes)
+    review_key = f"U+{record['unicode']:04X}-{record['source']}-{glyph_id}"
+    candidate_order = "；".join(
+        f"{index + 1}. {stroke['feature']}" for index, stroke in enumerate(strokes)
+    )
+    annotation_js = annotation_editor_script(
+        {
+            "reviewKey": review_key,
+            "unicode": f"U+{record['unicode']:04X}",
+            "character": chr(record["unicode"]),
+            "source": record["source"],
+            "candidateGlyphId": glyph_id,
+            "candidateStrokeCount": len(strokes),
+            "candidateStrokeOrder": [stroke["feature"] for stroke in strokes],
+        }
+    )
     original_use = f'''<use class="source-use" href="{glyph['useAttributes']['href']}" x="{glyph['useAttributes'].get('x', 0)}" y="{glyph['useAttributes'].get('y', 0)}"/>'''
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
-    body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}header{{padding:14px 22px;background:#0f172a;color:white}}header button{{margin:10px 7px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:5px}}main{{padding:18px;display:grid;grid-template-columns:repeat(4,minmax(250px,1fr));gap:14px}}article{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}h3{{font-size:14px;margin:0;padding:9px;background:#f1f5f9}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-stroke:hover{{filter:drop-shadow(0 0 1.5px #111);stroke:#111;stroke-width:.25}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.75}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}pre{{margin:0;padding:12px;white-space:pre-wrap;font-size:12px}}#tip{{position:fixed;z-index:5;display:none;pointer-events:none;background:#111827;color:white;padding:6px 8px;border-radius:6px;font-size:12px}}
-    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>逐笔语义来自 hanzi-chai；字形轮廓来自 Unicode PDF。红实点＝端点，蓝空心点＝笔画接触/交叉，绿叉＝稀疏结构转折。</div><div class="warning">斜线区域＝笔画归属歧义；当前 {metrics['ambiguousRatio'] * 100:.2f}%，本页只用于验证，不得作为自动写入证据。</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">每笔独立着色</button><button id="node-mode" class="active">显示拓扑节点</button></header><main>
+    body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:14px 22px;background:#0f172a;color:white}}header button,.toolbar button{{margin:10px 7px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:5px}}main{{padding:18px;display:grid;grid-template-columns:repeat(4,minmax(250px,1fr));gap:14px}}article{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}h3{{font-size:14px;margin:0;padding:9px;background:#f1f5f9}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-stroke:hover{{filter:drop-shadow(0 0 1.5px #111);stroke:#111;stroke-width:.25}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.75}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}pre{{margin:0;padding:12px;white-space:pre-wrap;font-size:12px}}#tip{{position:fixed;z-index:5;display:none;pointer-events:none;background:#111827;color:white;padding:6px 8px;border-radius:6px;font-size:12px}}.editor{{grid-column:1/-1}}.editor-layout{{display:grid;grid-template-columns:minmax(600px,1fr) 360px;gap:14px;padding:14px}}.board-wrap{{border:1px solid #94a3b8;border-radius:8px;background:white;overflow:hidden}}#annotation-board{{touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.toolbar{{padding:0 10px 10px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar label{{display:inline-flex;align-items:center;gap:5px;margin:8px 9px 0 0}}.toolbar input[type=text]{{width:150px;padding:5px;border:1px solid #94a3b8;border-radius:5px}}.editor-help{{font-size:13px;line-height:1.55}}.editor-help code{{background:#e2e8f0;padding:1px 4px}}#annotation-status{{padding:8px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.sequence{{max-height:290px;overflow:auto;padding:8px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc}}@media(max-width:1050px){{main{{grid-template-columns:1fr 1fr}}.editor-layout{{grid-template-columns:1fr}}}}
+    .jump{{display:inline-block;margin:10px 7px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none;cursor:pointer}}.editor{{scroll-margin-top:12px}}
+    </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供的是假设笔数与笔序。当前系统尚未识别出 PDF 的真实笔画。</div><div class="warning">候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按候选笔槽着色（非真实拆笔）</button><button id="node-mode" class="active">显示拓扑节点</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
     <article><h3>PDF 原始矢量轮廓</h3><svg viewBox="0 0 100 100"><defs>{glyph['definitions']}</defs><g class="source-fit">{original_use}</g></svg></article>
     <article><h3>hanzi-chai 候选（递归到叶部件）</h3>{candidate_svg}</article>
-    <article><h3>PDF 逐笔互斥分区（原始矢量外沿）</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g mask="url(#pdf-outline-mask)">{''.join(layers)}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg></article>
+    <article><h3>候选驱动的 PDF 墨迹归属假设（不是已识别笔画）</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g mask="url(#pdf-outline-mask)">{''.join(layers)}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg></article>
     <article><h3>拟合后的逐笔中心线</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></article>
+    <article class="editor"><h3>人工真值标注板：请直接圈部件，或按真实笔顺逐笔画中心线</h3><div class="toolbar"><button type="button" data-tool="stroke" class="active">画真实笔画中心线</button><button type="button" data-tool="lasso">圈部件区域</button><button type="button" data-tool="erase">点选删除</button><label>部件标签 <input id="component-label" type="text" placeholder="例如：匕 / 1128"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出 JSON</button><button type="button" id="import-annotations">导入 JSON</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="editor-layout"><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><aside class="editor-help"><div id="annotation-status"></div><p><b>操作：</b>“画真实笔画中心线”时，每次按下并拖动是一笔，松开后自动编号；请按真实笔序画。“圈部件区域”时沿部件外圈拖动，标签取左侧输入框。“点选删除”可删错线。</p><p><b>保存：</b>每次落笔自动保存在本页浏览器的 localStorage；“导出 JSON”可把真值交给算法。</p><p><b>PDF 真值：</b>笔数未知、笔序未知，等待你的标注。<br><b>candidate：</b>{len(strokes)} 笔。</p><div class="sequence"><b>candidate 笔序</b><br>{html.escape(candidate_order)}</div></aside></div></article>
     </main><div id="tip"></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
     document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const tip=document.querySelector('#tip');document.querySelectorAll('.source-stroke').forEach(el=>{{el.addEventListener('pointerenter',()=>{{tip.textContent=el.dataset.label;tip.style.display='block'}});el.addEventListener('pointermove',e=>{{tip.style.left=`${{e.clientX+12}}px`;tip.style.top=`${{e.clientY+12}}px`}});el.addEventListener('pointerleave',()=>tip.style.display='none')}});const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
+    {annotation_js}
     </script></body></html>'''
 
 
@@ -702,6 +881,18 @@ def main():
     fitted = fit_centerlines(strokes, args.canvas)
     snapped, snap_distances = snap_centerlines(fitted, target, max_distance=args.canvas * 0.08)
     masks, ambiguous, metrics = partition_strokes(target, snapped)
+    fragment_counts = []
+    for mask in masks:
+        component_count, _labels = cv2.connectedComponents(
+            mask.astype(np.uint8), connectivity=8
+        )
+        fragment_counts.append(max(0, int(component_count) - 1))
+    metrics["candidateStrokeCount"] = len(strokes)
+    metrics["candidateStrokeOrder"] = [stroke["feature"] for stroke in strokes]
+    metrics["pdfActualStrokeCount"] = None
+    metrics["pdfActualStrokeOrder"] = None
+    metrics["partitionInkFragments"] = fragment_counts
+    metrics["totalPartitionInkFragments"] = sum(fragment_counts)
     metrics["maxSnapDistances"] = [round(value, 3) for value in snap_distances]
     metrics["emptyStrokes"] = [index for index, mask in enumerate(masks) if not mask.any()]
     document = build_html(
