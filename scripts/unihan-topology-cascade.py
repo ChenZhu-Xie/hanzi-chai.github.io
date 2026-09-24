@@ -29,6 +29,34 @@ def keyed(payload: dict) -> dict[tuple[int, str], dict]:
 
 
 def choose(low: dict, high: dict, subtree: dict) -> tuple[int | None, str, float]:
+    high_report = high.get("recursiveTopology", {})
+    principal_axis = high_report.get("principalAxis") or {}
+    topology_index = principal_axis.get("candidateIndex")
+    topology_candidate_ids = high_report.get("candidateGlyphIds", [])
+    if (
+        topology_index is not None
+        and float(principal_axis.get("margin", 0.0)) >= 15.0
+        and 0 <= int(topology_index) < len(topology_candidate_ids)
+    ):
+        return (
+            int(topology_candidate_ids[int(topology_index)]),
+            "terminal-principal-axis",
+            float(principal_axis["margin"]),
+        )
+
+    signature = high_report.get("topologySignatureDecision") or {}
+    topology_index = signature.get("candidateIndex")
+    if (
+        topology_index is not None
+        and float(signature.get("margin", 0.0)) >= 3.0
+        and 0 <= int(topology_index) < len(topology_candidate_ids)
+    ):
+        return (
+            int(topology_candidate_ids[int(topology_index)]),
+            "recursive-graph-consensus",
+            float(signature["margin"]),
+        )
+
     exact = subtree.get("exactComponentPredictionGlyphId")
     if exact is not None:
         component_distances = sorted(
@@ -57,7 +85,6 @@ def choose(low: dict, high: dict, subtree: dict) -> tuple[int | None, str, float
             "terminal-stroke-direction",
             float(report.get("margin", 0.0)),
         )
-    high_report = high.get("recursiveTopology", {})
     return (
         high.get("recursiveTopologyPredictionGlyphId"),
         "recursive-subtree-topology",
@@ -81,10 +108,19 @@ def calibrate_thresholds(rows: list[dict]) -> dict[str, float]:
         )
         correct = 0
         selected = None
-        for index, row in enumerate(ordered, start=1):
-            correct += row["correct"]
-            if correct == index:
-                selected = row["margin"]
+        index = 0
+        while index < len(ordered):
+            margin = ordered[index]["margin"]
+            group_end = index
+            while (
+                group_end < len(ordered)
+                and ordered[group_end]["margin"] == margin
+            ):
+                correct += ordered[group_end]["correct"]
+                group_end += 1
+            if correct == group_end:
+                selected = margin
+            index = group_end
         if selected is not None:
             thresholds[method] = selected
     return thresholds
@@ -102,16 +138,30 @@ def accepted_summary(rows: list[dict]) -> dict:
     }
 
 
-def evaluate(low_payload: dict, high_payload: dict, subtree_payload: dict) -> dict:
+def evaluate(
+    low_payload: dict,
+    high_payload: dict,
+    subtree_payload: dict,
+    baseline_payload: dict | None = None,
+) -> dict:
     low = keyed(low_payload)
     high = keyed(high_payload)
     subtree = keyed(subtree_payload)
+    baseline = keyed(baseline_payload or {})
     rows = []
     for key in sorted(low):
         if key not in high or key not in subtree:
             continue
         low_row = low[key]
         predicted, method, margin = choose(low_row, high[key], subtree[key])
+        # Only the vector principal-axis decision is a sufficiently specific
+        # hard override. Graph-count consensus remains useful review evidence,
+        # but its family-disjoint errors make it unsafe as an automatic gate.
+        if baseline and method != "terminal-principal-axis" and key in baseline:
+            baseline_row = baseline[key]
+            predicted = baseline_row.get("predictedGlyphId")
+            method = f"baseline/{baseline_row.get('method', 'unknown')}"
+            margin = float(baseline_row.get("margin", 0.0))
         expected = low_row.get("expectedGlyphId")
         rows.append(
             {
@@ -149,6 +199,7 @@ def evaluate(low_payload: dict, high_payload: dict, subtree_payload: dict) -> di
             "safeThresholds": thresholds,
             "safeTrain": accepted_summary(train),
             "safeHeldOut": accepted_summary(test),
+            "baselineFallbackEnabled": bool(baseline),
             "automaticWriteEnabled": False,
         },
         "results": rows,
@@ -160,12 +211,18 @@ def main():
     parser.add_argument("--low-resolution", type=Path, required=True)
     parser.add_argument("--high-resolution", type=Path, required=True)
     parser.add_argument("--subtree-topology", type=Path, required=True)
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="fall back to a previously calibrated raster cascade",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = evaluate(
         json.loads(args.low_resolution.read_text("utf-8")),
         json.loads(args.high_resolution.read_text("utf-8")),
         json.loads(args.subtree_topology.read_text("utf-8")),
+        json.loads(args.baseline.read_text("utf-8")) if args.baseline else None,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
