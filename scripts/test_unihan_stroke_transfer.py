@@ -25,12 +25,15 @@ class StrokeTransferTest(unittest.TestCase):
             }
         )
 
-        self.assertIn("placeLinearPoint(drawingPoint(event))", script)
+        self.assertIn("placeLinearPoint(\n            drawingPoint(event)", script)
         self.assertNotIn("board.addEventListener('click', event =>", script)
         self.assertIn("incomingHandleLength = vectorLength(incoming) / 3", script)
         self.assertIn("outgoingHandleLength = vectorLength(outgoing) / 3", script)
         self.assertIn("polygon: '多边形圈：逐点单击；Enter 或右键自动闭合'", script)
         self.assertIn("['line', 'polyline', 'polygon'].includes(tool)", script)
+        self.assertIn("reassignRegion(Number(shape.dataset.annotationIndex))", script)
+        self.assertIn("event.shiftKey && ['line', 'polyline'].includes(tool)", script)
+        self.assertIn("labelFollowupPreferenceKey", script)
 
     def test_directed_stroke_features_change_when_arc_is_reversed(self):
         forward = np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]])
@@ -264,6 +267,17 @@ class StrokeTransferTest(unittest.TestCase):
         self.assertLess(ranked[0]["distanceWeight"], ranked[1]["distanceWeight"])
         self.assertEqual(ranked[0]["methodPrior"]["correct"], 2)
         self.assertEqual(ranked[0]["methodPrior"]["total"], 3)
+
+    def test_candidate_ranking_puts_selected_candidate_first_when_evidence_ties(self):
+        row = {"candidateSvgs": {"133": "", "1128": ""}}
+        ranked = MODULE.rank_candidates(
+            row,
+            result=None,
+            evidence=None,
+            selected_glyph_id=1128,
+        )
+
+        self.assertEqual([item["id"] for item in ranked], [1128, 133])
 
 
 if __name__ == "__main__":

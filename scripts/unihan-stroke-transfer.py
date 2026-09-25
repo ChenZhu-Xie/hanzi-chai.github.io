@@ -985,7 +985,12 @@ def evidence_for_record(evidence: dict | None, unicode: int, source: str) -> dic
     )
 
 
-def rank_candidates(row: dict, result: dict | None, evidence: dict | None) -> list[dict]:
+def rank_candidates(
+    row: dict,
+    result: dict | None,
+    evidence: dict | None,
+    selected_glyph_id: int | None = None,
+) -> list[dict]:
     candidate_ids = [int(value) for value in row["candidateSvgs"]]
     evidence_by_id = {
         int(item["id"]): item for item in (result or {}).get("candidates", [])
@@ -1034,6 +1039,7 @@ def rank_candidates(row: dict, result: dict | None, evidence: dict | None) -> li
         candidate_ids,
         key=lambda glyph_id: (
             -decision_weights[glyph_id],
+            glyph_id != selected_glyph_id,
             glyph_id,
         ),
     )
@@ -1082,6 +1088,8 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       const labelInput = document.querySelector('#component-label');
       const colorInput = document.querySelector('#annotation-color');
       const fileInput = document.querySelector('#annotation-file');
+      const labelFollowupButton = document.querySelector('#label-followup-toggle');
+      const labelFollowupPreferenceKey = 'unihan-annotation-label-followup-tool';
       let tool = 'freehand';
       let current = null;
       let pointDraft = null;
@@ -1090,6 +1098,9 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       let annotations = initialAnnotations;
       let history = [];
       let future = [];
+      let labelFollowupTool = localStorage.getItem(labelFollowupPreferenceKey) === 'polyline'
+        ? 'polyline'
+        : 'polygon';
 
       // A freshly supplied human-truth file is authoritative.  Do not let an
       // older browser draft silently restore the pre-correction IDs/colors.
@@ -1130,6 +1141,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         bezier: '钢笔路径：单击自动平滑锚点；Alt+单击角锚点；拖动可明确方向手柄',
         lasso: '自由圈：按住左键沿边界描画，松开完成',
         polygon: '多边形圈：逐点单击；Enter 或右键自动闭合',
+        relabel: '重标部件：先填正确部件标签，再点击既有部件圈',
         erase: '删除：点击已有笔画或部件圈',
       };
       const updateToolStatus = (detail = '') => {
@@ -1151,6 +1163,41 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         points.reduce((sum, point) => sum + point[0], 0) / points.length,
         points.reduce((sum, point) => sum + point[1], 0) / points.length,
       ];
+      const pointInPolygon = (point, polygon) => {
+        let inside = false;
+        for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index++) {
+          const [x, y] = polygon[index], [previousX, previousY] = polygon[previous];
+          const intersects = (y > point[1]) !== (previousY > point[1])
+            && point[0] < (previousX - x) * (point[1] - y) / (previousY - y) + x;
+          if (intersects) inside = !inside;
+        }
+        return inside;
+      };
+      const strokeInsideRegion = (annotation, polygon) => {
+        if (!annotation.points?.length || isRegion(annotation)) return false;
+        const insideCount = annotation.points.filter(point => pointInPolygon(point, polygon)).length;
+        return pointInPolygon(centroid(annotation.points), polygon)
+          || insideCount / annotation.points.length >= .5;
+      };
+      const reassignRegion = regionIndex => {
+        const label = labelInput.value.trim();
+        if (!/^\d+$/.test(label)) {
+          updateToolStatus('请先填入数字部件 ID，再点击需要改写的部件圈');
+          labelInput.focus();
+          return;
+        }
+        const region = annotations[regionIndex];
+        const strokeIndices = annotations
+          .map((annotation, index) => strokeInsideRegion(annotation, region.points) ? index : -1)
+          .filter(index => index >= 0);
+        mutate(() => {
+          for (const index of [regionIndex, ...strokeIndices]) {
+            annotations[index].label = label;
+            annotations[index].color = colorInput.value;
+          }
+        });
+        updateToolStatus(`已把部件圈及其范围内 ${strokeIndices.length} 笔改为 ${label}；可撤销`);
+      };
       const appendAnnotation = (annotation, index, preview = false) => {
         if (!annotation.points.length) return;
         let shape;
@@ -1180,9 +1227,13 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         if (!preview) {
           shape.dataset.annotationIndex = String(index);
           shape.addEventListener('pointerdown', event => {
-            if (tool !== 'erase') return;
-            event.stopPropagation();
-            mutate(() => annotations.splice(Number(shape.dataset.annotationIndex), 1));
+            if (tool === 'erase') {
+              event.stopPropagation();
+              mutate(() => annotations.splice(Number(shape.dataset.annotationIndex), 1));
+            } else if (tool === 'relabel' && isRegion(annotation)) {
+              event.stopPropagation();
+              reassignRegion(Number(shape.dataset.annotationIndex));
+            }
           });
         }
         layer.append(shape);
@@ -1406,7 +1457,12 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         render();
         updateToolStatus('未达到两个点，已取消');
       };
-      const placeLinearPoint = point => {
+      const placeLinearPoint = (rawPoint, constrained = false) => {
+        let point = rawPoint;
+        const previousFixedPoint = pointDraft?.fixedPoints?.at(-1);
+        if (constrained && previousFixedPoint) {
+          point = constrainDirection(point, previousFixedPoint);
+        }
         if (!pointDraft) {
           pointDraft = draftAnnotation(tool, [point]);
           pointDraft.fixedPoints = [point];
@@ -1437,7 +1493,10 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         if (event.button !== 0) return;
         if (['line', 'polyline', 'polygon'].includes(tool)) {
           event.preventDefault();
-          placeLinearPoint(drawingPoint(event));
+          placeLinearPoint(
+            drawingPoint(event),
+            event.shiftKey && ['line', 'polyline'].includes(tool),
+          );
           return;
         }
         if (tool === 'bezier') {
@@ -1514,6 +1573,9 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         if (!current) {
           if (['line', 'polyline', 'polygon', 'bezier'].includes(tool) && pointDraft) {
             previewPoint = drawingPoint(event);
+            if (event.shiftKey && ['line', 'polyline'].includes(tool)) {
+              previewPoint = constrainDirection(previewPoint, pointDraft.fixedPoints.at(-1));
+            }
             if (tool === 'line') pointDraft.points = [pointDraft.points[0], previewPoint];
             else if (['polyline', 'polygon'].includes(tool)) pointDraft.points = [...pointDraft.fixedPoints, previewPoint];
             else updateBezierDraft(pointDraft, previewPoint);
@@ -1563,19 +1625,36 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         finishPointDraft();
       });
 
-      const selectTool = nextTool => {
-        const cancel = tool === nextTool;
+      const selectTool = (nextTool, allowToggle = true) => {
+        const cancel = allowToggle && tool === nextTool;
         tool = cancel ? null : nextTool;
         current = null;
         pointDraft = null;
         previewPoint = null;
         penDrag = null;
         document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item.dataset.tool === tool));
-        board.style.cursor = tool === 'erase' ? 'not-allowed' : 'crosshair';
+        board.style.cursor = tool === 'erase' ? 'not-allowed' : tool === 'relabel' ? 'alias' : 'crosshair';
         render();
         updateToolStatus(cancel ? '再次按同一快捷键可重新激活' : '已激活');
       };
       document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => selectTool(button.dataset.tool)));
+      const updateLabelFollowupButton = () => {
+        const label = labelFollowupTool === 'polygon' ? '多边形圈' : '折线';
+        labelFollowupButton.innerHTML = `标签后→${label} <kbd>T</kbd>`;
+        labelFollowupButton.title = `标签变化后自动切换到${label}；点击或按 T 切换偏好`;
+      };
+      labelFollowupButton.onclick = () => {
+        labelFollowupTool = labelFollowupTool === 'polygon' ? 'polyline' : 'polygon';
+        localStorage.setItem(labelFollowupPreferenceKey, labelFollowupTool);
+        updateLabelFollowupButton();
+        updateToolStatus(`标签后自动工具已改为${labelFollowupTool === 'polygon' ? '多边形圈' : '折线'}`);
+      };
+      labelInput.addEventListener('input', () => {
+        if (!labelInput.value.trim()) return;
+        selectTool(labelFollowupTool, false);
+        updateToolStatus(`标签已变化；按偏好自动切换到${labelFollowupTool === 'polygon' ? '多边形圈' : '折线'}`);
+      });
+      updateLabelFollowupButton();
       const undo = () => {
         if (!history.length) return;
         future.push(structuredClone(annotations));
@@ -1828,7 +1907,7 @@ def build_html(
     )
     registry: dict[str, dict] = {}
     result = evidence_for_record(evidence, record["unicode"], record["source"])
-    ranked = rank_candidates(row, result, evidence)
+    ranked = rank_candidates(row, result, evidence, selected_glyph_id=glyph_id)
     sources_by_glyph: dict[int, list[str]] = {}
     for source, candidate_id in row.get("sourceGlyphs", {}).items():
         sources_by_glyph.setdefault(int(candidate_id), []).append(source)
@@ -1962,7 +2041,7 @@ def build_html(
     *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#0284c7;color:#082f49;box-shadow:inset 0 0 0 1px #0369a1}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.node{{pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:7px;background:#f8fafc;border-bottom:1px solid #cbd5e1;display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}}.tool-group{{position:relative;display:inline-flex;align-items:center;gap:4px;padding:17px 6px 5px;border:2px solid #cbd5e1;border-radius:8px;background:#fff}}.tool-group .group-title{{position:absolute;top:2px;left:7px;font-size:9px;font-weight:700;color:#475569;letter-spacing:.04em}}.draw-group{{border-color:#fda4af;background:#fff1f2}}.precision-group{{border-color:#93c5fd;background:#eff6ff}}.component-group{{border-color:#c4b5fd;background:#f5f3ff}}.history-group{{border-color:#86efac;background:#f0fdf4}}.file-group{{border-color:#fcd34d;background:#fffbeb}}.toolbar button{{font-size:11px;padding:4px 6px;margin:0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:0;font-size:11px}}.toolbar input[type=text]{{width:92px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}kbd{{font:700 9px/1 monospace;padding:2px 3px;border:1px solid #94a3b8;border-bottom-width:2px;border-radius:3px;background:#fff;color:#334155}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.draft-handle,.draft-handle-number,.draft-preview-handle,.draft-guide{{pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#tool-status{{padding:6px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:330px;max-width:520px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.hierarchy-row b,.picker-option b{{white-space:nowrap;align-self:center}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
     </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供引用树，人工标注可提供真实笔画与部件边界。</div><div class="warning">{html.escape(warning)}</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按逐笔槽着色</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
     <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
-    <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><span class="tool-group draw-group"><span class="group-title">自由绘制</span><button type="button" data-tool="freehand" data-shortcut="f" class="active">自由线 <kbd>F</kbd></button><button type="button" data-tool="erase" data-shortcut="d">删除 <kbd>D</kbd></button><label>颜色 <kbd>K</kbd><input id="annotation-color" data-focus-shortcut="k" type="color" value="#ef4444"></label></span><span class="tool-group precision-group"><span class="group-title">精确路径</span><button type="button" data-tool="line" data-shortcut="l">直线 <kbd>L</kbd></button><button type="button" data-tool="polyline" data-shortcut="p">折线 <kbd>P</kbd></button><button type="button" data-tool="bezier" data-shortcut="b">钢笔路径 <kbd>B</kbd></button></span><span class="tool-group component-group"><span class="group-title">部件归属</span><button type="button" data-tool="lasso" data-shortcut="c">自由圈 <kbd>C</kbd></button><button type="button" data-tool="polygon" data-shortcut="o">多边形圈 <kbd>O</kbd></button><label>部件标签 <kbd>Q</kbd><input id="component-label" data-focus-shortcut="q" type="text" placeholder="点上方候选"></label></span><span class="tool-group history-group"><span class="group-title">历史</span><button type="button" id="undo-annotation" data-action data-shortcut="u">撤销 <kbd>U</kbd></button><button type="button" id="redo-annotation" data-action data-shortcut="r">重做 <kbd>R</kbd></button><button type="button" id="clear-annotations" data-action data-shortcut="x">清空 <kbd>X</kbd></button></span><span class="tool-group file-group"><span class="group-title">文件</span><button type="button" id="export-annotations" data-action data-shortcut="s">导出 <kbd>S</kbd></button><button type="button" id="import-annotations" data-action data-shortcut="i">导入 <kbd>I</kbd></button><input id="annotation-file" type="file" accept="application/json" hidden></span></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="tool-status"></div><div id="annotation-status"></div><div class="help-box"><b>工具键：</b>F 自由线；D 删除；K 颜色；L 直线；P 折线；B 钢笔路径；C 自由圈；O 多边形圈；Q 标签；U/R 撤销/重做；X 清空；S/I 导出/导入。多边形圈：逐点单击，Enter 或右键自动闭合。钢笔：单击自动平滑锚点，Alt+单击角锚点，拖动建立方向手柄，Shift 约束 45°；Enter 或右键结束整笔。再次按当前工具键可取消；Esc 取消未完成内容。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
+    <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><span class="tool-group draw-group"><span class="group-title">自由绘制</span><button type="button" data-tool="freehand" data-shortcut="f" class="active">自由线 <kbd>F</kbd></button><button type="button" data-tool="erase" data-shortcut="d">删除 <kbd>D</kbd></button><label>颜色 <kbd>K</kbd><input id="annotation-color" data-focus-shortcut="k" type="color" value="#ef4444"></label></span><span class="tool-group precision-group"><span class="group-title">精确路径</span><button type="button" data-tool="line" data-shortcut="l">直线 <kbd>L</kbd></button><button type="button" data-tool="polyline" data-shortcut="p">折线 <kbd>P</kbd></button><button type="button" data-tool="bezier" data-shortcut="b">钢笔路径 <kbd>B</kbd></button><button type="button" id="label-followup-toggle" data-action data-shortcut="t">标签后→多边形圈 <kbd>T</kbd></button></span><span class="tool-group component-group"><span class="group-title">部件归属</span><button type="button" data-tool="lasso" data-shortcut="c">自由圈 <kbd>C</kbd></button><button type="button" data-tool="polygon" data-shortcut="o">多边形圈 <kbd>O</kbd></button><button type="button" data-tool="relabel" data-shortcut="a">重标部件 <kbd>A</kbd></button><label>部件标签 <kbd>Q</kbd><input id="component-label" data-focus-shortcut="q" type="text" placeholder="点上方候选"></label></span><span class="tool-group history-group"><span class="group-title">历史</span><button type="button" id="undo-annotation" data-action data-shortcut="u">撤销 <kbd>U</kbd></button><button type="button" id="redo-annotation" data-action data-shortcut="r">重做 <kbd>R</kbd></button><button type="button" id="clear-annotations" data-action data-shortcut="x">清空 <kbd>X</kbd></button></span><span class="tool-group file-group"><span class="group-title">文件</span><button type="button" id="export-annotations" data-action data-shortcut="s">导出 <kbd>S</kbd></button><button type="button" id="import-annotations" data-action data-shortcut="i">导入 <kbd>I</kbd></button><input id="annotation-file" type="file" accept="application/json" hidden></span></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="tool-status"></div><div id="annotation-status"></div><div class="help-box"><b>工具键：</b>F 自由线；D 删除；K 颜色；L 直线；P 折线；B 钢笔路径；C 自由圈；O 多边形圈；A 重标部件；T 切换标签后的自动工具；Q 标签；U/R 撤销/重做；X 清空；S/I 导出/导入。重标：填入正确 ID，按 A 后点击既有部件圈，将同时改写圈及圈内笔画。直线/折线按住 Shift 约束为 45° 档位。多边形圈：逐点单击，Enter 或右键自动闭合。钢笔：单击自动平滑锚点，Alt+单击角锚点，拖动建立方向手柄，Shift 约束 45°；Enter 或右键结束整笔。再次按当前工具键可取消；Esc 取消未完成内容。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
     </main><div id="hierarchy-tip" class="hierarchy-float" hidden></div><div id="component-picker" class="hierarchy-float" hidden></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
     document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode'),sourceButton=document.querySelector('#source-view-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};sourceButton.onclick=()=>{{document.body.classList.toggle('original-source-mode');sourceButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
