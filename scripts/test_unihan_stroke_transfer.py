@@ -29,6 +29,8 @@ class StrokeTransferTest(unittest.TestCase):
         self.assertNotIn("board.addEventListener('click', event =>", script)
         self.assertIn("incomingHandleLength = vectorLength(incoming) / 3", script)
         self.assertIn("outgoingHandleLength = vectorLength(outgoing) / 3", script)
+        self.assertIn("polygon: '多边形圈：逐点单击；Enter 或右键自动闭合'", script)
+        self.assertIn("['line', 'polyline', 'polygon'].includes(tool)", script)
 
     def test_directed_stroke_features_change_when_arc_is_reversed(self):
         forward = np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]])
@@ -107,7 +109,7 @@ class StrokeTransferTest(unittest.TestCase):
             "annotations": [
                 {"type": "line", "label": "133", "color": "#000000", "points": [[10, 20], [30, 40]]},
                 {"type": "freehand", "label": "133", "color": "#000000", "points": [[50, 60], [70, 80]]},
-                {"type": "lasso", "label": "133", "color": "#000000", "points": [[5, 5], [90, 5], [90, 90]]},
+                {"type": "polygon", "label": "133", "color": "#000000", "points": [[5, 5], [90, 5], [90, 90]]},
             ],
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -143,7 +145,7 @@ class StrokeTransferTest(unittest.TestCase):
         strokes = [{"componentId": 10}, {"componentId": 20}]
         annotations = [
             {"type": "lasso", "label": "10", "points": [[0, 0], [100, 0], [100, 45], [0, 45]]},
-            {"type": "lasso", "label": "20", "points": [[0, 55], [100, 55], [100, 100], [0, 100]]},
+            {"type": "polygon", "label": "20", "points": [[0, 55], [100, 55], [100, 100], [0, 100]]},
         ]
         masks, _ambiguous, metrics = MODULE.partition_human_truth(
             target, centerlines, strokes, annotations, 32
@@ -154,7 +156,9 @@ class StrokeTransferTest(unittest.TestCase):
         self.assertTrue(masks[0][8, 8])
         self.assertTrue(masks[1][24, 8])
         self.assertEqual(metrics["humanComponentIds"], [10, 20])
-        self.assertEqual(metrics["humanLassoCount"], 2)
+        self.assertEqual(metrics["humanRegionCount"], 2)
+        self.assertEqual(metrics["humanLassoCount"], 1)
+        self.assertEqual(metrics["humanPolygonCount"], 1)
 
     def test_samples_relative_lines_and_cubic_without_control_points(self):
         points = MODULE.sample_svg_centerline("M 1 2 h 3 v 4 c 1 0 2 1 3 2", curve_steps=4)
