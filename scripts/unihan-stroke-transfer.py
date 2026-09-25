@@ -1066,6 +1066,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       const board = document.querySelector('#annotation-board');
       const layer = document.querySelector('#annotation-layer');
       const status = document.querySelector('#annotation-status');
+      const toolStatus = document.querySelector('#tool-status');
       const labelInput = document.querySelector('#component-label');
       const colorInput = document.querySelector('#annotation-color');
       const fileInput = document.querySelector('#annotation-file');
@@ -1073,6 +1074,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       let current = null;
       let pointDraft = null;
       let previewPoint = null;
+      let penDrag = null;
       let annotations = initialAnnotations;
       let history = [];
       let future = [];
@@ -1108,6 +1110,18 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         const regions = annotations.filter(item => item.type === 'lasso').length;
         status.innerHTML = `<b>人工真值：</b>${strokes} 笔，${regions} 个部件圈。PDF 的真实笔数现在由你的 ${strokes} 条中心线定义。`;
       };
+      const toolNames = {
+        freehand: '自由线：按住左键拖动，松开完成',
+        line: '直线：点击起点，再点击终点',
+        polyline: '折线：逐点单击；Enter、双击或右键完成',
+        bezier: '钢笔路径：单击角锚点；按下拖动平滑锚点；Alt+拖动断开手柄',
+        lasso: '圈部件：按住左键沿边界描画，松开完成',
+        erase: '删除：点击已有笔画或部件圈',
+      };
+      const updateToolStatus = (detail = '') => {
+        const base = tool ? toolNames[tool] : '工具已取消；按快捷键或点击按钮重新激活';
+        toolStatus.innerHTML = `<b>当前工具：</b>${base}${detail ? `；${detail}` : ''}`;
+      };
       const checkpoint = () => {
         history.push(structuredClone(annotations));
         if (history.length > 100) history.shift();
@@ -1132,10 +1146,13 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
             'fill-opacity': preview ? '.08' : '.16', stroke: annotation.color,
             'stroke-width': '.55', 'stroke-dasharray': '1.2 .7',
           });
-        } else if (annotation.type === 'bezier' && annotation.controlPoints?.length === 4) {
-          const [start, control1, control2, end] = annotation.controlPoints;
+        } else if (annotation.type === 'bezier' && (annotation.bezierSegments?.length || annotation.controlPoints?.length === 4)) {
+          const segments = annotation.bezierSegments || [annotation.controlPoints];
+          const commands = segments.map(([start, control1, control2, end], index) =>
+            `${index ? '' : `M ${start.join(' ')}`} C ${control1.join(' ')} ${control2.join(' ')} ${end.join(' ')}`
+          ).join(' ');
           shape = svgElement('path', {
-            d: `M ${start.join(' ')} C ${control1.join(' ')} ${control2.join(' ')} ${end.join(' ')}`,
+            d: commands,
             fill: 'none', stroke: annotation.color, 'stroke-width': '1.05',
             'stroke-linecap': 'round', 'stroke-linejoin': 'round',
           });
@@ -1169,7 +1186,74 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         layer.replaceChildren();
         annotations.forEach((annotation, index) => appendAnnotation(annotation, index));
         if (current) appendAnnotation(current, -1, true);
-        if (pointDraft) appendAnnotation(pointDraft, -1, true);
+        if (pointDraft) {
+          appendAnnotation(pointDraft, -1, true);
+          const fixed = pointDraft.fixedPoints || [];
+          if (pointDraft.type === 'bezier') {
+            for (const [index, anchor] of (pointDraft.anchors || []).entries()) {
+              for (const [handleKind, handle] of [['in', anchor.inHandle], ['out', anchor.outHandle]].filter(([, value]) => Boolean(value))) {
+                layer.append(svgElement('line', {
+                  x1: anchor.point[0], y1: anchor.point[1], x2: handle[0], y2: handle[1],
+                  stroke: pointDraft.color, 'stroke-width': '.32', 'stroke-dasharray': '.8 .55',
+                  opacity: '.8', class: 'draft-guide',
+                }));
+                const handleNode = svgElement('circle', {
+                  cx: handle[0], cy: handle[1], r: '.8', fill: '#fff',
+                  stroke: pointDraft.color, 'stroke-width': '.4', class: 'draft-direction-handle',
+                });
+                handleNode.style.cursor = 'grab';
+                handleNode.addEventListener('pointerdown', event => {
+                  event.stopPropagation();
+                  board.setPointerCapture(event.pointerId);
+                  penDrag = {mode: handleKind, pointerId: event.pointerId, anchorIndex: index, moved: true};
+                });
+                layer.append(handleNode);
+              }
+              const anchorNode = svgElement('rect', {
+                x: anchor.point[0] - 1.15, y: anchor.point[1] - 1.15,
+                width: '2.3', height: '2.3', rx: anchor.kind === 'smooth' ? '1.15' : '.15',
+                fill: '#fff', stroke: pointDraft.color, 'stroke-width': '.58',
+                class: `draft-anchor ${anchor.kind}`,
+              });
+              anchorNode.style.cursor = 'move';
+              anchorNode.addEventListener('pointerdown', event => {
+                event.stopPropagation();
+                board.setPointerCapture(event.pointerId);
+                penDrag = {
+                  mode: 'anchor', pointerId: event.pointerId, anchorIndex: index, moved: true,
+                  start: drawingPoint(event), original: structuredClone(anchor),
+                };
+              });
+              layer.append(anchorNode);
+              const number = svgElement('text', {
+                x: anchor.point[0], y: anchor.point[1] + .7, fill: pointDraft.color,
+                'font-size': '1.9', 'font-weight': '800', 'text-anchor': 'middle',
+                class: 'draft-handle-number',
+              });
+              number.textContent = String(index + 1);
+              layer.append(number);
+            }
+          } else fixed.forEach((point, index) => {
+              layer.append(svgElement('circle', {
+                cx: point[0], cy: point[1], r: '1.35', fill: '#fff',
+                stroke: pointDraft.color, 'stroke-width': '.55', class: 'draft-handle',
+              }));
+              const number = svgElement('text', {
+                x: point[0], y: point[1] + .72, fill: pointDraft.color,
+                'font-size': '2.1', 'font-weight': '800', 'text-anchor': 'middle',
+                class: 'draft-handle-number',
+              });
+              number.textContent = String(index + 1);
+              layer.append(number);
+            });
+          if (previewPoint) {
+            layer.append(svgElement('circle', {
+              cx: previewPoint[0], cy: previewPoint[1], r: '.8', fill: 'none',
+              stroke: pointDraft.color, 'stroke-width': '.35', 'stroke-dasharray': '.5 .4',
+              class: 'draft-preview-handle',
+            }));
+          }
+        }
       };
       const simplifyPoints = points => points.filter((point, index) => {
         if (index === 0 || index === points.length - 1) return true;
@@ -1181,37 +1265,154 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         const t = index / 40, m = 1 - t;
         return [0, 1].map(axis => m ** 3 * controls[0][axis] + 3 * m ** 2 * t * controls[1][axis] + 3 * m * t ** 2 * controls[2][axis] + t ** 3 * controls[3][axis]);
       });
+      const sampleBezierSegments = segments => segments.flatMap((segment, index) => {
+        const sampled = cubicPoints(segment);
+        return index ? sampled.slice(1) : sampled;
+      });
+      const reflectPoint = (point, around) => [2 * around[0] - point[0], 2 * around[1] - point[1]];
+      const constrainDirection = (point, origin) => {
+        const dx = point[0] - origin[0], dy = point[1] - origin[1];
+        const radius = Math.hypot(dx, dy);
+        if (!radius) return point;
+        const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * Math.PI / 4;
+        return [origin[0] + Math.cos(angle) * radius, origin[1] + Math.sin(angle) * radius];
+      };
+      const segmentsFromAnchors = anchors => anchors.slice(1).map((anchor, index) => {
+        const previous = anchors[index];
+        return [
+          previous.point,
+          previous.outHandle || previous.point,
+          anchor.inHandle || anchor.point,
+          anchor.point,
+        ];
+      });
+      const updateBezierDraft = (draft, hoverPoint = null) => {
+        const anchors = [...draft.anchors];
+        if (hoverPoint && anchors.length) {
+          anchors.push({point: hoverPoint, inHandle: null, outHandle: null, kind: 'preview'});
+        }
+        const segments = segmentsFromAnchors(anchors);
+        draft.bezierSegments = segments;
+        draft.controlPoints = segments.length === 1 ? segments[0] : undefined;
+        draft.points = sampleBezierSegments(segments);
+        if (!draft.points.length && anchors.length) draft.points = [anchors[0].point];
+      };
       const draftAnnotation = (type, points, controlPoints = undefined) => ({
         type, color: colorInput.value, label: labelInput.value.trim(), points,
         controlPoints, createdAt: new Date().toISOString(),
       });
       const finishPointDraft = () => {
         if (!pointDraft) return;
-        if (pointDraft.type === 'polyline' && pointDraft.points.length >= 2) {
-          mutate(() => annotations.push(pointDraft));
+        if (pointDraft.type === 'polyline' && pointDraft.fixedPoints.length >= 2) {
+          pointDraft.points = [...pointDraft.fixedPoints];
+          const finished = pointDraft;
+          pointDraft = null;
+          previewPoint = null;
+          mutate(() => annotations.push(finished));
+          updateToolStatus('折线已完成');
+          return;
+        }
+        if (pointDraft.type === 'bezier') {
+          const segments = segmentsFromAnchors(pointDraft.anchors || []);
+          if (segments.length && pointDraft.anchors.length >= 2) {
+            const finished = pointDraft;
+            const anchorCount = finished.anchors.length;
+            finished.bezierSegments = segments;
+            finished.controlPoints = segments.length === 1 ? segments[0] : undefined;
+            finished.points = sampleBezierSegments(segments);
+            pointDraft = null;
+            previewPoint = null;
+            mutate(() => annotations.push(finished));
+            updateToolStatus(`钢笔路径已完成：${anchorCount} 个锚点、${segments.length} 段；下一次操作将开始新笔画`);
+            return;
+          }
         }
         pointDraft = null;
         previewPoint = null;
         render();
+        updateToolStatus('未达到两个点，已取消');
       };
 
       board.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        if (tool === 'bezier') {
+          if (event.detail > 1) return;
+          const point = drawingPoint(event);
+          if (!pointDraft) {
+            pointDraft = draftAnnotation('bezier', [point]);
+            pointDraft.anchors = [];
+          }
+          const previous = pointDraft.anchors.at(-1)?.point;
+          if (previous && Math.hypot(point[0] - previous[0], point[1] - previous[1]) < .25) return;
+          const anchor = {point, inHandle: null, outHandle: null, kind: 'corner'};
+          pointDraft.anchors.push(anchor);
+          penDrag = {mode: 'new', pointerId: event.pointerId, anchorIndex: pointDraft.anchors.length - 1, origin: point, moved: false};
+          board.setPointerCapture(event.pointerId);
+          previewPoint = null;
+          updateBezierDraft(pointDraft);
+          updateToolStatus(`已放置第 ${pointDraft.anchors.length} 个锚点；拖动可建立方向手柄`);
+          render();
+          return;
+        }
         if (!['freehand', 'lasso'].includes(tool)) return;
         board.setPointerCapture(event.pointerId);
         current = draftAnnotation(tool, [drawingPoint(event)]);
         render();
       });
       board.addEventListener('pointermove', event => {
+        if (penDrag && pointDraft?.type === 'bezier') {
+          const anchor = pointDraft.anchors[penDrag.anchorIndex];
+          let handle = drawingPoint(event);
+          if (penDrag.mode === 'anchor') {
+            const dx = handle[0] - penDrag.start[0], dy = handle[1] - penDrag.start[1];
+            anchor.point = [penDrag.original.point[0] + dx, penDrag.original.point[1] + dy];
+            anchor.inHandle = penDrag.original.inHandle
+              ? [penDrag.original.inHandle[0] + dx, penDrag.original.inHandle[1] + dy]
+              : null;
+            anchor.outHandle = penDrag.original.outHandle
+              ? [penDrag.original.outHandle[0] + dx, penDrag.original.outHandle[1] + dy]
+              : null;
+            updateBezierDraft(pointDraft);
+            updateToolStatus(`正在移动第 ${penDrag.anchorIndex + 1} 个锚点及其方向手柄`);
+            render();
+            return;
+          }
+          if (event.shiftKey) handle = constrainDirection(handle, anchor.point);
+          if (penDrag.mode === 'in' || penDrag.mode === 'out') {
+            anchor[`${penDrag.mode}Handle`] = handle;
+            if (!event.altKey && anchor.kind === 'smooth') {
+              const opposite = penDrag.mode === 'in' ? 'outHandle' : 'inHandle';
+              anchor[opposite] = reflectPoint(handle, anchor.point);
+            } else if (event.altKey) {
+              anchor.kind = 'corner';
+            }
+            updateBezierDraft(pointDraft);
+            updateToolStatus(`正在调整第 ${penDrag.anchorIndex + 1} 个锚点的${penDrag.mode === 'in' ? '入' : '出'}手柄`);
+            render();
+            return;
+          }
+          if (Math.hypot(handle[0] - penDrag.origin[0], handle[1] - penDrag.origin[1]) >= .35) {
+            penDrag.moved = true;
+            if (penDrag.anchorIndex === 0) {
+              anchor.outHandle = handle;
+              anchor.inHandle = event.altKey ? null : reflectPoint(handle, anchor.point);
+            } else {
+              anchor.inHandle = handle;
+              anchor.outHandle = event.altKey ? null : reflectPoint(handle, anchor.point);
+            }
+            anchor.kind = event.altKey ? 'corner' : 'smooth';
+            updateBezierDraft(pointDraft);
+            updateToolStatus(`第 ${penDrag.anchorIndex + 1} 个锚点：${anchor.kind === 'smooth' ? '平滑点（双手柄共线）' : '角点（Alt 已断开手柄）'}`);
+            render();
+          }
+          return;
+        }
         if (!current) {
           if (['line', 'polyline', 'bezier'].includes(tool) && pointDraft) {
             previewPoint = drawingPoint(event);
             if (tool === 'line') pointDraft.points = [pointDraft.points[0], previewPoint];
             else if (tool === 'polyline') pointDraft.points = [...pointDraft.fixedPoints, previewPoint];
-            else {
-              const controls = [...pointDraft.fixedPoints, previewPoint];
-              pointDraft.controlPoints = controls;
-              pointDraft.points = controls.length === 4 ? cubicPoints(controls) : controls;
-            }
+            else updateBezierDraft(pointDraft, previewPoint);
             render();
           }
           return;
@@ -1224,6 +1425,20 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         }
       });
       const finish = event => {
+        if (penDrag) {
+          if (board.hasPointerCapture(event.pointerId)) board.releasePointerCapture(event.pointerId);
+          const anchor = pointDraft?.anchors?.[penDrag.anchorIndex];
+          updateToolStatus(
+            penDrag.moved
+              ? `第 ${penDrag.anchorIndex + 1} 个${anchor?.kind === 'smooth' ? '平滑锚点' : '角锚点'}已固定；继续单击或拖动添加锚点`
+              : `第 ${penDrag.anchorIndex + 1} 个角锚点已固定；继续添加锚点`
+          );
+          penDrag = null;
+          previewPoint = null;
+          updateBezierDraft(pointDraft);
+          render();
+          return;
+        }
         if (!current) return;
         if (board.hasPointerCapture(event.pointerId)) board.releasePointerCapture(event.pointerId);
         current.points = simplifyPoints(current.points);
@@ -1240,42 +1455,55 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       board.addEventListener('pointercancel', finish);
 
       board.addEventListener('click', event => {
-        if (!['line', 'polyline', 'bezier'].includes(tool) || event.detail > 1) return;
+        if (!['line', 'polyline'].includes(tool) || event.detail > 1) return;
         const point = drawingPoint(event);
         if (!pointDraft) {
           pointDraft = draftAnnotation(tool, [point]);
           pointDraft.fixedPoints = [point];
         } else {
-          pointDraft.fixedPoints.push(point);
+          const previous = pointDraft.fixedPoints.at(-1);
+          if (!previous || Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .2) {
+            pointDraft.fixedPoints.push(point);
+          }
         }
         if (tool === 'line' && pointDraft.fixedPoints.length === 2) {
           pointDraft.points = [...pointDraft.fixedPoints];
           const finished = pointDraft;
           mutate(() => annotations.push(finished));
           pointDraft = null;
-        } else if (tool === 'bezier' && pointDraft.fixedPoints.length === 4) {
-          pointDraft.controlPoints = [...pointDraft.fixedPoints];
-          pointDraft.points = cubicPoints(pointDraft.controlPoints);
-          const finished = pointDraft;
-          mutate(() => annotations.push(finished));
-          pointDraft = null;
+          previewPoint = null;
+          updateToolStatus('直线已完成；下一次点击将开始新直线');
+        } else if (tool === 'line') {
+          updateToolStatus('已固定点 1/2；请点击终点');
+        } else if (tool === 'polyline') {
+          updateToolStatus(`已固定 ${pointDraft.fixedPoints.length} 个点；继续点击，完成时按 Enter、双击或右键`);
         }
         render();
       });
       board.addEventListener('dblclick', event => {
-        if (tool !== 'polyline') return;
+        if (!['polyline', 'bezier'].includes(tool)) return;
+        event.preventDefault();
+        finishPointDraft();
+      });
+      board.addEventListener('contextmenu', event => {
+        if (!['polyline', 'bezier'].includes(tool) || !pointDraft) return;
         event.preventDefault();
         finishPointDraft();
       });
 
-      document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => {
-        tool = button.dataset.tool;
+      const selectTool = nextTool => {
+        const cancel = tool === nextTool;
+        tool = cancel ? null : nextTool;
         current = null;
         pointDraft = null;
         previewPoint = null;
-        document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item === button));
+        penDrag = null;
+        document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item.dataset.tool === tool));
         board.style.cursor = tool === 'erase' ? 'not-allowed' : 'crosshair';
-      }));
+        render();
+        updateToolStatus(cancel ? '再次按同一快捷键可重新激活' : '已激活');
+      };
+      document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => selectTool(button.dataset.tool)));
       const undo = () => {
         if (!history.length) return;
         future.push(structuredClone(annotations));
@@ -1296,6 +1524,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         }
       };
       document.addEventListener('keydown', event => {
+        const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
         const modifier = event.ctrlKey || event.metaKey;
         if (modifier && event.key.toLowerCase() === 'z') {
           event.preventDefault();
@@ -1303,9 +1532,24 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         } else if (modifier && event.key.toLowerCase() === 'y') {
           event.preventDefault(); redo();
         } else if (event.key === 'Escape') {
-          current = null; pointDraft = null; previewPoint = null; render();
-        } else if (event.key === 'Enter' && tool === 'polyline') {
+          current = null; pointDraft = null; previewPoint = null; penDrag = null; render();
+          updateToolStatus('未完成笔画已取消');
+        } else if (event.key === 'Enter' && ['polyline', 'bezier'].includes(tool)) {
           event.preventDefault(); finishPointDraft();
+        } else if (!modifier && !event.altKey && !editing) {
+          const key = event.key.toLowerCase();
+          const toolButton = document.querySelector(`[data-tool][data-shortcut="${key}"]`);
+          if (toolButton) {
+            event.preventDefault(); selectTool(toolButton.dataset.tool);
+          } else {
+            const action = document.querySelector(`[data-action][data-shortcut="${key}"]`);
+            if (action) { event.preventDefault(); action.click(); }
+            const focus = document.querySelector(`[data-focus-shortcut="${key}"]`);
+            if (focus) {
+              event.preventDefault();
+              if (focus.type === 'color' && focus.showPicker) focus.showPicker(); else focus.focus();
+            }
+          }
         }
       });
       document.querySelector('#export-annotations').onclick = () => {
@@ -1333,6 +1577,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       });
       persist();
       render();
+      updateToolStatus('已激活');
     })();
     '''.replace("__METADATA__", payload).replace("__INITIAL_ANNOTATIONS__", initial_payload)
 
@@ -1637,10 +1882,10 @@ def build_html(
         or "无 ID 纠正"
     )
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
-    *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#38bdf8}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.node{{pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:0 8px 7px;background:#f8fafc;border-bottom:1px solid #cbd5e1}}.toolbar button{{font-size:11px;padding:4px 6px;margin:6px 3px 0 0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:6px 4px 0 0;font-size:11px}}.toolbar input[type=text]{{width:112px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:330px;max-width:520px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.hierarchy-row b,.picker-option b{{white-space:nowrap;align-self:center}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
+    *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#0284c7;color:#082f49;box-shadow:inset 0 0 0 1px #0369a1}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.node{{pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:7px;background:#f8fafc;border-bottom:1px solid #cbd5e1;display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}}.tool-group{{position:relative;display:inline-flex;align-items:center;gap:4px;padding:17px 6px 5px;border:2px solid #cbd5e1;border-radius:8px;background:#fff}}.tool-group .group-title{{position:absolute;top:2px;left:7px;font-size:9px;font-weight:700;color:#475569;letter-spacing:.04em}}.draw-group{{border-color:#fda4af;background:#fff1f2}}.precision-group{{border-color:#93c5fd;background:#eff6ff}}.component-group{{border-color:#c4b5fd;background:#f5f3ff}}.history-group{{border-color:#86efac;background:#f0fdf4}}.file-group{{border-color:#fcd34d;background:#fffbeb}}.toolbar button{{font-size:11px;padding:4px 6px;margin:0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:0;font-size:11px}}.toolbar input[type=text]{{width:92px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}kbd{{font:700 9px/1 monospace;padding:2px 3px;border:1px solid #94a3b8;border-bottom-width:2px;border-radius:3px;background:#fff;color:#334155}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.draft-handle,.draft-handle-number,.draft-preview-handle,.draft-guide{{pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#tool-status{{padding:6px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:330px;max-width:520px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.hierarchy-row b,.picker-option b{{white-space:nowrap;align-self:center}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
     </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供引用树，人工标注可提供真实笔画与部件边界。</div><div class="warning">{html.escape(warning)}</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按逐笔槽着色</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
     <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
-    <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><button type="button" data-tool="freehand" class="active">自由线</button><button type="button" data-tool="line">直线</button><button type="button" data-tool="polyline">折线</button><button type="button" data-tool="bezier">贝塞尔</button><button type="button" data-tool="lasso">圈部件</button><button type="button" data-tool="erase">删除</button><label>部件标签 <input id="component-label" type="text" placeholder="点上方候选"></label><label>颜色 <input id="annotation-color" type="color" value="#ef4444"></label><button type="button" id="undo-annotation">撤销</button><button type="button" id="redo-annotation">重做</button><button type="button" id="clear-annotations">清空</button><button type="button" id="export-annotations">导出</button><button type="button" id="import-annotations">导入</button><input id="annotation-file" type="file" accept="application/json" hidden></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="annotation-status"></div><div class="help-box"><b>快捷键：</b>Ctrl+Z 撤销；Ctrl+Y / Ctrl+Shift+Z 重做；Esc 取消当前线；折线按 Enter 或双击完成。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
+    <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><span class="tool-group draw-group"><span class="group-title">自由绘制</span><button type="button" data-tool="freehand" data-shortcut="f" class="active">自由线 <kbd>F</kbd></button><button type="button" data-tool="erase" data-shortcut="d">删除 <kbd>D</kbd></button><label>颜色 <kbd>K</kbd><input id="annotation-color" data-focus-shortcut="k" type="color" value="#ef4444"></label></span><span class="tool-group precision-group"><span class="group-title">精确路径</span><button type="button" data-tool="line" data-shortcut="l">直线 <kbd>L</kbd></button><button type="button" data-tool="polyline" data-shortcut="p">折线 <kbd>P</kbd></button><button type="button" data-tool="bezier" data-shortcut="b">钢笔路径 <kbd>B</kbd></button></span><span class="tool-group component-group"><span class="group-title">部件归属</span><button type="button" data-tool="lasso" data-shortcut="c">圈部件 <kbd>C</kbd></button><label>部件标签 <kbd>Q</kbd><input id="component-label" data-focus-shortcut="q" type="text" placeholder="点上方候选"></label></span><span class="tool-group history-group"><span class="group-title">历史</span><button type="button" id="undo-annotation" data-action data-shortcut="u">撤销 <kbd>U</kbd></button><button type="button" id="redo-annotation" data-action data-shortcut="r">重做 <kbd>R</kbd></button><button type="button" id="clear-annotations" data-action data-shortcut="x">清空 <kbd>X</kbd></button></span><span class="tool-group file-group"><span class="group-title">文件</span><button type="button" id="export-annotations" data-action data-shortcut="s">导出 <kbd>S</kbd></button><button type="button" id="import-annotations" data-action data-shortcut="i">导入 <kbd>I</kbd></button><input id="annotation-file" type="file" accept="application/json" hidden></span></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="tool-status"></div><div id="annotation-status"></div><div class="help-box"><b>工具键：</b>F 自由线；D 删除；K 颜色；L 直线；P 折线；B 钢笔路径；C 圈部件；Q 标签；U/R 撤销/重做；X 清空；S/I 导出/导入。钢笔：单击角锚点，拖动平滑锚点，Alt+拖动断开手柄，Shift 约束 45°；Enter、双击或右键结束整笔。再次按当前工具键可取消；Esc 取消未完成笔画。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
     </main><div id="hierarchy-tip" class="hierarchy-float" hidden></div><div id="component-picker" class="hierarchy-float" hidden></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
     document.querySelectorAll('.source-fit,.source-mask-fit').forEach(fit);const componentButton=document.querySelector('#component-mode'),strokeButton=document.querySelector('#stroke-mode'),nodeButton=document.querySelector('#node-mode'),sourceButton=document.querySelector('#source-view-mode');componentButton.onclick=()=>{{document.body.classList.remove('stroke-mode');componentButton.classList.add('active');strokeButton.classList.remove('active')}};strokeButton.onclick=()=>{{document.body.classList.add('stroke-mode');strokeButton.classList.add('active');componentButton.classList.remove('active')}};nodeButton.onclick=()=>{{document.body.classList.toggle('nodes-hidden');nodeButton.classList.toggle('active')}};sourceButton.onclick=()=>{{document.body.classList.toggle('original-source-mode');sourceButton.classList.toggle('active')}};if(new URLSearchParams(location.search).get('mode')==='stroke')strokeButton.click();
