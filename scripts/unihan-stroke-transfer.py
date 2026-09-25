@@ -1113,8 +1113,8 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       const toolNames = {
         freehand: '自由线：按住左键拖动，松开完成',
         line: '直线：点击起点，再点击终点',
-        polyline: '折线：逐点单击；Enter、双击或右键完成',
-        bezier: '钢笔路径：单击角锚点；按下拖动平滑锚点；Alt+拖动断开手柄',
+        polyline: '折线：每次左键只落一个点；Enter 或右键完成',
+        bezier: '钢笔路径：单击自动平滑锚点；Alt+单击角锚点；拖动可明确方向手柄',
         lasso: '圈部件：按住左键沿边界描画，松开完成',
         erase: '删除：点击已有笔画或部件圈',
       };
@@ -1190,7 +1190,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           appendAnnotation(pointDraft, -1, true);
           const fixed = pointDraft.fixedPoints || [];
           if (pointDraft.type === 'bezier') {
-            for (const [index, anchor] of (pointDraft.anchors || []).entries()) {
+            for (const [index, anchor] of (pointDraft.renderAnchors || pointDraft.anchors || []).entries()) {
               for (const [handleKind, handle] of [['in', anchor.inHandle], ['out', anchor.outHandle]].filter(([, value]) => Boolean(value))) {
                 layer.append(svgElement('line', {
                   x1: anchor.point[0], y1: anchor.point[1], x2: handle[0], y2: handle[1],
@@ -1205,13 +1205,19 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
                 handleNode.addEventListener('pointerdown', event => {
                   event.stopPropagation();
                   board.setPointerCapture(event.pointerId);
+                  const editable = pointDraft.anchors[index];
+                  if (editable.kind === 'auto') {
+                    editable.inHandle = anchor.inHandle ? [...anchor.inHandle] : null;
+                    editable.outHandle = anchor.outHandle ? [...anchor.outHandle] : null;
+                    editable.kind = 'smooth';
+                  }
                   penDrag = {mode: handleKind, pointerId: event.pointerId, anchorIndex: index, moved: true};
                 });
                 layer.append(handleNode);
               }
               const anchorNode = svgElement('rect', {
                 x: anchor.point[0] - 1.15, y: anchor.point[1] - 1.15,
-                width: '2.3', height: '2.3', rx: anchor.kind === 'smooth' ? '1.15' : '.15',
+                width: '2.3', height: '2.3', rx: ['smooth', 'auto'].includes(anchor.kind) ? '1.15' : '.15',
                 fill: '#fff', stroke: pointDraft.color, 'stroke-width': '.58',
                 class: `draft-anchor ${anchor.kind}`,
               });
@@ -1221,7 +1227,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
                 board.setPointerCapture(event.pointerId);
                 penDrag = {
                   mode: 'anchor', pointerId: event.pointerId, anchorIndex: index, moved: true,
-                  start: drawingPoint(event), original: structuredClone(anchor),
+                  start: drawingPoint(event), original: structuredClone(pointDraft.anchors[index]),
                 };
               });
               layer.append(anchorNode);
@@ -1277,6 +1283,30 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * Math.PI / 4;
         return [origin[0] + Math.cos(angle) * radius, origin[1] + Math.sin(angle) * radius];
       };
+      const resolveAutomaticHandles = anchors => anchors.map((source, index) => {
+        const anchor = structuredClone(source);
+        if (anchor.kind !== 'auto' || anchors.length < 2) return anchor;
+        const previous = anchors[Math.max(0, index - 1)].point;
+        const next = anchors[Math.min(anchors.length - 1, index + 1)].point;
+        if (index === 0) {
+          anchor.inHandle = null;
+          anchor.outHandle = [
+            anchor.point[0] + (next[0] - anchor.point[0]) / 3,
+            anchor.point[1] + (next[1] - anchor.point[1]) / 3,
+          ];
+        } else if (index === anchors.length - 1) {
+          const dx = (anchor.point[0] - previous[0]) / 3;
+          const dy = (anchor.point[1] - previous[1]) / 3;
+          anchor.inHandle = [anchor.point[0] - dx, anchor.point[1] - dy];
+          anchor.outHandle = [anchor.point[0] + dx, anchor.point[1] + dy];
+        } else {
+          const dx = (next[0] - previous[0]) / 6;
+          const dy = (next[1] - previous[1]) / 6;
+          anchor.inHandle = [anchor.point[0] - dx, anchor.point[1] - dy];
+          anchor.outHandle = [anchor.point[0] + dx, anchor.point[1] + dy];
+        }
+        return anchor;
+      });
       const segmentsFromAnchors = anchors => anchors.slice(1).map((anchor, index) => {
         const previous = anchors[index];
         return [
@@ -1287,11 +1317,13 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         ];
       });
       const updateBezierDraft = (draft, hoverPoint = null) => {
-        const anchors = [...draft.anchors];
+        const anchors = draft.anchors.map(anchor => structuredClone(anchor));
         if (hoverPoint && anchors.length) {
-          anchors.push({point: hoverPoint, inHandle: null, outHandle: null, kind: 'preview'});
+          anchors.push({point: hoverPoint, inHandle: null, outHandle: null, kind: 'auto', preview: true});
         }
-        const segments = segmentsFromAnchors(anchors);
+        const resolved = resolveAutomaticHandles(anchors);
+        draft.renderAnchors = resolved.slice(0, draft.anchors.length);
+        const segments = segmentsFromAnchors(resolved);
         draft.bezierSegments = segments;
         draft.controlPoints = segments.length === 1 ? segments[0] : undefined;
         draft.points = sampleBezierSegments(segments);
@@ -1313,13 +1345,15 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           return;
         }
         if (pointDraft.type === 'bezier') {
-          const segments = segmentsFromAnchors(pointDraft.anchors || []);
+          const resolved = resolveAutomaticHandles(pointDraft.anchors || []);
+          const segments = segmentsFromAnchors(resolved);
           if (segments.length && pointDraft.anchors.length >= 2) {
             const finished = pointDraft;
             const anchorCount = finished.anchors.length;
             finished.bezierSegments = segments;
             finished.controlPoints = segments.length === 1 ? segments[0] : undefined;
             finished.points = sampleBezierSegments(segments);
+            delete finished.renderAnchors;
             pointDraft = null;
             previewPoint = null;
             mutate(() => annotations.push(finished));
@@ -1336,7 +1370,6 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       board.addEventListener('pointerdown', event => {
         if (event.button !== 0) return;
         if (tool === 'bezier') {
-          if (event.detail > 1) return;
           const point = drawingPoint(event);
           if (!pointDraft) {
             pointDraft = draftAnnotation('bezier', [point]);
@@ -1344,9 +1377,9 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           }
           const previous = pointDraft.anchors.at(-1)?.point;
           if (previous && Math.hypot(point[0] - previous[0], point[1] - previous[1]) < .25) return;
-          const anchor = {point, inHandle: null, outHandle: null, kind: 'corner'};
+          const anchor = {point, inHandle: null, outHandle: null, kind: event.altKey ? 'corner' : 'auto'};
           pointDraft.anchors.push(anchor);
-          penDrag = {mode: 'new', pointerId: event.pointerId, anchorIndex: pointDraft.anchors.length - 1, origin: point, moved: false};
+          penDrag = {mode: 'new', pointerId: event.pointerId, anchorIndex: pointDraft.anchors.length - 1, origin: point, moved: false, altKey: event.altKey};
           board.setPointerCapture(event.pointerId);
           previewPoint = null;
           updateBezierDraft(pointDraft);
@@ -1431,7 +1464,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           updateToolStatus(
             penDrag.moved
               ? `第 ${penDrag.anchorIndex + 1} 个${anchor?.kind === 'smooth' ? '平滑锚点' : '角锚点'}已固定；继续单击或拖动添加锚点`
-              : `第 ${penDrag.anchorIndex + 1} 个角锚点已固定；继续添加锚点`
+              : `第 ${penDrag.anchorIndex + 1} 个${anchor?.kind === 'auto' ? '自动平滑锚点' : '角锚点'}已固定；可直接拖动其圆形手柄调整曲率`
           );
           penDrag = null;
           previewPoint = null;
@@ -1455,7 +1488,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       board.addEventListener('pointercancel', finish);
 
       board.addEventListener('click', event => {
-        if (!['line', 'polyline'].includes(tool) || event.detail > 1) return;
+        if (!['line', 'polyline'].includes(tool)) return;
         const point = drawingPoint(event);
         if (!pointDraft) {
           pointDraft = draftAnnotation(tool, [point]);
@@ -1476,14 +1509,9 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         } else if (tool === 'line') {
           updateToolStatus('已固定点 1/2；请点击终点');
         } else if (tool === 'polyline') {
-          updateToolStatus(`已固定 ${pointDraft.fixedPoints.length} 个点；继续点击，完成时按 Enter、双击或右键`);
+          updateToolStatus(`已固定 ${pointDraft.fixedPoints.length} 个点；继续点击，完成时按 Enter 或右键`);
         }
         render();
-      });
-      board.addEventListener('dblclick', event => {
-        if (!['polyline', 'bezier'].includes(tool)) return;
-        event.preventDefault();
-        finishPointDraft();
       });
       board.addEventListener('contextmenu', event => {
         if (!['polyline', 'bezier'].includes(tool) || !pointDraft) return;
@@ -1577,6 +1605,11 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       });
       persist();
       render();
+      const helpBox = document.querySelector('.editor .help-box');
+      helpBox.innerHTML = helpBox.innerHTML.replace(
+        '钢笔：单击角锚点，拖动平滑锚点，Alt+拖动断开手柄',
+        '钢笔：单击自动平滑锚点，Alt+单击角锚点；拖动建立明确方向手柄，Alt+拖动断开手柄'
+      ).replaceAll('Enter、双击或右键', 'Enter 或右键');
       updateToolStatus('已激活');
     })();
     '''.replace("__METADATA__", payload).replace("__INITIAL_ANNOTATIONS__", initial_payload)
