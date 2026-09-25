@@ -1283,6 +1283,11 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * Math.PI / 4;
         return [origin[0] + Math.cos(angle) * radius, origin[1] + Math.sin(angle) * radius];
       };
+      const vectorLength = vector => Math.hypot(vector[0], vector[1]);
+      const unitVector = vector => {
+        const length = vectorLength(vector);
+        return length > 1e-6 ? [vector[0] / length, vector[1] / length] : [0, 0];
+      };
       const resolveAutomaticHandles = anchors => anchors.map((source, index) => {
         const anchor = structuredClone(source);
         if (anchor.kind !== 'auto' || anchors.length < 2) return anchor;
@@ -1295,15 +1300,27 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
             anchor.point[1] + (next[1] - anchor.point[1]) / 3,
           ];
         } else if (index === anchors.length - 1) {
-          const dx = (anchor.point[0] - previous[0]) / 3;
-          const dy = (anchor.point[1] - previous[1]) / 3;
-          anchor.inHandle = [anchor.point[0] - dx, anchor.point[1] - dy];
-          anchor.outHandle = [anchor.point[0] + dx, anchor.point[1] + dy];
+          anchor.inHandle = [
+            anchor.point[0] - (anchor.point[0] - previous[0]) / 3,
+            anchor.point[1] - (anchor.point[1] - previous[1]) / 3,
+          ];
+          anchor.outHandle = null;
         } else {
-          const dx = (next[0] - previous[0]) / 6;
-          const dy = (next[1] - previous[1]) / 6;
-          anchor.inHandle = [anchor.point[0] - dx, anchor.point[1] - dy];
-          anchor.outHandle = [anchor.point[0] + dx, anchor.point[1] + dy];
+          const incoming = [anchor.point[0] - previous[0], anchor.point[1] - previous[1]];
+          const outgoing = [next[0] - anchor.point[0], next[1] - anchor.point[1]];
+          const incomingUnit = unitVector(incoming), outgoingUnit = unitVector(outgoing);
+          let tangent = unitVector([incomingUnit[0] + outgoingUnit[0], incomingUnit[1] + outgoingUnit[1]]);
+          if (vectorLength(tangent) < 1e-6) tangent = outgoingUnit;
+          const incomingHandleLength = vectorLength(incoming) / 3;
+          const outgoingHandleLength = vectorLength(outgoing) / 3;
+          anchor.inHandle = [
+            anchor.point[0] - tangent[0] * incomingHandleLength,
+            anchor.point[1] - tangent[1] * incomingHandleLength,
+          ];
+          anchor.outHandle = [
+            anchor.point[0] + tangent[0] * outgoingHandleLength,
+            anchor.point[1] + tangent[1] * outgoingHandleLength,
+          ];
         }
         return anchor;
       });
@@ -1366,9 +1383,38 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         render();
         updateToolStatus('未达到两个点，已取消');
       };
+      const placeLinearPoint = point => {
+        if (!pointDraft) {
+          pointDraft = draftAnnotation(tool, [point]);
+          pointDraft.fixedPoints = [point];
+        } else {
+          const previous = pointDraft.fixedPoints.at(-1);
+          if (!previous || Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .2) {
+            pointDraft.fixedPoints.push(point);
+          }
+        }
+        if (tool === 'line' && pointDraft.fixedPoints.length === 2) {
+          pointDraft.points = [...pointDraft.fixedPoints];
+          const finished = pointDraft;
+          pointDraft = null;
+          previewPoint = null;
+          mutate(() => annotations.push(finished));
+          updateToolStatus('直线已完成；下一次按下左键将开始新直线');
+        } else if (tool === 'line') {
+          updateToolStatus('已固定点 1/2；请按下左键放置终点');
+        } else {
+          updateToolStatus(`已固定 ${pointDraft.fixedPoints.length} 个点；继续按下左键，完成时按 Enter 或右键`);
+        }
+        render();
+      };
 
       board.addEventListener('pointerdown', event => {
         if (event.button !== 0) return;
+        if (['line', 'polyline'].includes(tool)) {
+          event.preventDefault();
+          placeLinearPoint(drawingPoint(event));
+          return;
+        }
         if (tool === 'bezier') {
           const point = drawingPoint(event);
           if (!pointDraft) {
@@ -1486,33 +1532,6 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       };
       board.addEventListener('pointerup', finish);
       board.addEventListener('pointercancel', finish);
-
-      board.addEventListener('click', event => {
-        if (!['line', 'polyline'].includes(tool)) return;
-        const point = drawingPoint(event);
-        if (!pointDraft) {
-          pointDraft = draftAnnotation(tool, [point]);
-          pointDraft.fixedPoints = [point];
-        } else {
-          const previous = pointDraft.fixedPoints.at(-1);
-          if (!previous || Math.hypot(point[0] - previous[0], point[1] - previous[1]) >= .2) {
-            pointDraft.fixedPoints.push(point);
-          }
-        }
-        if (tool === 'line' && pointDraft.fixedPoints.length === 2) {
-          pointDraft.points = [...pointDraft.fixedPoints];
-          const finished = pointDraft;
-          mutate(() => annotations.push(finished));
-          pointDraft = null;
-          previewPoint = null;
-          updateToolStatus('直线已完成；下一次点击将开始新直线');
-        } else if (tool === 'line') {
-          updateToolStatus('已固定点 1/2；请点击终点');
-        } else if (tool === 'polyline') {
-          updateToolStatus(`已固定 ${pointDraft.fixedPoints.length} 个点；继续点击，完成时按 Enter 或右键`);
-        }
-        render();
-      });
       board.addEventListener('contextmenu', event => {
         if (!['polyline', 'bezier'].includes(tool) || !pointDraft) return;
         event.preventDefault();

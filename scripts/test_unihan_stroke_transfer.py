@@ -15,6 +15,21 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_annotation_editor_uses_pointerdown_and_smooth_auto_tangents(self):
+        script = MODULE.annotation_editor_script(
+            {
+                "reviewKey": "test",
+                "unicode": "U+6418",
+                "source": "G",
+                "candidateGlyphId": 17973,
+            }
+        )
+
+        self.assertIn("placeLinearPoint(drawingPoint(event))", script)
+        self.assertNotIn("board.addEventListener('click', event =>", script)
+        self.assertIn("incomingHandleLength = vectorLength(incoming) / 3", script)
+        self.assertIn("outgoingHandleLength = vectorLength(outgoing) / 3", script)
+
     def test_directed_stroke_features_change_when_arc_is_reversed(self):
         forward = np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]])
         normal = MODULE.directed_stroke_features(forward, 100)
