@@ -3,6 +3,11 @@ param(
     [Parameter(Position = 0)]
     [string]$Match = '*-annotation.html',
 
+    [ValidateRange(1, 100)]
+    [int]$Count = 1,
+
+    [switch]$All,
+
     [switch]$PrintOnly
 )
 
@@ -25,9 +30,16 @@ if ($candidatePages.Count -eq 0) {
     throw "No annotation page matching '$Match' was found in $artifactDirectory"
 }
 
-$latestPage = $candidatePages[0]
-Write-Output $latestPage.FullName
+$selectedPages = if ($All) {
+    $candidatePages
+} else {
+    @($candidatePages | Select-Object -First $Count)
+}
+
+$selectedPages | ForEach-Object { Write-Output $_.FullName }
 
 if (-not $PrintOnly) {
-    Start-Process -FilePath $latestPage.FullName
+    $selectedPages | ForEach-Object {
+        Start-Process -FilePath $_.FullName
+    }
 }
