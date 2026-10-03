@@ -238,6 +238,295 @@ def candidate_strokes(row: dict, glyph_id: int) -> list[dict]:
     return [by_index[index] for index in range(expected)]
 
 
+def merge_intersecting_annotation_strokes(
+    annotations: list[dict], first_index: int, second_index: int
+) -> list[dict]:
+    """Merge two directed same-component polylines at their first intersection."""
+    if first_index == second_index:
+        raise ValueError("stroke indices must be distinct")
+    first = annotations[first_index]
+    second = annotations[second_index]
+    if str(first.get("label")) != str(second.get("label")):
+        raise ValueError("merged strokes must have the same component label")
+    first_points = np.asarray(first.get("points", []), dtype=float)
+    second_points = np.asarray(second.get("points", []), dtype=float)
+    if len(first_points) < 2 or len(second_points) < 2:
+        raise ValueError("merged strokes must each contain at least two points")
+
+    intersection = None
+    first_segment = second_segment = None
+
+    def cross_2d(left: np.ndarray, right: np.ndarray) -> float:
+        return float(left[0] * right[1] - left[1] * right[0])
+
+    for left_index, (left_start, left_end) in enumerate(
+        zip(first_points[:-1], first_points[1:])
+    ):
+        left_vector = left_end - left_start
+        for right_index, (right_start, right_end) in enumerate(
+            zip(second_points[:-1], second_points[1:])
+        ):
+            right_vector = right_end - right_start
+            denominator = cross_2d(left_vector, right_vector)
+            if abs(denominator) < 1e-9:
+                continue
+            offset = right_start - left_start
+            left_fraction = cross_2d(offset, right_vector) / denominator
+            right_fraction = cross_2d(offset, left_vector) / denominator
+            if -1e-6 <= left_fraction <= 1 + 1e-6 and -1e-6 <= right_fraction <= 1 + 1e-6:
+                intersection = left_start + left_fraction * left_vector
+                first_segment = left_index
+                second_segment = right_index
+                break
+        if intersection is not None:
+            break
+    if intersection is None or first_segment is None or second_segment is None:
+        raise ValueError("strokes do not intersect")
+
+    points = [*first_points[: first_segment + 1], intersection]
+    points.extend(second_points[second_segment + 1 :])
+    deduplicated = [points[0]]
+    for point in points[1:]:
+        if np.linalg.norm(point - deduplicated[-1]) > 1e-6:
+            deduplicated.append(point)
+    merged = copy.deepcopy(first)
+    merged["type"] = "polyline"
+    merged["points"] = [
+        [round(float(point[0]), 12), round(float(point[1]), 12)]
+        for point in deduplicated
+    ]
+    if "fixedPoints" in merged:
+        merged["fixedPoints"] = copy.deepcopy(merged["points"])
+    output = copy.deepcopy(annotations)
+    output[first_index] = merged
+    del output[second_index]
+    return output
+
+
+def stroke_sequence_profile(strokes: list[dict]) -> dict:
+    """Describe leaf-component completion in standard stroke order.
+
+    Component IDs are not sufficient: one glyph may contain two occurrences
+    of the same leaf.  ``(componentId, occurrence)`` is therefore the unit
+    that must be opened, completed, and never re-entered.  This turns the
+    human "write until the smallest component is complete" procedure into a
+    machine-checkable sequence grammar.
+    """
+    runs = []
+    for stroke_number, stroke in enumerate(strokes, start=1):
+        has_component = "componentId" in stroke
+        key = (
+            int(stroke.get("componentId", -1)),
+            int(stroke.get("occurrence", 0 if has_component else stroke_number - 1)),
+        )
+        if not runs or runs[-1]["instanceKey"] != key:
+            runs.append(
+                {
+                    "componentId": key[0],
+                    "occurrence": key[1],
+                    "instanceKey": key,
+                    "firstStroke": stroke_number,
+                    "lastStroke": stroke_number,
+                    "strokeCount": 1,
+                    "features": [stroke.get("feature")],
+                }
+            )
+        else:
+            runs[-1]["lastStroke"] = stroke_number
+            runs[-1]["strokeCount"] += 1
+            runs[-1]["features"].append(stroke.get("feature"))
+
+    seen = set()
+    reentered = []
+    for run in runs:
+        key = run["instanceKey"]
+        if key in seen and key not in reentered:
+            reentered.append(key)
+        seen.add(key)
+    public_runs = [
+        {key: value for key, value in run.items() if key != "instanceKey"}
+        for run in runs
+    ]
+    return {
+        "strokeCount": len(strokes),
+        "componentInstanceCount": len({
+            (
+                int(stroke.get("componentId", -1)),
+                int(stroke.get("occurrence", 0 if "componentId" in stroke else index)),
+            )
+            for index, stroke in enumerate(strokes)
+        }),
+        "runs": public_runs,
+        "completionStrokes": [run["lastStroke"] for run in public_runs],
+        "sequentiallyClosed": not reentered,
+        "reenteredInstances": [
+            {"componentId": component_id, "occurrence": occurrence}
+            for component_id, occurrence in reentered
+        ],
+    }
+
+
+def candidate_catalog(rows: list[dict]) -> dict[int, list[dict]]:
+    """Index repository candidates for safe normalization of reference truth.
+
+    Exported annotations can retain a sibling ID that was selected before the
+    annotator switched to the final candidate.  The chosen candidate ID and
+    directed stroke order are already part of the export metadata, so the
+    repository candidate is the authoritative map from annotation stroke
+    number to leaf component ID.
+    """
+    catalog: dict[int, list[dict]] = {}
+    for row in rows:
+        for glyph_text in row.get("candidates", {}):
+            glyph_id = int(glyph_text)
+            if glyph_id not in catalog:
+                catalog[glyph_id] = candidate_strokes(row, glyph_id)
+    return catalog
+
+
+def reference_annotation_components(
+    path: Path,
+    reference_candidates: dict[int, list[dict]] | None = None,
+) -> tuple[dict, dict[int, list[dict]], list[dict]]:
+    """Read reference strokes and normalize labels from its chosen candidate.
+
+    This never guesses between siblings.  Normalization is enabled only when
+    the export's candidate glyph exists in the repository catalog and its
+    stroke count and directed feature sequence agree with the export metadata.
+    """
+    document = json.loads(path.read_text("utf-8-sig"))
+    metadata = document.get("metadata") or {}
+    annotations = [
+        annotation
+        for annotation in document.get("annotations", [])
+        if annotation.get("type") not in {"lasso", "polygon"}
+    ]
+    reference = None
+    glyph_id = metadata.get("candidateGlyphId")
+    if reference_candidates is not None and isinstance(glyph_id, int):
+        proposed = reference_candidates.get(glyph_id)
+        exported_order = metadata.get("candidateStrokeOrder")
+        if (
+            proposed is not None
+            and len(proposed) == len(annotations)
+            and (
+                not isinstance(exported_order, list)
+                or exported_order == [stroke.get("feature") for stroke in proposed]
+            )
+        ):
+            reference = proposed
+
+    by_component: dict[int, list[dict]] = {}
+    corrections = []
+    for index, annotation in enumerate(annotations):
+        label = str(annotation.get("label", "")).strip()
+        points = np.asarray(annotation.get("points", []), dtype=float)
+        if len(points) < 2 or points.shape[1:] != (2,):
+            continue
+        if reference is not None:
+            component_id = int(reference[index]["componentId"])
+            if label.isdigit() and int(label) != component_id:
+                corrections.append(
+                    {
+                        "strokeNumber": index + 1,
+                        "from": int(label),
+                        "to": component_id,
+                        "reason": "reference candidate stroke ownership",
+                    }
+                )
+        elif label.isdigit():
+            component_id = int(label)
+        else:
+            continue
+        by_component.setdefault(component_id, []).append(annotation)
+    return metadata, by_component, corrections
+
+
+def verified_component_coverage(
+    candidate: list[dict],
+    annotation_paths: list[Path],
+    *,
+    reference_candidates: dict[int, list[dict]] | None = None,
+    target_source: str | None = None,
+) -> dict:
+    """Report exact leaf IDs already verified by independent annotations."""
+    component_ids = {int(stroke["componentId"]) for stroke in candidate}
+    exact_ids: set[int] = set()
+    same_source_ids: set[int] = set()
+    correction_count = 0
+    for path in annotation_paths:
+        metadata, by_component, corrections = reference_annotation_components(
+            path, reference_candidates
+        )
+        matched = component_ids & set(by_component)
+        exact_ids.update(matched)
+        if (
+            target_source
+            and str(metadata.get("source", "")).upper() == target_source.upper()
+        ):
+            same_source_ids.update(matched)
+        correction_count += len(corrections)
+    return {
+        "componentIds": sorted(component_ids),
+        "verifiedExactIds": sorted(exact_ids),
+        "verifiedSameSourceExactIds": sorted(same_source_ids),
+        "normalizedReferenceLabelCorrections": correction_count,
+    }
+
+
+def compare_verified_component_coverage(
+    candidates: dict[int, list[dict]],
+    annotation_paths: list[Path],
+    *,
+    reference_candidates: dict[int, list[dict]] | None = None,
+    target_source: str | None = None,
+) -> dict:
+    """Find exact same-source leaf evidence unique to one sibling candidate."""
+    coverages = {
+        glyph_id: verified_component_coverage(
+            strokes,
+            annotation_paths,
+            reference_candidates=reference_candidates,
+            target_source=target_source,
+        )
+        for glyph_id, strokes in candidates.items()
+    }
+    component_ids = {
+        glyph_id: set(coverage["componentIds"])
+        for glyph_id, coverage in coverages.items()
+    }
+    discriminating = {}
+    for glyph_id, coverage in coverages.items():
+        other_ids = set().union(
+            *(
+                ids
+                for other_glyph_id, ids in component_ids.items()
+                if other_glyph_id != glyph_id
+            )
+        )
+        discriminating[glyph_id] = sorted(
+            set(coverage["verifiedSameSourceExactIds"]) - other_ids
+        )
+    supported = [glyph_id for glyph_id, ids in discriminating.items() if ids]
+    return {
+        "candidateCoverage": {
+            str(glyph_id): coverage for glyph_id, coverage in coverages.items()
+        },
+        "discriminatingSameSourceVerifiedIds": {
+            str(glyph_id): ids for glyph_id, ids in discriminating.items()
+        },
+        "evidenceGlyphId": supported[0] if len(supported) == 1 else None,
+        "automaticWriteEnabled": False,
+        "reason": (
+            "one candidate contains independently verified exact leaf IDs from "
+            "the same IRG source that no sibling candidate contains; this is one "
+            "evidence channel, not a decision rule"
+            if len(supported) == 1
+            else "no unique same-source exact-leaf winner"
+        ),
+    }
+
+
 def load_human_annotations(
     path: Path,
     *,
@@ -341,6 +630,304 @@ def load_human_annotations(
             }
         )
     return manual, normalized, corrections
+
+
+def transfer_verified_component_strokes(
+    candidate: list[dict],
+    annotation_paths: list[Path],
+    *,
+    target_unicode: str | None = None,
+    target_source: str | None = None,
+    reference_candidates: dict[int, list[dict]] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Replace exact leaf components with strokes from verified annotations.
+
+    This deliberately transfers only an identical component ID with an
+    identical stroke count.  Sibling IDs are not treated as interchangeable.
+    It gives deterministic, human-verified component geometry priority while
+    leaving unmatched components on the repository candidate template.
+    """
+    output = copy.deepcopy(candidate)
+    candidate_indices: dict[int, list[int]] = {}
+    for index, stroke in enumerate(output):
+        candidate_indices.setdefault(int(stroke["componentId"]), []).append(index)
+
+    transferred = []
+    claimed: set[int] = set()
+    for path in annotation_paths:
+        metadata, by_component, label_corrections = reference_annotation_components(
+            path, reference_candidates
+        )
+        same_character_and_source = bool(
+            target_unicode
+            and target_source
+            and str(metadata.get("unicode", "")).upper()
+            == target_unicode.upper()
+            and str(metadata.get("source", "")).upper() == target_source.upper()
+        )
+        for component_id, indices in candidate_indices.items():
+            references = by_component.get(component_id, [])
+            if component_id in claimed or len(references) != len(indices):
+                continue
+            if same_character_and_source:
+                source_minimum = np.zeros(2, dtype=float)
+                target_minimum = np.zeros(2, dtype=float)
+                scale = np.ones(2, dtype=float)
+            else:
+                source_points = np.concatenate(
+                    [np.asarray(annotation["points"], dtype=float) for annotation in references]
+                )
+                target_points = np.concatenate(
+                    [np.asarray(output[index]["points"], dtype=float) for index in indices]
+                )
+                source_minimum = source_points.min(axis=0)
+                source_extent = source_points.max(axis=0) - source_minimum
+                target_minimum = target_points.min(axis=0)
+                target_extent = target_points.max(axis=0) - target_minimum
+                scale = np.divide(
+                    target_extent,
+                    source_extent,
+                    out=np.ones(2, dtype=float),
+                    where=source_extent > 1e-6,
+                )
+            for index, annotation in zip(indices, references):
+                points = np.asarray(annotation["points"], dtype=float)
+                output[index]["points"] = (
+                    points - source_minimum
+                ) * scale + target_minimum
+                output[index]["verifiedTemplateSource"] = str(path)
+            claimed.add(component_id)
+            transferred.append(
+                {
+                    "componentId": component_id,
+                    "strokeCount": len(indices),
+                    "annotation": str(path),
+                    "transferMode": (
+                        "same-character-and-source-absolute"
+                        if same_character_and_source
+                        else "component-local"
+                    ),
+                    "localScale": [round(float(value), 6) for value in scale],
+                    "annotationLabelCorrections": [
+                        correction
+                        for correction in label_corrections
+                        if correction["to"] == component_id
+                    ],
+                }
+            )
+    return output, transferred
+
+
+def select_component_templates_by_alignment(
+    candidate: list[dict],
+    annotation_paths: list[Path],
+    target: np.ndarray,
+    canvas: int,
+    *,
+    target_unicode: str | None = None,
+    target_source: str | None = None,
+    reference_candidates: dict[int, list[dict]] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Choose each exact-ID component template by target reconstruction only."""
+    selected = copy.deepcopy(candidate)
+    component_indices: dict[int, list[int]] = {}
+    for index, stroke in enumerate(candidate):
+        component_indices.setdefault(int(stroke["componentId"]), []).append(index)
+
+    choices = []
+    for component_id, indices in component_indices.items():
+        variants = [
+            {
+                "kind": "repository-candidate",
+                "annotation": None,
+                "strokes": candidate,
+                "details": None,
+            }
+        ]
+        for path in annotation_paths:
+            transferred, details = transfer_verified_component_strokes(
+                candidate,
+                [path],
+                target_unicode=target_unicode,
+                target_source=target_source,
+                reference_candidates=reference_candidates,
+            )
+            detail = next(
+                (item for item in details if item["componentId"] == component_id),
+                None,
+            )
+            if detail is not None:
+                variant = copy.deepcopy(candidate)
+                for index in indices:
+                    variant[index]["points"] = transferred[index]["points"]
+                    variant[index]["verifiedTemplateSource"] = str(path)
+                variants.append(
+                    {
+                        "kind": "verified-annotation",
+                        "annotation": str(path),
+                        "strokes": variant,
+                        "details": detail,
+                    }
+                )
+
+        scored = []
+        for variant in variants:
+            metrics = candidate_alignment_metrics(
+                variant["strokes"],
+                target,
+                canvas,
+                focus_component_ids={component_id},
+            )
+            scored.append(
+                {
+                    **variant,
+                    "score": float(metrics["score"]),
+                    "metrics": {
+                        key: value
+                        for key, value in metrics.items()
+                        if key != "snapped"
+                    },
+                }
+            )
+        scored.sort(key=lambda item: (item["score"], item["kind"], item["annotation"] or ""))
+        winner = scored[0]
+        for index in indices:
+            selected[index] = copy.deepcopy(winner["strokes"][index])
+        choices.append(
+            {
+                "componentId": component_id,
+                "strokeCount": len(indices),
+                "selectedKind": winner["kind"],
+                "selectedAnnotation": winner["annotation"],
+                "selectedScore": round(winner["score"], 6),
+                "runnerUpScore": round(scored[1]["score"], 6) if len(scored) > 1 else None,
+                "margin": round(scored[1]["score"] - winner["score"], 6) if len(scored) > 1 else None,
+                "variants": [
+                    {
+                        "kind": item["kind"],
+                        "annotation": item["annotation"],
+                        "score": round(item["score"], 6),
+                    }
+                    for item in scored
+                ],
+            }
+        )
+    return selected, choices
+
+
+def search_component_templates_globally(
+    candidate: list[dict],
+    annotation_paths: list[Path],
+    target: np.ndarray,
+    canvas: int,
+    *,
+    target_unicode: str | None = None,
+    target_source: str | None = None,
+    reference_candidates: dict[int, list[dict]] | None = None,
+    beam_width: int = 8,
+) -> tuple[list[dict], dict]:
+    """Beam-search component templates using whole-glyph reconstruction error."""
+    component_indices: dict[int, list[int]] = {}
+    for index, stroke in enumerate(candidate):
+        component_indices.setdefault(int(stroke["componentId"]), []).append(index)
+
+    options_by_component: dict[int, list[dict]] = {}
+    for component_id, indices in component_indices.items():
+        options = [
+            {
+                "kind": "repository-candidate",
+                "annotation": None,
+                "points": [copy.deepcopy(candidate[index]["points"]) for index in indices],
+            }
+        ]
+        seen = {
+            hashlib.sha256(
+                np.concatenate(options[0]["points"]).astype(np.float64).tobytes()
+            ).hexdigest()
+        }
+        for path in annotation_paths:
+            transferred, details = transfer_verified_component_strokes(
+                candidate,
+                [path],
+                target_unicode=target_unicode,
+                target_source=target_source,
+                reference_candidates=reference_candidates,
+            )
+            if not any(item["componentId"] == component_id for item in details):
+                continue
+            points = [copy.deepcopy(transferred[index]["points"]) for index in indices]
+            digest = hashlib.sha256(
+                np.concatenate(points).astype(np.float64).tobytes()
+            ).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            options.append(
+                {
+                    "kind": "verified-annotation",
+                    "annotation": str(path),
+                    "points": points,
+                }
+            )
+        options_by_component[component_id] = options
+
+    beam = [{"strokes": copy.deepcopy(candidate), "choices": [], "score": math.inf}]
+    explored = 0
+    for component_id, indices in component_indices.items():
+        expanded = []
+        for state in beam:
+            for option in options_by_component[component_id]:
+                strokes = copy.deepcopy(state["strokes"])
+                for index, points in zip(indices, option["points"]):
+                    strokes[index]["points"] = copy.deepcopy(points)
+                    if option["annotation"]:
+                        strokes[index]["verifiedTemplateSource"] = option["annotation"]
+                    else:
+                        strokes[index].pop("verifiedTemplateSource", None)
+                metrics = candidate_alignment_metrics(strokes, target, canvas)
+                explored += 1
+                expanded.append(
+                    {
+                        "strokes": strokes,
+                        "choices": [
+                            *state["choices"],
+                            {
+                                "componentId": component_id,
+                                "kind": option["kind"],
+                                "annotation": option["annotation"],
+                            },
+                        ],
+                        "score": float(metrics["score"]),
+                    }
+                )
+        expanded.sort(
+            key=lambda item: (
+                item["score"],
+                json.dumps(item["choices"], ensure_ascii=False, sort_keys=True),
+            )
+        )
+        beam = expanded[:beam_width]
+
+    winner = beam[0]
+    option_counts = {
+        str(component_id): len(options)
+        for component_id, options in options_by_component.items()
+    }
+    return winner["strokes"], {
+        "objective": "whole-glyph symmetric reconstruction score",
+        "beamWidth": beam_width,
+        "exploredStates": explored,
+        "componentOptionCounts": option_counts,
+        "componentsWithoutVerifiedTemplates": [
+            component_id
+            for component_id, options in options_by_component.items()
+            if len(options) == 1
+        ],
+        "selectedScore": round(winner["score"], 6),
+        "runnerUpScore": round(beam[1]["score"], 6) if len(beam) > 1 else None,
+        "margin": round(beam[1]["score"] - winner["score"], 6) if len(beam) > 1 else None,
+        "choices": winner["choices"],
+    }
 
 
 def partition_human_truth(
@@ -490,6 +1077,54 @@ def resample_polyline(points: np.ndarray, step: float = 4.0) -> np.ndarray:
     return np.asarray(output, dtype=float)
 
 
+def _direction_angle_degrees(vector: np.ndarray) -> float | None:
+    length = float(np.linalg.norm(vector))
+    if length < 1e-6:
+        return None
+    return float(math.degrees(math.atan2(float(vector[1]), float(vector[0]))))
+
+
+def _angle_distance_degrees(first: float | None, second: float | None) -> float:
+    if first is None or second is None:
+        return 180.0
+    return abs((first - second + 180.0) % 360.0 - 180.0)
+
+
+def directed_polyline_distortions(
+    template: np.ndarray, snapped: np.ndarray
+) -> tuple[float, float, float]:
+    """Compare directed whole-stroke and endpoint tangents.
+
+    Point-set distances cannot distinguish, for example, a horizontal first
+    stroke from a similarly placed left-falling stroke.  The annotation format
+    and candidate medians are directed (pen-down to pen-up), so retain that
+    information after coherent snapping.  Tangents use a short endpoint chord
+    instead of one noisy skeleton segment.
+    """
+    template = resample_polyline(template)
+    snapped = resample_polyline(snapped)
+    if len(template) < 2 or len(snapped) < 2:
+        return 180.0, 180.0, 180.0
+
+    def endpoint_angles(points: np.ndarray) -> tuple[float | None, float | None]:
+        offset = min(len(points) - 1, max(1, round((len(points) - 1) * 0.2)))
+        start = _direction_angle_degrees(points[offset] - points[0])
+        end = _direction_angle_degrees(points[-1] - points[-1 - offset])
+        return start, end
+
+    template_start, template_end = endpoint_angles(template)
+    snapped_start, snapped_end = endpoint_angles(snapped)
+    displacement = _angle_distance_degrees(
+        _direction_angle_degrees(template[-1] - template[0]),
+        _direction_angle_degrees(snapped[-1] - snapped[0]),
+    )
+    return (
+        displacement,
+        _angle_distance_degrees(template_start, snapped_start),
+        _angle_distance_degrees(template_end, snapped_end),
+    )
+
+
 def snap_polyline_coherently(
     line: np.ndarray,
     skeleton_points: np.ndarray,
@@ -576,11 +1211,293 @@ def snap_centerlines(
     return output, maxima
 
 
+def snap_polyline_on_skeleton_graph(
+    line: np.ndarray,
+    skeleton: np.ndarray,
+    *,
+    corridor_ratio: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Find a continuous target-skeleton route between directed endpoints.
+
+    Unlike pointwise k-nearest snapping, every consecutive result point is an
+    actual 8-neighbour edge in the PDF skeleton.  Distance from the candidate
+    median is a soft cost, so the route respects both target topology and the
+    proposed stroke shape.
+    """
+    skeleton_yx = np.argwhere(skeleton)
+    if len(skeleton_yx) == 0 or len(line) < 2:
+        return line.copy(), 0.0
+    skeleton_xy = skeleton_yx[:, ::-1].astype(float)
+    tree = cKDTree(skeleton_xy)
+    start_index = int(tree.query(line[0])[1])
+    end_index = int(tree.query(line[-1])[1])
+    start = tuple(int(value) for value in skeleton_yx[start_index])
+    goal = tuple(int(value) for value in skeleton_yx[end_index])
+    if start == goal:
+        return snap_polyline_coherently(
+            line, skeleton_yx, tree, max_distance=max(skeleton.shape) * 0.08
+        )
+
+    template_seed = np.zeros(skeleton.shape, dtype=bool)
+    dense = resample_polyline(line, step=1.25)
+    rounded = np.rint(dense).astype(int)
+    valid = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < skeleton.shape[1])
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < skeleton.shape[0])
+    )
+    template_seed[rounded[valid, 1], rounded[valid, 0]] = True
+    template_distance = ndimage.distance_transform_edt(~template_seed)
+    max_template_deviation = (
+        max(skeleton.shape) * corridor_ratio if corridor_ratio is not None else None
+    )
+
+    queue = [(0.0, start)]
+    distance = {start: 0.0}
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    neighbours = (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1), (0, 1),
+        (1, -1), (1, 0), (1, 1),
+    )
+    while queue:
+        _priority, current = heapq.heappop(queue)
+        if current == goal:
+            break
+        current_distance = distance[current]
+        for dy, dx in neighbours:
+            nxt = (current[0] + dy, current[1] + dx)
+            if not (
+                0 <= nxt[0] < skeleton.shape[0]
+                and 0 <= nxt[1] < skeleton.shape[1]
+                and skeleton[nxt]
+            ):
+                continue
+            # At crossings the PDF skeleton is one large graph.  Without a
+            # hard candidate corridor, A* can leave the proposed stroke and
+            # return through a neighbouring component while remaining fully
+            # connected.  That is topologically legal but semantically wrong.
+            if (
+                max_template_deviation is not None
+                and nxt != goal
+                and float(template_distance[nxt]) > max_template_deviation
+            ):
+                continue
+            step = math.sqrt(2.0) if dx and dy else 1.0
+            deviation = float(template_distance[nxt])
+            candidate_distance = current_distance + step * (1.0 + 0.08 * deviation * deviation)
+            if candidate_distance >= distance.get(nxt, math.inf):
+                continue
+            distance[nxt] = candidate_distance
+            parent[nxt] = current
+            heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
+            heapq.heappush(queue, (candidate_distance + heuristic, nxt))
+
+    if goal not in parent:
+        return snap_polyline_coherently(
+            line, skeleton_yx, tree, max_distance=max(skeleton.shape) * 0.08
+        )
+    route = [goal]
+    while route[-1] != start:
+        route.append(parent[route[-1]])
+    route.reverse()
+    route_xy = np.asarray([(x, y) for y, x in route], dtype=float)
+    nearest_distances, _indices = tree.query(dense)
+    return route_xy, float(np.max(nearest_distances, initial=0.0))
+
+
+def snap_centerlines_on_skeleton_graph(
+    centerlines: list[np.ndarray],
+    target: np.ndarray,
+    *,
+    corridor_ratio: float | None = None,
+) -> tuple[list[np.ndarray], list[float]]:
+    skeleton = skeletonize(target)
+    output, maxima = [], []
+    for line in centerlines:
+        snapped, maximum = snap_polyline_on_skeleton_graph(
+            line, skeleton, corridor_ratio=corridor_ratio
+        )
+        output.append(snapped)
+        maxima.append(maximum)
+    return output, maxima
+
+
+def snap_centerlines_sequentially(
+    strokes: list[dict],
+    centerlines: list[np.ndarray],
+    target: np.ndarray,
+    *,
+    beam_width: int = 24,
+) -> tuple[list[np.ndarray], list[float], dict]:
+    """Choose stroke routes jointly in writing order.
+
+    Each stroke offers coherent, unrestricted-graph, and corridor-graph
+    hypotheses.  The beam consumes them strictly from stroke 1 to stroke N,
+    rewards newly explained skeleton ink, and penalizes reusing an already
+    consumed edge.  A few shared pixels are free because real stroke
+    intersections legitimately meet.  This is intentionally a deterministic
+    search, not a learned visual classifier.
+    """
+    profile = stroke_sequence_profile(strokes)
+    if not profile["sequentiallyClosed"]:
+        raise ValueError("candidate re-enters a closed component occurrence")
+    skeleton = skeletonize(target)
+    skeleton_yx = np.argwhere(skeleton)
+    if not len(skeleton_yx):
+        return centerlines, [0.0] * len(centerlines), {
+            "mode": "sequential-stroke-beam",
+            "beamWidth": beam_width,
+            "error": "empty-target-skeleton",
+        }
+    skeleton_xy = skeleton_yx[:, ::-1].astype(float)
+    skeleton_tree = cKDTree(skeleton_xy)
+    skeleton_pixels = int(skeleton.sum())
+
+    hypotheses_by_stroke = []
+    for line in centerlines:
+        coherent, coherent_maximum = snap_polyline_coherently(
+            line,
+            skeleton_yx,
+            skeleton_tree,
+            max_distance=max(target.shape) * 0.08,
+        )
+        graph, graph_maximum = snap_polyline_on_skeleton_graph(
+            line, skeleton, corridor_ratio=None
+        )
+        corridor, corridor_maximum = snap_polyline_on_skeleton_graph(
+            line, skeleton, corridor_ratio=0.05
+        )
+        options = []
+        seen = set()
+        template_dense = resample_polyline(line)
+        template_tree = cKDTree(template_dense)
+        template_length = float(
+            np.linalg.norm(np.diff(template_dense, axis=0), axis=1).sum()
+        )
+        for kind, route, maximum in (
+            ("coherent", coherent, coherent_maximum),
+            ("graph", graph, graph_maximum),
+            ("corridor", corridor, corridor_maximum),
+        ):
+            occupied = _line_seed(target.shape, route, width=1) & skeleton
+            flat = frozenset(np.flatnonzero(occupied).tolist())
+            if flat in seen:
+                continue
+            seen.add(flat)
+            route_dense = resample_polyline(route)
+            deviation = (
+                float(np.mean(template_tree.query(route_dense)[0])) / max(target.shape)
+                if len(route_dense)
+                else 1.0
+            )
+            route_length = float(
+                np.linalg.norm(np.diff(route_dense, axis=0), axis=1).sum()
+            )
+            length_distortion = abs(
+                math.log((route_length + 1.0) / (template_length + 1.0))
+            )
+            options.append(
+                {
+                    "kind": kind,
+                    "route": route,
+                    "pixels": flat,
+                    "maximum": float(maximum),
+                    "deviation": deviation,
+                    "lengthDistortion": length_distortion,
+                }
+            )
+        hypotheses_by_stroke.append(options)
+
+    beam = [
+        {
+            "routes": [],
+            "maxima": [],
+            "choices": [],
+            "occupied": frozenset(),
+            "score": 0.0,
+        }
+    ]
+    explored = 0
+    for stroke_number, options in enumerate(hypotheses_by_stroke, start=1):
+        expanded = []
+        for state in beam:
+            for option in options:
+                overlap = len(state["occupied"] & option["pixels"])
+                # A crossing is a local meeting, not permission for two
+                # strokes to follow the same skeleton edge.
+                excess_overlap = max(0, overlap - 3)
+                overlap_ratio = excess_overlap / max(1, len(option["pixels"]))
+                new_pixels = len(option["pixels"] - state["occupied"])
+                new_coverage = new_pixels / skeleton_pixels
+                local_score = (
+                    option["deviation"]
+                    + option["lengthDistortion"] * 0.2
+                    + overlap_ratio * 2.0
+                    - new_coverage * 2.0
+                    + (2.0 if not option["pixels"] else 0.0)
+                )
+                explored += 1
+                expanded.append(
+                    {
+                        "routes": [*state["routes"], option["route"]],
+                        "maxima": [*state["maxima"], option["maximum"]],
+                        "choices": [
+                            *state["choices"],
+                            {
+                                "strokeNumber": stroke_number,
+                                "kind": option["kind"],
+                                "newSkeletonPixels": new_pixels,
+                                "overlapPixels": overlap,
+                            },
+                        ],
+                        "occupied": state["occupied"] | option["pixels"],
+                        "score": state["score"] + local_score,
+                    }
+                )
+        expanded.sort(
+            key=lambda state: (
+                state["score"],
+                tuple(choice["kind"] for choice in state["choices"]),
+            )
+        )
+        beam = expanded[:beam_width]
+
+    for state in beam:
+        uncovered_ratio = 1.0 - len(state["occupied"]) / skeleton_pixels
+        state["finalScore"] = state["score"] + uncovered_ratio * 3.0
+        state["uncoveredRatio"] = uncovered_ratio
+    beam.sort(
+        key=lambda state: (
+            state["finalScore"],
+            tuple(choice["kind"] for choice in state["choices"]),
+        )
+    )
+    winner = beam[0]
+    return winner["routes"], winner["maxima"], {
+        "mode": "sequential-stroke-beam",
+        "beamWidth": beam_width,
+        "exploredStates": explored,
+        "selectedScore": round(winner["finalScore"], 6),
+        "runnerUpScore": round(beam[1]["finalScore"], 6) if len(beam) > 1 else None,
+        "margin": (
+            round(beam[1]["finalScore"] - winner["finalScore"], 6)
+            if len(beam) > 1
+            else None
+        ),
+        "uncoveredSkeletonRatio": round(winner["uncoveredRatio"], 6),
+        "choices": winner["choices"],
+        "strokeSequenceProfile": profile,
+    }
+
+
 def candidate_alignment_metrics(
     strokes: list[dict],
     target: np.ndarray,
     canvas: int,
     focus_component_ids: set[int] | None = None,
+    focus_window: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict:
     """Score a candidate before target partitioning hides candidate mistakes."""
     fitted = fit_centerlines(strokes, canvas)
@@ -588,15 +1505,28 @@ def candidate_alignment_metrics(
     skeleton_yx = np.argwhere(skeleton)
     if not len(skeleton_yx):
         raise ValueError("target skeleton is empty")
-    selected = [
-        line
+    selected_pairs = [
+        (stroke, line)
         for stroke, line in zip(strokes, fitted)
         if not focus_component_ids or stroke["componentId"] in focus_component_ids
     ]
+    selected_strokes = [stroke for stroke, _line in selected_pairs]
+    selected = [line for _stroke, line in selected_pairs]
     if not selected:
+        selected_strokes = strokes
         selected = fitted
     focus_points = np.concatenate([resample_polyline(line) for line in selected])
-    if focus_component_ids:
+    if focus_window is not None:
+        minimum, maximum = focus_window
+        in_window = (
+            (skeleton_yx[:, 1] >= minimum[0])
+            & (skeleton_yx[:, 1] <= maximum[0])
+            & (skeleton_yx[:, 0] >= minimum[1])
+            & (skeleton_yx[:, 0] <= maximum[1])
+        )
+        if in_window.any():
+            skeleton_yx = skeleton_yx[in_window]
+    elif focus_component_ids:
         padding = canvas * 0.055
         minimum = focus_points.min(axis=0) - padding
         maximum = focus_points.max(axis=0) + padding
@@ -613,6 +1543,9 @@ def candidate_alignment_metrics(
     snapped_lines = []
     forward_distances = []
     length_distortions = []
+    displacement_angle_distortions = []
+    start_tangent_angle_distortions = []
+    end_tangent_angle_distortions = []
     max_distance = canvas * 0.08
     for line in selected:
         dense = resample_polyline(line)
@@ -622,6 +1555,12 @@ def candidate_alignment_metrics(
             line, skeleton_yx, tree, max_distance=max_distance
         )
         snapped_lines.append(snapped)
+        displacement, start_tangent, end_tangent = directed_polyline_distortions(
+            line, snapped
+        )
+        displacement_angle_distortions.append(displacement)
+        start_tangent_angle_distortions.append(start_tangent)
+        end_tangent_angle_distortions.append(end_tangent)
         source_length = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum())
         target_length = float(np.linalg.norm(np.diff(snapped, axis=0), axis=1).sum())
         length_distortions.append(abs(math.log((target_length + 1) / (source_length + 1))))
@@ -633,6 +1572,34 @@ def candidate_alignment_metrics(
     reverse_mean = float(np.mean(reverse_distances)) * scale
     reverse_p95 = float(np.percentile(reverse_distances, 95)) * scale
     length_mean = float(np.mean(length_distortions))
+    displacement_angle_mean = float(np.mean(displacement_angle_distortions))
+    start_tangent_angle_mean = float(np.mean(start_tangent_angle_distortions))
+    end_tangent_angle_mean = float(np.mean(end_tangent_angle_distortions))
+    stroke_occupancy = []
+    component_occupancy: dict[tuple[int, int], np.ndarray] = {}
+    for selected_index, (stroke, line) in enumerate(zip(selected_strokes, snapped_lines)):
+        occupied = _line_seed(target.shape, line, width=1) & skeleton
+        stroke_occupancy.append(occupied)
+        has_component = "componentId" in stroke
+        instance_key = (
+            int(stroke.get("componentId", -1)),
+            int(stroke.get("occurrence", 0 if has_component else selected_index)),
+        )
+        component_occupancy[instance_key] = (
+            component_occupancy.get(instance_key, np.zeros_like(skeleton)) | occupied
+        )
+    stroke_counts = np.sum(np.stack(stroke_occupancy), axis=0)
+    component_counts = np.sum(np.stack(list(component_occupancy.values())), axis=0)
+    covered = stroke_counts > 0
+    covered_pixels = int(covered.sum())
+    sequence_profile = stroke_sequence_profile(strokes)
+    stroke_collision_ratio = (
+        float((stroke_counts > 1).sum() / covered_pixels) if covered_pixels else 1.0
+    )
+    cross_component_collision_ratio = (
+        float((component_counts > 1).sum() / covered_pixels) if covered_pixels else 1.0
+    )
+    skeleton_coverage_ratio = float(covered_pixels / skeleton.sum())
     score = (
         forward_mean * 0.28
         + forward_p95 * 0.12
@@ -647,9 +1614,111 @@ def candidate_alignment_metrics(
         "targetToTemplateMean": round(reverse_mean, 6),
         "targetToTemplateP95": round(reverse_p95, 6),
         "meanLengthLogDistortion": round(length_mean, 6),
+        "meanDisplacementAngleDistortion": round(displacement_angle_mean, 6),
+        "meanStartTangentAngleDistortion": round(start_tangent_angle_mean, 6),
+        "meanEndTangentAngleDistortion": round(end_tangent_angle_mean, 6),
+        "skeletonCoverageRatio": round(skeleton_coverage_ratio, 6),
+        "strokeCollisionRatio": round(stroke_collision_ratio, 6),
+        "crossComponentCollisionRatio": round(cross_component_collision_ratio, 6),
+        "strokeSequenceProfile": sequence_profile,
         "focusStrokeCount": len(selected),
         "focusSkeletonPoints": len(skeleton_xy),
         "snapped": snapped_lines,
+    }
+
+
+def shared_focus_window(
+    candidate_sets: list[list[dict]],
+    focus_component_ids: set[int],
+    canvas: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Freeze one PDF grading window across all sibling candidates."""
+    points = []
+    for strokes in candidate_sets:
+        fitted = fit_centerlines(strokes, canvas)
+        points.extend(
+            resample_polyline(line)
+            for stroke, line in zip(strokes, fitted)
+            if int(stroke.get("componentId", -1)) in focus_component_ids
+        )
+    if not points:
+        return None
+    combined = np.concatenate(points)
+    padding = canvas * 0.055
+    return combined.min(axis=0) - padding, combined.max(axis=0) + padding
+
+
+def component_closure_alignment_metrics(
+    strokes: list[dict], target: np.ndarray, canvas: int
+) -> dict:
+    """Score a glyph by settling each smallest component at its final stroke."""
+    profile = stroke_sequence_profile(strokes)
+    if not profile["sequentiallyClosed"]:
+        return {
+            "score": math.inf,
+            "strokeSequenceProfile": profile,
+            "componentClosures": [],
+        }
+    fitted = fit_centerlines(strokes, canvas)
+    snapped, _distances = snap_centerlines(fitted, target, max_distance=canvas * 0.08)
+    masks, ambiguous, partition_metrics = partition_components_then_strokes(
+        target, snapped, strokes
+    )
+    scale = 100 / canvas
+    closures = []
+    total_score = 0.0
+    total_weight = 0.0
+    for run in profile["runs"]:
+        indices = list(range(run["firstStroke"] - 1, run["lastStroke"]))
+        template_points = np.concatenate(
+            [resample_polyline(fitted[index]) for index in indices]
+        )
+        component_mask = np.logical_or.reduce([masks[index] for index in indices])
+        component_skeleton = skeletonize(component_mask)
+        target_yx = np.argwhere(component_skeleton)
+        if not len(template_points) or not len(target_yx):
+            local_score = 100.0
+            forward_mean = reverse_mean = 100.0
+            forward_p95 = reverse_p95 = 100.0
+        else:
+            target_xy = target_yx[:, ::-1].astype(float)
+            forward = cKDTree(target_xy).query(template_points)[0] * scale
+            reverse = cKDTree(template_points).query(target_xy)[0] * scale
+            forward_mean = float(np.mean(forward))
+            forward_p95 = float(np.percentile(forward, 95))
+            reverse_mean = float(np.mean(reverse))
+            reverse_p95 = float(np.percentile(reverse, 95))
+            local_score = (
+                forward_mean * 0.28
+                + forward_p95 * 0.12
+                + reverse_mean * 0.40
+                + reverse_p95 * 0.20
+            )
+        # Equal component weight prevents a large component from hiding a bad
+        # one-stroke leaf; a small log factor still acknowledges complexity.
+        weight = 1.0 + math.log1p(run["strokeCount"]) * 0.15
+        total_score += local_score * weight
+        total_weight += weight
+        closures.append(
+            {
+                **run,
+                "score": round(local_score, 6),
+                "templateToComponentMean": round(forward_mean, 6),
+                "templateToComponentP95": round(forward_p95, 6),
+                "componentToTemplateMean": round(reverse_mean, 6),
+                "componentToTemplateP95": round(reverse_p95, 6),
+                "componentInkPixels": int(component_mask.sum()),
+            }
+        )
+    score = total_score / total_weight if total_weight else math.inf
+    return {
+        "score": round(score, 6),
+        "strokeSequenceProfile": profile,
+        "componentClosures": closures,
+        "ambiguousRatio": partition_metrics["ambiguousRatio"],
+        "componentSeedConflictPixels": partition_metrics[
+            "componentSeedConflictPixels"
+        ],
     }
 
 
@@ -675,7 +1744,10 @@ def partition_strokes(
     stack = np.stack(distances)
     nearest_labels = np.argmin(stack, axis=0)
     ordered = np.partition(stack, 1, axis=0)
-    ambiguous = target & ((ordered[1] - ordered[0]) <= ambiguity_distance)
+    with np.errstate(invalid="ignore"):
+        separation = ordered[1] - ordered[0]
+    separation[~np.isfinite(separation)] = np.inf
+    ambiguous = target & (separation <= ambiguity_distance)
     seed_labels = np.zeros(target.shape, dtype=np.int32)
     for index, line in enumerate(centerlines):
         seed = np.logical_and(_line_seed(target.shape, line), target)
@@ -691,6 +1763,80 @@ def partition_strokes(
         "ambiguousRatio": round(float(ambiguous.sum() / target.sum()), 6),
         "strokePixels": [int(mask.sum()) for mask in masks],
     }
+
+
+def partition_components_then_strokes(
+    target: np.ndarray,
+    centerlines: list[np.ndarray],
+    strokes: list[dict],
+) -> tuple[list[np.ndarray], np.ndarray, dict]:
+    """Partition leaf component instances before partitioning their strokes.
+
+    This mirrors the human procedure: a completed smallest component owns ink
+    as a unit; only then is that unit divided into its ordered strokes.  Using
+    occurrence in the key keeps repeated siblings independent.
+    """
+    baseline_masks, ambiguous, metrics = partition_strokes(target, centerlines)
+    instance_keys = list(
+        dict.fromkeys(
+            (
+                int(stroke.get("componentId", -1)),
+                int(stroke.get("occurrence", index if "componentId" not in stroke else 0)),
+            )
+            for index, stroke in enumerate(strokes)
+        )
+    )
+    instance_number = {key: index + 1 for index, key in enumerate(instance_keys)}
+    seed_masks = [np.zeros_like(target) for _key in instance_keys]
+    stroke_keys = []
+    for index, (stroke, line) in enumerate(zip(strokes, centerlines)):
+        key = (
+            int(stroke.get("componentId", -1)),
+            int(stroke.get("occurrence", index if "componentId" not in stroke else 0)),
+        )
+        stroke_keys.append(key)
+        seed_masks[instance_number[key] - 1] |= target & _line_seed(
+            target.shape, line, width=2
+        )
+
+    seed_stack = np.stack(seed_masks)
+    seed_count = seed_stack.sum(axis=0)
+    component_seeds = np.zeros(target.shape, dtype=np.int32)
+    exclusive = seed_count == 1
+    for number, seed in enumerate(seed_masks, start=1):
+        component_seeds[exclusive & seed] = number
+    component_labels = geodesic_labels(target, component_seeds)
+
+    masks = [np.zeros_like(target) for _stroke in strokes]
+    for key in instance_keys:
+        indices = [index for index, value in enumerate(stroke_keys) if value == key]
+        component_mask = target & (component_labels == instance_number[key])
+        if not component_mask.any():
+            for index in indices:
+                masks[index] = baseline_masks[index]
+            continue
+        if len(indices) == 1:
+            masks[indices[0]] = component_mask
+            continue
+        local_masks, _local_ambiguous, _local_metrics = partition_strokes(
+            component_mask, [centerlines[index] for index in indices]
+        )
+        for index, local_mask in zip(indices, local_masks):
+            masks[index] = local_mask
+
+    covered = np.logical_or.reduce(masks)
+    uncovered = target & ~covered
+    if uncovered.any():
+        for index, baseline in enumerate(baseline_masks):
+            masks[index] |= uncovered & baseline
+    metrics.update(
+        {
+            "partitionMode": "component-instance-then-stroke",
+            "componentInstanceCount": len(instance_keys),
+            "componentSeedConflictPixels": int((target & (seed_count > 1)).sum()),
+        }
+    )
+    return masks, ambiguous, metrics
 
 
 def geodesic_labels(target: np.ndarray, seeds: np.ndarray) -> np.ndarray:
@@ -1090,7 +2236,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       const fileInput = document.querySelector('#annotation-file');
       const labelFollowupButton = document.querySelector('#label-followup-toggle');
       const labelFollowupPreferenceKey = 'unihan-annotation-label-followup-tool';
-      let tool = 'freehand';
+      let tool = 'polyline';
       let current = null;
       let pointDraft = null;
       let previewPoint = null;
@@ -1099,6 +2245,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       let annotations = initialAnnotations;
       let history = [];
       let future = [];
+      let draftFuture = [];
       let labelFollowupTool = localStorage.getItem(labelFollowupPreferenceKey) === 'polyline'
         ? 'polyline'
         : 'polygon';
@@ -1112,6 +2259,35 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           if (Array.isArray(saved)) annotations = saved;
         } catch (_error) {}
       }
+      if (!annotations.length && metadata.defaultComponentId != null) {
+        labelInput.value = String(metadata.defaultComponentId);
+        if (metadata.defaultComponentColor) {
+          colorInput.value = metadata.defaultComponentColor;
+        }
+      }
+      const defaultComponentSequence = Array.isArray(metadata.defaultComponentSequence)
+        ? metadata.defaultComponentSequence
+        : [];
+      let defaultComponentIndex = Math.max(0, defaultComponentSequence.findIndex(
+        component => String(component.id) === labelInput.value.trim()
+      ));
+      const advanceDefaultComponent = () => {
+        if (!defaultComponentSequence.length) return false;
+        const currentLabel = labelInput.value.trim();
+        if (String(defaultComponentSequence[defaultComponentIndex]?.id) !== currentLabel) {
+          const matchingIndex = defaultComponentSequence.findIndex(
+            (component, index) => index >= defaultComponentIndex
+              && String(component.id) === currentLabel
+          );
+          if (matchingIndex >= 0) defaultComponentIndex = matchingIndex;
+        }
+        if (defaultComponentIndex >= defaultComponentSequence.length - 1) return false;
+        defaultComponentIndex += 1;
+        const component = defaultComponentSequence[defaultComponentIndex];
+        labelInput.value = String(component.id);
+        if (component.color) colorInput.value = component.color;
+        return true;
+      };
 
       const svgElement = (name, attributes = {}) => {
         const element = document.createElementNS('http://www.w3.org/2000/svg', name);
@@ -1477,10 +2653,12 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         const nextTool = pendingEmptyConfirmTool;
         pendingEmptyConfirmTool = null;
         selectTool(nextTool, false);
-        updateToolStatus(`空确认：已切换到${nextTool === 'polygon' ? '多边形圈' : '折线'}`);
+        const advanced = nextTool === labelFollowupTool && advanceDefaultComponent();
+        updateToolStatus(`空确认：已切换到${nextTool === 'polygon' ? '多边形圈' : '折线'}${advanced ? `；已推进到下一叶部件 ${labelInput.value}` : ''}`);
         return true;
       };
       const placeLinearPoint = (rawPoint, constrained = false) => {
+        draftFuture = [];
         let point = rawPoint;
         const previousFixedPoint = pointDraft?.fixedPoints?.at(-1);
         if (constrained && previousFixedPoint) {
@@ -1533,6 +2711,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
           const previous = pointDraft.anchors.at(-1)?.point;
           if (previous && Math.hypot(point[0] - previous[0], point[1] - previous[1]) < .25) return;
           const anchor = {point, inHandle: null, outHandle: null, kind: event.altKey ? 'corner' : 'auto'};
+          draftFuture = [];
           pointDraft.anchors.push(anchor);
           penDrag = {mode: 'new', pointerId: event.pointerId, anchorIndex: pointDraft.anchors.length - 1, origin: point, moved: false, altKey: event.altKey};
           board.setPointerCapture(event.pointerId);
@@ -1658,6 +2837,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         pointDraft = null;
         previewPoint = null;
         penDrag = null;
+        draftFuture = [];
         document.querySelectorAll('[data-tool]').forEach(item => item.classList.toggle('active', item.dataset.tool === tool));
         board.style.cursor = tool === 'erase' ? 'not-allowed' : tool === 'relabel' ? 'alias' : 'crosshair';
         render();
@@ -1677,6 +2857,11 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
       };
       labelInput.addEventListener('input', () => {
         if (!labelInput.value.trim()) return;
+        const matchingIndex = defaultComponentSequence.findIndex(
+          (component, index) => index >= defaultComponentIndex
+            && String(component.id) === labelInput.value.trim()
+        );
+        if (matchingIndex >= 0) defaultComponentIndex = matchingIndex;
         selectTool(labelFollowupTool, false);
         updateToolStatus(`标签已变化；按偏好自动切换到${labelFollowupTool === 'polygon' ? '多边形圈' : '折线'}`);
       });
@@ -1693,6 +2878,47 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         annotations = future.pop();
         persist(); render();
       };
+      const updatePointDraftGeometry = () => {
+        previewPoint = null;
+        if (!pointDraft) return;
+        if (pointDraft.type === 'bezier') updateBezierDraft(pointDraft);
+        else pointDraft.points = [...(pointDraft.fixedPoints || [])];
+      };
+      const undoDraftNode = () => {
+        if (!pointDraft) {
+          updateToolStatus('当前没有未完成路径；整笔撤销请用 Ctrl+Z');
+          return;
+        }
+        const nodes = pointDraft.type === 'bezier' ? pointDraft.anchors : pointDraft.fixedPoints;
+        if (!nodes?.length) {
+          updateToolStatus('当前路径已经没有可撤销节点');
+          return;
+        }
+        draftFuture.push({type: pointDraft.type, node: structuredClone(nodes.pop())});
+        updatePointDraftGeometry();
+        render();
+        updateToolStatus(`已撤销当前${pointDraft.type === 'bezier' ? '锚点' : '节点'}；Shift+Tab 可重做`);
+      };
+      const redoDraftNode = () => {
+        if (!pointDraft || !draftFuture.length) {
+          updateToolStatus('当前没有可重做的路径节点');
+          return;
+        }
+        const entry = draftFuture.at(-1);
+        if (entry.type !== pointDraft.type) {
+          draftFuture = [];
+          updateToolStatus('工具已变化，旧的节点重做记录已清除');
+          return;
+        }
+        draftFuture.pop();
+        const nodes = pointDraft.type === 'bezier' ? pointDraft.anchors : pointDraft.fixedPoints;
+        nodes.push(structuredClone(entry.node));
+        updatePointDraftGeometry();
+        render();
+        updateToolStatus(`已重做当前${pointDraft.type === 'bezier' ? '锚点' : '节点'}`);
+      };
+      document.querySelector('#undo-draft-node').onclick = undoDraftNode;
+      document.querySelector('#redo-draft-node').onclick = redoDraftNode;
       document.querySelector('#undo-annotation').onclick = undo;
       document.querySelector('#redo-annotation').onclick = redo;
       document.querySelector('#clear-annotations').onclick = () => {
@@ -1711,8 +2937,11 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         } else if (modifier && event.key.toLowerCase() === 'e') {
           event.preventDefault(); document.querySelector('#import-annotations').click();
         } else if (event.key === 'Escape') {
-          current = null; pointDraft = null; previewPoint = null; penDrag = null; pendingEmptyConfirmTool = null; render();
+          current = null; pointDraft = null; previewPoint = null; penDrag = null; pendingEmptyConfirmTool = null; draftFuture = []; render();
           updateToolStatus('未完成笔画已取消');
+        } else if (event.key === 'Tab' && document.activeElement === board) {
+          event.preventDefault();
+          if (event.shiftKey) redoDraftNode(); else undoDraftNode();
         } else if (event.code === 'Space' && document.activeElement === board) {
           event.preventDefault();
           if (pointDraft || pendingEmptyConfirmTool) finishDraftOrSwitchTool();
@@ -1762,7 +2991,7 @@ def annotation_editor_script(metadata: dict, initial_annotations: list[dict] | N
         '钢笔：单击角锚点，拖动平滑锚点，Alt+拖动断开手柄',
         '钢笔：单击自动平滑锚点，Alt+单击角锚点；拖动建立明确方向手柄，Alt+拖动断开手柄'
       ).replaceAll('Enter、双击或右键', '空格或右键');
-      updateToolStatus('已激活');
+      selectTool('polyline', false);
     })();
     '''.replace("__METADATA__", payload).replace("__INITIAL_ANNOTATIONS__", initial_payload)
 
@@ -1914,6 +3143,16 @@ def interaction_script(registry: dict[str, dict]) -> str:
     '''.replace("__PARTS__", payload)
 
 
+def human_truth_warning(
+    *, stroke_count: int, metrics: dict, correction_count: int
+) -> str:
+    return (
+        f"已载入人工真值：{stroke_count} 笔、"
+        f"{metrics.get('humanRegionCount', 0)} 个部件圈；"
+        f"按真值重分区。ID 自动纠正 {correction_count} 项。"
+    )
+
+
 def build_html(
     record: dict,
     glyph: dict,
@@ -2030,6 +3269,18 @@ def build_html(
     candidate_order = "；".join(
         f"{index + 1}. {stroke['feature']}" for index, stroke in enumerate(strokes)
     )
+    first_ranked_strokes = candidate_strokes(row, int(ranked[0]["id"]))
+    default_components = []
+    seen_default_components = set()
+    for stroke in first_ranked_strokes:
+        instance_key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
+        if instance_key in seen_default_components:
+            continue
+        seen_default_components.add(instance_key)
+        default_components.append(
+            {"id": int(stroke["componentId"]), "color": stroke["color"]}
+        )
+    default_component = default_components[0]
     annotation_js = annotation_editor_script(
         {
             "reviewKey": review_key,
@@ -2039,6 +3290,9 @@ def build_html(
             "candidateGlyphId": glyph_id,
             "candidateStrokeCount": len(strokes),
             "candidateStrokeOrder": [stroke["feature"] for stroke in strokes],
+            "defaultComponentId": default_component["id"],
+            "defaultComponentColor": default_component["color"],
+            "defaultComponentSequence": default_components,
             "strokePointSemantics": "points[0] is pen-down; points[-1] is pen-up; order is directed",
         },
         initial_annotations,
@@ -2054,8 +3308,11 @@ def build_html(
         else "候选驱动的 PDF 墨迹归属假设（不是已识别笔画）"
     )
     warning = (
-        f"已载入人工真值：{len(strokes)} 笔、{metrics.get('humanLassoCount', 0)} 个部件圈；"
-        f"按真值重分区。ID 自动纠正 {len(annotation_corrections or [])} 项。"
+        human_truth_warning(
+            stroke_count=len(strokes),
+            metrics=metrics,
+            correction_count=len(annotation_corrections or []),
+        )
         if human_driven
         else f"候选强制为 {len(strokes)} 笔，但分区产生 {metrics.get('totalPartitionInkFragments', '待统计')} 个连通墨迹片；斜线歧义 {metrics['ambiguousRatio'] * 100:.2f}%。因此不得自动写入。"
     )
@@ -2066,10 +3323,61 @@ def build_html(
         )
         or "无 ID 纠正"
     )
+    template_search = metrics.get("globalTemplateSearch") or {}
+    template_choices = template_search.get("choices") or []
+    template_choice_text = "；".join(
+        f"{choice['componentId']}："
+        + (
+            "已验证人工模板"
+            if choice.get("kind") == "verified-annotation"
+            else "仓库候选自身"
+        )
+        for choice in template_choices
+    ) or "本页未运行全局人工模板搜索"
+    template_option_text = "；".join(
+        f"{component_id}→{count} 个选项"
+        for component_id, count in (
+            template_search.get("componentOptionCounts") or {}
+        ).items()
+    ) or "无"
+    template_missing_text = "、".join(
+        str(component_id)
+        for component_id in template_search.get(
+            "componentsWithoutVerifiedTemplates", []
+        )
+    ) or "无"
+    template_margin = format_metric(template_search.get("margin"))
+    geometry_policy = (
+        "人工模板只作为候选判别证据；最终 PDF 分区仍使用当前候选自身的中心线"
+        if metrics.get("templateGeometry") == "candidate"
+        else "已明确启用实验模式：把所选人工模板的归一化中心线用于最终 PDF 分区"
+    )
+    template_review_text = "、".join(
+        metrics.get("templateReviewReasons") or []
+    ) or "无"
+    coverage_comparison = metrics.get("verifiedCoverageComparison") or {}
+    coverage_evidence_glyph = coverage_comparison.get("evidenceGlyphId")
+    coverage_details = "；".join(
+        f"glyph {glyph_id}→{','.join(str(value) for value in component_ids) or '无'}"
+        for glyph_id, component_ids in (
+            coverage_comparison.get("discriminatingSameSourceVerifiedIds") or {}
+        ).items()
+    ) or "无"
+    template_evidence_note = (
+        f"<b>几何安全边界：</b>{html.escape(geometry_policy)}。"
+        f"<b>全局组合：</b>{html.escape(template_choice_text)}。"
+        f"<b>每部件可比较项：</b>{html.escape(template_option_text)}。"
+        f"<b>尚无人工模板：</b>{html.escape(template_missing_text)}。"
+        f"<b>最优/次优 margin：</b>{template_margin}。"
+        f"<b>需复核原因：</b>{html.escape(template_review_text)}。"
+        f"<b>同来源独占真值叶（单项证据，不能单独裁决）：</b>"
+        f"{html.escape(coverage_details)}；证据指向 candidate："
+        f"{coverage_evidence_glyph if coverage_evidence_glyph is not None else '无（弃权）'}。"
+    )
     document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>U+{record['unicode']:04X} 逐笔迁移</title><style>
     *{{box-sizing:border-box}}body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:#eef2f7;color:#172033}}button,input{{font:inherit}}header{{padding:13px 20px;background:#0f172a;color:white}}header h2{{margin:0 0 5px}}header button,.toolbar button{{margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;cursor:pointer}}header button.active,.toolbar button.active{{background:#38bdf8;border-color:#0284c7;color:#082f49;box-shadow:inset 0 0 0 1px #0369a1}}.warning{{color:#fde68a;margin-top:4px}}main{{padding:14px;display:flex;flex-direction:column;gap:14px}}.review-section{{background:white;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden}}.section-title,h3{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.section-note{{padding:8px 11px;font-size:12px;color:#475569;border-bottom:1px solid #e2e8f0}}svg{{display:block;width:100%;height:auto;aspect-ratio:1}}.candidate-row{{display:flex;gap:12px;padding:12px;overflow-x:auto;align-items:stretch}}.candidate-card{{flex:1 0 340px;max-width:460px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.candidate-visual{{height:250px;display:flex;justify-content:center}}.candidate-visual svg{{height:250px;width:auto}}.weight{{padding:7px 10px;background:#ecfeff;border-top:1px solid #a5f3fc}}.evidence-grid{{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:4px 8px;margin:0;padding:8px 10px;font-size:12px}}.evidence-grid dt{{color:#64748b}}.evidence-grid dd{{margin:0;font-variant-numeric:tabular-nums}}.evidence-flags{{padding:7px 10px;font-size:12px;background:#fefce8}}details{{border-top:1px solid #e2e8f0}}summary{{cursor:pointer;padding:7px 10px;font-size:12px}}pre{{margin:0;padding:10px;white-space:pre-wrap;font-size:11px;max-height:260px;overflow:auto}}.vector-row{{display:grid;grid-template-columns:repeat(3,minmax(300px,1fr));gap:12px;padding:12px;align-items:start}}.vector-card{{border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;background:#fff}}.vector-card>svg{{max-height:390px}}.source-fit{{fill:#111827}}.source-mask-fit{{fill:white}}.source-stroke{{fill:var(--component-color)}}body.stroke-mode .source-stroke{{fill:var(--stroke-color)}}.source-original-overlay{{display:none;fill:#111827}}body.original-source-mode .source-attribution-layer,body.original-source-mode .ambiguity,body.original-source-mode .node{{display:none}}body.original-source-mode .source-original-overlay{{display:block}}.median{{fill:none;stroke-width:.45;stroke-dasharray:1 1;opacity:.9}}.ambiguity{{fill:url(#hatch);opacity:.8;pointer-events:none}}.node{{pointer-events:none}}.endpoint{{fill:#ef4444}}.contact{{fill:white;stroke:#2563eb;stroke-width:.38}}.bend{{fill:none;stroke:#22c55e;stroke-width:.42;stroke-linecap:round}}body.nodes-hidden .node{{display:none}}.interactive-part{{cursor:pointer;transition:opacity .12s,filter .12s,stroke-width .12s}}.interactive-part.linked-highlight{{filter:drop-shadow(0 0 1.2px #020617);stroke:#020617!important;stroke-width:4.6!important;opacity:1!important}}.source-stroke.linked-highlight{{stroke-width:.5!important}}.median.linked-highlight{{stroke-width:1!important}}.interactive-part.linked-dim{{opacity:.13!important}}.editor{{scroll-margin-top:10px}}.toolbar{{padding:7px;background:#f8fafc;border-bottom:1px solid #cbd5e1;display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}}.tool-group{{position:relative;display:inline-flex;align-items:center;gap:4px;padding:17px 6px 5px;border:2px solid #cbd5e1;border-radius:8px;background:#fff}}.tool-group .group-title{{position:absolute;top:2px;left:7px;font-size:9px;font-weight:700;color:#475569;letter-spacing:.04em}}.draw-group{{border-color:#fda4af;background:#fff1f2}}.precision-group{{border-color:#93c5fd;background:#eff6ff}}.component-group{{border-color:#c4b5fd;background:#f5f3ff}}.history-group{{border-color:#86efac;background:#f0fdf4}}.file-group{{border-color:#fcd34d;background:#fffbeb}}.toolbar button{{font-size:11px;padding:4px 6px;margin:0}}.toolbar label{{display:inline-flex;align-items:center;gap:4px;margin:0;font-size:11px}}.toolbar input[type=text]{{width:92px;padding:4px;border:1px solid #94a3b8;border-radius:5px}}kbd{{font:700 9px/1 monospace;padding:2px 3px;border:1px solid #94a3b8;border-bottom-width:2px;border-radius:3px;background:#fff;color:#334155}}.board-wrap{{height:330px;border-bottom:1px solid #cbd5e1;background:white;overflow:hidden;display:flex;justify-content:center}}#annotation-board{{height:100%;width:auto;max-width:100%;touch-action:none;cursor:crosshair;user-select:none}}.annotation-reference{{fill:#111827;opacity:.18;pointer-events:none}}.annotation-shape{{vector-effect:non-scaling-stroke}}.annotation-label{{font-size:3.2px;font-weight:700;paint-order:stroke;stroke:white;stroke-width:.7px;pointer-events:none}}.draft-handle,.draft-handle-number,.draft-preview-handle,.draft-guide{{pointer-events:none}}.editor-help{{font-size:11px;line-height:1.35;padding:7px;display:grid;gap:6px}}#tool-status{{padding:6px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px}}#annotation-status,.help-box{{padding:6px;background:#ecfeff;border:1px solid #67e8f9;border-radius:6px}}.hierarchy-float{{position:fixed;z-index:30;min-width:330px;max-width:520px;border-radius:8px;overflow:hidden;box-shadow:0 12px 35px #0f172a55;background:#fff}}#hierarchy-tip{{pointer-events:none}}.tip-position,.picker-title{{padding:6px 8px;background:#0f172a;color:#fff;font-size:11px}}.hierarchy-row,.picker-option{{width:100%;display:flex;justify-content:space-between;gap:12px;padding:6px 8px;border:0;font-size:12px;text-align:left}}.hierarchy-row b,.picker-option b{{white-space:nowrap;align-self:center}}.picker-option{{cursor:pointer;border-top:1px solid #ffffff44}}.picker-option:hover{{outline:3px solid #38bdf8;outline-offset:-3px}}.jump{{display:inline-block;margin:8px 6px 0 0;border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:white;color:#172033;text-decoration:none}}@media(max-width:1050px){{.vector-row{{grid-template-columns:1fr}}.board-wrap{{height:60vh}}}}
     </style></head><body><header><h2>U+{record['unicode']:04X} {chr(record['unicode'])} · {record['source']} 源 · candidate {glyph_id}</h2><div>PDF 只有最终复合轮廓；候选提供引用树，人工标注可提供真实笔画与部件边界。</div><div class="warning">{html.escape(warning)}</div><button id="component-mode" class="active">按递归叶部件聚色</button><button id="stroke-mode">按逐笔槽着色</button><button id="node-mode" class="active">显示拓扑节点</button><button id="source-view-mode">归属图 / 原始 PDF</button><a class="jump" href="#human-editor">跳到人工标注板 ↓</a></header><main>
-    <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="candidate-row">{top_candidates}</div></section>
+    <section class="review-section"><h2 class="section-title">第 1 行 · 所有可能拆法（经验决策权重由高到低）</h2><div class="section-note">先以同一最终决策方法在已复核样本中的 Laplace 平滑命中率作为推荐候选的先验，其余权重再按 exp(−(总距离−最小总距离)) 分配；同时单列纯距离权重。这仍是可审计的经验估计，不是已校准概率。当前方法：{html.escape(str(decision_method))}；margin：{decision_margin}。</div><div class="section-note">{template_evidence_note}</div><div class="candidate-row">{top_candidates}</div></section>
     <section class="review-section"><h2 class="section-title">第 2 行 · 人工真值标注、PDF 重分区、真值中心线</h2><div class="vector-row"><article class="vector-card editor"><h3>人工真值标注板（左键第一行候选，直接选择叶部件）</h3><div class="toolbar"><span class="tool-group draw-group"><span class="group-title">自由绘制</span><button type="button" data-tool="freehand" data-shortcut="f" class="active">自由线 <kbd>F</kbd></button><button type="button" data-tool="erase" data-shortcut="d">删除 <kbd>D</kbd></button><label>颜色 <kbd>K</kbd><input id="annotation-color" data-focus-shortcut="k" type="color" value="#ef4444"></label></span><span class="tool-group precision-group"><span class="group-title">精确路径</span><button type="button" data-tool="line" data-shortcut="l">直线 <kbd>L</kbd></button><button type="button" data-tool="polyline" data-shortcut="p">折线 <kbd>P</kbd></button><button type="button" data-tool="bezier" data-shortcut="b">钢笔路径 <kbd>B</kbd></button><button type="button" id="label-followup-toggle" data-action data-shortcut="t">标签后→多边形圈 <kbd>T</kbd></button></span><span class="tool-group component-group"><span class="group-title">部件归属</span><button type="button" data-tool="lasso" data-shortcut="c">自由圈 <kbd>C</kbd></button><button type="button" data-tool="polygon" data-shortcut="o">多边形圈 <kbd>O</kbd></button><button type="button" data-tool="relabel" data-shortcut="a">重标部件 <kbd>A</kbd></button><label>部件标签 <kbd>Q</kbd><input id="component-label" data-focus-shortcut="q" type="text" placeholder="点上方候选"></label></span><span class="tool-group history-group"><span class="group-title">历史</span><button type="button" id="undo-annotation" data-action data-shortcut="u">撤销 <kbd>U</kbd></button><button type="button" id="redo-annotation" data-action data-shortcut="r">重做 <kbd>R</kbd></button><button type="button" id="clear-annotations" data-action data-shortcut="x">清空 <kbd>X</kbd></button></span><span class="tool-group file-group"><span class="group-title">文件</span><button type="button" id="export-annotations" data-action data-shortcut="s">导出 <kbd>S</kbd></button><button type="button" id="import-annotations" data-action data-shortcut="i">导入 <kbd>I</kbd></button><input id="annotation-file" type="file" accept="application/json" hidden></span></div><div class="board-wrap"><svg id="annotation-board" viewBox="0 0 100 100" aria-label="PDF 字源人工标注板"><defs>{glyph['definitions']}</defs><g class="annotation-reference source-fit">{original_use}</g><g id="annotation-layer"></g></svg></div><div class="editor-help"><div id="tool-status"></div><div id="annotation-status"></div><div class="help-box"><b>工具键：</b>F 自由线；D 删除；K 颜色；L 直线；P 折线；B 钢笔路径；C 自由圈；O 多边形圈；A 重标部件；T 切换标签后的自动工具；Q 标签；U/R 撤销/重做；X 清空；S/I 导出/导入。重标：填入正确 ID，按 A 后点击既有部件圈，将同时改写圈及圈内笔画。直线/折线按住 Shift 约束为 45° 档位。多边形圈：逐点单击，Enter 或右键自动闭合。钢笔：单击自动平滑锚点，Alt+单击角锚点，拖动建立方向手柄，Shift 约束 45°；Enter 或右键结束整笔。完成笔画或部件圈后，未落点时再按一次 Enter/右键，会在折线与多边形圈之间切换；取消不会触发。再次按当前工具键可取消；Esc 取消未完成内容。<br><b>ID：</b>{html.escape(correction_note)}。</div></div></article><article class="vector-card"><h3>{html.escape(partition_title)}</h3><svg viewBox="0 0 100 100"><defs><pattern id="hatch" width="2" height="2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="2" stroke="#111827" stroke-width=".25"/></pattern><mask id="pdf-outline-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="black"/><g class="source-mask-fit">{original_use}</g></mask></defs><g class="source-attribution-layer" mask="url(#pdf-outline-mask)">{''.join(layers)}</g><g class="source-original-overlay source-fit">{original_use}</g><path class="ambiguity" d="{ambiguity_path}" fill-rule="evenodd"/>{nodes}</svg><div class="section-note">hover 查看层级；右键才打开只读复制列表；页首可切换原始 PDF。</div></article><article class="vector-card"><h3>{'人工真值拟合后的逐笔中心线' if human_driven else '拟合后的逐笔中心线'}</h3><svg viewBox="0 0 100 100">{''.join(medians)}</svg><details><summary>分区与拟合指标</summary><pre>{html.escape(json.dumps(metrics, ensure_ascii=False, indent=2))}</pre></details></article></div></section>
     </main><div id="hierarchy-tip" class="hierarchy-float" hidden></div><div id="component-picker" class="hierarchy-float" hidden></div><script>
     function fit(el){{const b=el.getBBox(),s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
@@ -2078,6 +3386,8 @@ def build_html(
     {interaction_js}
     </script></body></html>'''
     shortcut_replacements = {
+        '<span class="tool-group history-group"><span class="group-title">历史</span>':
+            '<span class="tool-group history-group"><span class="group-title">历史</span><button type="button" id="undo-draft-node" data-action>退一点 <kbd>Tab</kbd></button><button type="button" id="redo-draft-node" data-action>进一点 <kbd>Shift+Tab</kbd></button>',
         'data-tool="freehand" data-shortcut="f" class="active">自由线 <kbd>F</kbd>':
             'data-tool="freehand" data-shortcut="q" class="active">自由线 <kbd>Q</kbd>',
         'data-tool="erase" data-shortcut="d">删除 <kbd>D</kbd>':
@@ -2101,9 +3411,9 @@ def build_html(
         '部件标签 <kbd>Q</kbd><input id="component-label" data-focus-shortcut="q"':
             '部件标签 <kbd>V</kbd><input id="component-label" data-focus-shortcut="v"',
         'id="undo-annotation" data-action data-shortcut="u">撤销 <kbd>U</kbd>':
-            'id="undo-annotation" data-action>撤销 <kbd>Ctrl+Z</kbd>',
+            'id="undo-annotation" data-action>撤销整件 <kbd>Ctrl+Z</kbd>',
         'id="redo-annotation" data-action data-shortcut="r">重做 <kbd>R</kbd>':
-            'id="redo-annotation" data-action>重做 <kbd>Ctrl+Shift+Z</kbd>',
+            'id="redo-annotation" data-action>重做整件 <kbd>Ctrl+Shift+Z</kbd>',
         'id="clear-annotations" data-action data-shortcut="x">清空 <kbd>X</kbd>':
             'id="clear-annotations" data-action data-shortcut="r">清空 <kbd>R</kbd>',
         'id="export-annotations" data-action data-shortcut="s">导出 <kbd>S</kbd>':
@@ -2113,7 +3423,7 @@ def build_html(
         'id="annotation-board" viewBox="0 0 100 100"':
             'id="annotation-board" tabindex="0" viewBox="0 0 100 100"',
         '<b>工具键：</b>F 自由线；D 删除；K 颜色；L 直线；P 折线；B 钢笔路径；C 自由圈；O 多边形圈；A 重标部件；T 切换标签后的自动工具；Q 标签；U/R 撤销/重做；X 清空；S/I 导出/导入。':
-            '<b>左手快捷键：</b>Q 自由线；W 删除；E 颜色；A 直线；S 折线；D 钢笔路径；F 切换标签后的自动工具；Z 自由圈；X 多边形圈；C 重标部件；V 标签；R 清空；Ctrl+Z / Ctrl+Shift+Z 撤销/重做；Ctrl+S / Ctrl+E 导出/导入。',
+            '<b>左手快捷键：</b>Q 自由线；W 删除；E 颜色；A 直线；S 折线；D 钢笔路径；F 切换标签后的自动工具；Z 自由圈；X 多边形圈；C 重标部件；V 标签；R 清空；画布聚焦时 Tab / Shift+Tab 逐节点撤销/重做；Ctrl+Z / Ctrl+Shift+Z 整件撤销/重做；Ctrl+S / Ctrl+E 导出/导入。',
         '按 A 后点击既有部件圈': '按 C 后点击既有部件圈',
         'Enter 或右键': '空格或右键',
         'Enter/右键': '空格/右键',
@@ -2138,15 +3448,56 @@ def main():
         type=Path,
         help="optional exported human-truth JSON used to repartition PDF ink",
     )
+    parser.add_argument(
+        "--reference-annotations",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="verified annotations whose exact matching leaf components seed the candidate",
+    )
+    parser.add_argument(
+        "--reference-selection",
+        choices=("first", "adaptive", "global"),
+        default="global",
+        help=(
+            "how exact-ID verified component templates are selected; global uses "
+            "whole-glyph reconstruction and never reads the target annotation"
+        ),
+    )
+    parser.add_argument(
+        "--template-geometry",
+        choices=("candidate", "selected"),
+        default="candidate",
+        help=(
+            "candidate uses verified templates only as selection evidence; selected "
+            "also applies their transferred centerlines (experimental)"
+        ),
+    )
     parser.add_argument("--unicode", required=True, help="hex codepoint, e.g. 6418")
     parser.add_argument("--source", required=True)
     parser.add_argument("--glyph-id", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--canvas", type=int, default=512)
+    parser.add_argument(
+        "--snap-mode",
+        choices=("coherent", "graph", "corridor", "sequential"),
+        default="coherent",
+        help=(
+            "graph follows connected PDF skeleton edges; corridor additionally "
+            "prevents wandering; sequential jointly consumes routes in stroke order"
+        ),
+    )
+    parser.add_argument(
+        "--partition-mode",
+        choices=("flat", "hierarchical"),
+        default="flat",
+        help="hierarchical assigns PDF ink to leaf component instances before strokes",
+    )
     args = parser.parse_args()
 
     codepoint = int(args.unicode.removeprefix("U+").removeprefix("u+"), 16)
     candidate_rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
+    reference_candidates = candidate_catalog(candidate_rows)
     evidence = (
         json.loads(args.evidence.read_text("utf-8"))
         if args.evidence and args.evidence.exists()
@@ -2166,8 +3517,18 @@ def main():
     ) < 224
     target = normalize_target(source_mask, args.canvas)
     candidate = candidate_strokes(row, args.glyph_id)
+    verified_coverage_comparison = compare_verified_component_coverage(
+        {
+            int(glyph_text): candidate_strokes(row, int(glyph_text))
+            for glyph_text in row["candidates"]
+        },
+        args.reference_annotations,
+        reference_candidates=reference_candidates,
+        target_source=args.source,
+    )
     normalized_annotations = None
     annotation_corrections = []
+    sequential_search = None
     if args.annotations:
         strokes, normalized_document, annotation_corrections = load_human_annotations(
             args.annotations,
@@ -2191,12 +3552,98 @@ def main():
             args.canvas,
         )
     else:
-        strokes = candidate
+        template_choices = []
+        global_template_search = None
+        if args.reference_selection == "global":
+            strokes, global_template_search = search_component_templates_globally(
+                candidate,
+                args.reference_annotations,
+                target,
+                args.canvas,
+                target_unicode=f"U+{codepoint:04X}",
+                target_source=args.source,
+                reference_candidates=reference_candidates,
+            )
+            transferred_components = [
+                choice
+                for choice in global_template_search["choices"]
+                if choice["kind"] == "verified-annotation"
+            ]
+        elif args.reference_selection == "adaptive":
+            strokes, template_choices = select_component_templates_by_alignment(
+                candidate,
+                args.reference_annotations,
+                target,
+                args.canvas,
+                target_unicode=f"U+{codepoint:04X}",
+                target_source=args.source,
+                reference_candidates=reference_candidates,
+            )
+            transferred_components = [
+                choice
+                for choice in template_choices
+                if choice["selectedKind"] == "verified-annotation"
+            ]
+        else:
+            strokes, transferred_components = transfer_verified_component_strokes(
+                candidate,
+                args.reference_annotations,
+                target_unicode=f"U+{codepoint:04X}",
+                target_source=args.source,
+                reference_candidates=reference_candidates,
+            )
+        selected_template_strokes = strokes
+        if args.template_geometry == "candidate":
+            strokes = copy.deepcopy(candidate)
         fitted = fit_centerlines(strokes, args.canvas)
-        snapped, snap_distances = snap_centerlines(
-            fitted, target, max_distance=args.canvas * 0.08
+        if args.snap_mode == "sequential":
+            snapped, snap_distances, sequential_search = snap_centerlines_sequentially(
+                strokes, fitted, target
+            )
+        elif args.snap_mode in {"graph", "corridor"}:
+            snapped, snap_distances = snap_centerlines_on_skeleton_graph(
+                fitted,
+                target,
+                corridor_ratio=0.05 if args.snap_mode == "corridor" else None,
+            )
+        else:
+            snapped, snap_distances = snap_centerlines(
+                fitted, target, max_distance=args.canvas * 0.08
+            )
+        if args.partition_mode == "hierarchical":
+            masks, ambiguous, metrics = partition_components_then_strokes(
+                target, snapped, strokes
+            )
+        else:
+            masks, ambiguous, metrics = partition_strokes(target, snapped)
+        metrics["inkPartitionMode"] = args.partition_mode
+        metrics["partitionMode"] = (
+            f"verified-component-transfer-{args.reference_selection}"
+            if transferred_components and args.template_geometry == "selected"
+            else f"candidate-driven-with-{args.reference_selection}-template-evidence"
+            if transferred_components
+            else "candidate-driven"
         )
-        masks, ambiguous, metrics = partition_strokes(target, snapped)
+        metrics["transferredComponents"] = transferred_components
+        metrics["templateGeometry"] = args.template_geometry
+        metrics["appliedTransferredComponents"] = (
+            transferred_components if args.template_geometry == "selected" else []
+        )
+        metrics["selectedTemplateStrokeCount"] = len(selected_template_strokes)
+        metrics["templateChoices"] = template_choices
+        metrics["globalTemplateSearch"] = global_template_search
+        template_review_reasons = []
+        if global_template_search:
+            if global_template_search.get("margin") is None:
+                template_review_reasons.append("no-competing-template-combination")
+            elif global_template_search["margin"] < 0.03:
+                template_review_reasons.append("small-global-score-margin")
+            if global_template_search["componentsWithoutVerifiedTemplates"]:
+                template_review_reasons.append("components-without-verified-template")
+        metrics["templateReviewReasons"] = template_review_reasons
+        metrics["requiresTemplateReview"] = bool(template_review_reasons)
+        metrics["sequentialStrokeSearch"] = sequential_search
+        metrics["snapMode"] = args.snap_mode
     fragment_counts = []
     for mask in masks:
         component_count, _labels = cv2.connectedComponents(
@@ -2204,7 +3651,9 @@ def main():
         )
         fragment_counts.append(max(0, int(component_count) - 1))
     metrics["candidateStrokeCount"] = len(strokes)
+    metrics["verifiedCoverageComparison"] = verified_coverage_comparison
     metrics["candidateStrokeOrder"] = [stroke["feature"] for stroke in strokes]
+    metrics["strokeSequenceProfile"] = stroke_sequence_profile(strokes)
     metrics["pdfActualStrokeCount"] = len(strokes) if args.annotations else None
     metrics["pdfActualStrokeOrder"] = (
         normalized_document.get("metadata", {}).get("candidateStrokeOrder")

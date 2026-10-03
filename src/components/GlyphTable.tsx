@@ -21,10 +21,9 @@ import type {
 } from "hanzi-chai";
 import {
   isVectorStroke,
-  复合体,
   是用户字形,
   结构描述字符列表,
-  部件,
+  type 部件,
 } from "hanzi-chai";
 import { useAtom, useAtomValue } from "jotai";
 import { type ReactElement, useMemo, useState } from "react";

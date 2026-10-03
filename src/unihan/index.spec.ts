@@ -14,6 +14,7 @@ import {
   buildReviewedGlyphSiblingIndex,
   buildSourceEvidenceIndex,
   IRG_PROPERTY_TO_SOURCE,
+  isRecommendationSample,
   parseSourceVisualEvidence,
   parseUnihanIRGSources,
   readUnihanVersion,
@@ -21,6 +22,17 @@ import {
   resolveUnresolvedSourceProposal,
   sortSources,
 } from "./index";
+
+test("keeps the shared reviewed ranges aligned with the maintainer workflow", () => {
+  expect(isRecommendationSample(0x866a)).toBe(true);
+  expect(isRecommendationSample(0x866b)).toBe(false);
+  expect(isRecommendationSample(0x89d2)).toBe(true);
+  expect(isRecommendationSample(0x8c36)).toBe(true);
+  expect(isRecommendationSample(0x8d64)).toBe(true);
+  expect(isRecommendationSample(0x8d6f)).toBe(true);
+  expect(isRecommendationSample(0x8fb6)).toBe(true);
+  expect(isRecommendationSample(0x9fff)).toBe(true);
+});
 
 describe("parseUnihanIRGSources", () => {
   test("parses one source", () => {
@@ -221,6 +233,17 @@ describe("recommendation safety", () => {
     expect(result.proposals[0]?.glyph.references).toEqual([
       { id: 2, xbegin: 10 },
       { id: 3, ybegin: 4 },
+    ]);
+  });
+
+  test("supports a custom reviewed predicate for leakage-free holdouts", () => {
+    const evidence = buildSourceEvidenceIndex(
+      reviewedSamples,
+      glyphs,
+      (unicode) => unicode === reviewedSamples[0]!.unicode,
+    );
+    expect([...evidence.get("T")!.get(1)!.get(2)!]).toEqual([
+      reviewedSamples[0]!.unicode,
     ]);
   });
 

@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import tempfile
@@ -15,6 +16,268 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_merge_intersecting_annotations_trims_first_stroke_at_shared_turn(self):
+        annotations = [
+            {
+                "type": "polyline",
+                "label": "934",
+                "points": [[43.0, 47.0], [43.0, 72.0]],
+                "fixedPoints": [[43.0, 47.0], [43.0, 72.0]],
+            },
+            {
+                "type": "polyline",
+                "label": "934",
+                "points": [[43.0, 66.0], [60.0, 66.0]],
+            },
+        ]
+
+        merged = MODULE.merge_intersecting_annotation_strokes(annotations, 0, 1)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["type"], "polyline")
+        self.assertEqual(merged[0]["label"], "934")
+        self.assertEqual(
+            merged[0]["points"],
+            [[43.0, 47.0], [43.0, 66.0], [60.0, 66.0]],
+        )
+        self.assertEqual(merged[0]["fixedPoints"], merged[0]["points"])
+
+    def test_human_truth_warning_counts_all_region_tools(self):
+        warning = MODULE.human_truth_warning(
+            stroke_count=15,
+            metrics={
+                "humanRegionCount": 5,
+                "humanLassoCount": 0,
+                "humanPolygonCount": 5,
+            },
+            correction_count=0,
+        )
+
+        self.assertEqual(
+            warning,
+            "已载入人工真值：15 笔、5 个部件圈；按真值重分区。ID 自动纠正 0 项。",
+        )
+
+    def test_stroke_sequence_profile_treats_repeated_leaf_occurrences_as_distinct(self):
+        strokes = [
+            {"componentId": 117, "occurrence": 0, "feature": "点"},
+            {"componentId": 117, "occurrence": 0, "feature": "撇"},
+            {"componentId": 1, "occurrence": 0, "feature": "横"},
+            {"componentId": 117, "occurrence": 1, "feature": "点"},
+            {"componentId": 117, "occurrence": 1, "feature": "撇"},
+        ]
+        profile = MODULE.stroke_sequence_profile(strokes)
+        self.assertTrue(profile["sequentiallyClosed"])
+        self.assertEqual(profile["componentInstanceCount"], 3)
+        self.assertEqual(profile["completionStrokes"], [2, 3, 5])
+
+    def test_stroke_sequence_profile_rejects_reentering_same_instance(self):
+        strokes = [
+            {"componentId": 10, "occurrence": 0, "feature": "横"},
+            {"componentId": 20, "occurrence": 0, "feature": "竖"},
+            {"componentId": 10, "occurrence": 0, "feature": "点"},
+        ]
+        profile = MODULE.stroke_sequence_profile(strokes)
+        self.assertFalse(profile["sequentiallyClosed"])
+        self.assertEqual(
+            profile["reenteredInstances"],
+            [{"componentId": 10, "occurrence": 0}],
+        )
+
+    def test_verified_component_transfer_requires_exact_id_and_stroke_count(self):
+        candidate = [
+            {"componentId": 10, "points": np.array([[0.0, 0.0], [1.0, 0.0]])},
+            {"componentId": 10, "points": np.array([[0.0, 1.0], [1.0, 1.0]])},
+            {"componentId": 20, "points": np.array([[2.0, 0.0], [2.0, 1.0]])},
+        ]
+        annotations = {
+            "annotations": [
+                {"type": "polyline", "label": "10", "points": [[5, 5], [6, 5]]},
+                {"type": "polyline", "label": "10", "points": [[5, 6], [6, 6]]},
+                # Wrong count for component 20: it must not be transferred.
+                {"type": "polyline", "label": "20", "points": [[7, 5], [7, 6]]},
+                {"type": "polyline", "label": "20", "points": [[8, 5], [8, 6]]},
+                {"type": "polygon", "label": "10", "points": [[0, 0], [1, 0], [1, 1]]},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "truth.json"
+            path.write_text(json.dumps(annotations), "utf-8")
+            transferred, details = MODULE.transfer_verified_component_strokes(
+                candidate, [path]
+            )
+        np.testing.assert_array_equal(
+            transferred[0]["points"], np.array([[0.0, 0.0], [1.0, 0.0]])
+        )
+        np.testing.assert_array_equal(transferred[2]["points"], candidate[2]["points"])
+        self.assertEqual([item["componentId"] for item in details], [10])
+
+    def test_same_character_transfer_preserves_absolute_component_layout(self):
+        candidate = [
+            {"componentId": 10, "points": np.array([[0.0, 0.0], [1.0, 0.0]])},
+        ]
+        annotations = {
+            "metadata": {"unicode": "U+64CE", "source": "G"},
+            "annotations": [
+                {"type": "polyline", "label": "10", "points": [[25, 30], [40, 30]]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "truth.json"
+            path.write_text(json.dumps(annotations), "utf-8")
+            transferred, details = MODULE.transfer_verified_component_strokes(
+                candidate, [path], target_unicode="U+64CE", target_source="G"
+            )
+        np.testing.assert_array_equal(
+            transferred[0]["points"], np.array([[25.0, 30.0], [40.0, 30.0]])
+        )
+        self.assertEqual(
+            details[0]["transferMode"], "same-character-and-source-absolute"
+        )
+
+    def test_same_character_different_source_uses_component_local_layout(self):
+        candidate = [
+            {"componentId": 10, "points": np.array([[10.0, 10.0], [20.0, 10.0]])},
+        ]
+        annotations = {
+            "metadata": {"unicode": "U+64CE", "source": "T"},
+            "annotations": [
+                {"type": "polyline", "label": "10", "points": [[25, 30], [40, 30]]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "truth.json"
+            path.write_text(json.dumps(annotations), "utf-8")
+            transferred, details = MODULE.transfer_verified_component_strokes(
+                candidate, [path], target_unicode="U+64CE", target_source="G"
+            )
+        np.testing.assert_array_equal(transferred[0]["points"], candidate[0]["points"])
+        self.assertEqual(details[0]["transferMode"], "component-local")
+
+    def test_reference_transfer_normalizes_exported_sibling_label_from_candidate_order(self):
+        candidate = [
+            {
+                "componentId": 1128,
+                "feature": "横",
+                "points": np.array([[10.0, 10.0], [20.0, 10.0]]),
+            },
+            {
+                "componentId": 1128,
+                "feature": "竖弯钩",
+                "points": np.array([[20.0, 10.0], [20.0, 20.0]]),
+            },
+        ]
+        annotations = {
+            "metadata": {
+                "candidateGlyphId": 99,
+                "candidateStrokeOrder": ["横", "竖弯钩"],
+                "source": "T",
+            },
+            "annotations": [
+                {"type": "line", "label": "133", "points": [[30, 30], [50, 30]]},
+                {"type": "line", "label": "133", "points": [[50, 30], [50, 50]]},
+            ],
+        }
+        reference_candidates = {99: copy.deepcopy(candidate)}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "truth.json"
+            path.write_text(json.dumps(annotations), "utf-8")
+            transferred, details = MODULE.transfer_verified_component_strokes(
+                candidate,
+                [path],
+                reference_candidates=reference_candidates,
+            )
+            coverage = MODULE.verified_component_coverage(
+                candidate,
+                [path],
+                reference_candidates=reference_candidates,
+                target_source="T",
+            )
+            comparison = MODULE.compare_verified_component_coverage(
+                {
+                    1: candidate,
+                    2: [
+                        {**stroke, "componentId": 133}
+                        for stroke in copy.deepcopy(candidate)
+                    ],
+                },
+                [path],
+                reference_candidates=reference_candidates,
+                target_source="T",
+            )
+
+        self.assertEqual([item["componentId"] for item in details], [1128])
+        self.assertEqual(
+            details[0]["annotationLabelCorrections"],
+            [
+                {
+                    "strokeNumber": 1,
+                    "from": 133,
+                    "to": 1128,
+                    "reason": "reference candidate stroke ownership",
+                },
+                {
+                    "strokeNumber": 2,
+                    "from": 133,
+                    "to": 1128,
+                    "reason": "reference candidate stroke ownership",
+                },
+            ],
+        )
+        np.testing.assert_array_equal(transferred[0]["points"], candidate[0]["points"])
+        self.assertEqual(coverage["verifiedExactIds"], [1128])
+        self.assertEqual(coverage["verifiedSameSourceExactIds"], [1128])
+        self.assertEqual(coverage["normalizedReferenceLabelCorrections"], 2)
+        self.assertEqual(comparison["evidenceGlyphId"], 1)
+        self.assertEqual(
+            comparison["discriminatingSameSourceVerifiedIds"],
+            {"1": [1128], "2": []},
+        )
+
+    def test_global_template_search_prefers_better_whole_glyph_reconstruction(self):
+        candidate = [
+            {"componentId": 10, "points": np.array([[50.0, 10.0], [50.0, 90.0]])},
+        ]
+        annotations = {
+            "metadata": {"unicode": "U+TEST", "source": "G"},
+            "annotations": [
+                {"type": "polyline", "label": "10", "points": [[10, 50], [90, 50]]},
+            ],
+        }
+        target = np.zeros((64, 64), dtype=bool)
+        target[30:34, 8:56] = True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "truth.json"
+            path.write_text(json.dumps(annotations), "utf-8")
+            selected, search = MODULE.search_component_templates_globally(
+                candidate,
+                [path],
+                target,
+                64,
+                target_unicode="U+TEST",
+                target_source="G",
+                beam_width=2,
+            )
+        self.assertEqual(search["choices"][0]["kind"], "verified-annotation")
+        self.assertEqual(search["componentOptionCounts"], {"10": 2})
+        self.assertEqual(search["componentsWithoutVerifiedTemplates"], [])
+        np.testing.assert_array_equal(
+            selected[0]["points"], np.array([[10.0, 50.0], [90.0, 50.0]])
+        )
+
+    def test_global_template_search_reports_missing_verified_coverage(self):
+        candidate = [
+            {"componentId": 10, "points": np.array([[5.0, 5.0], [25.0, 5.0]])},
+        ]
+        target = np.zeros((32, 32), dtype=bool)
+        target[4:7, 5:26] = True
+        _selected, search = MODULE.search_component_templates_globally(
+            candidate, [], target, 32, beam_width=2
+        )
+        self.assertEqual(search["componentOptionCounts"], {"10": 1})
+        self.assertEqual(search["componentsWithoutVerifiedTemplates"], [10])
+        self.assertIsNone(search["margin"])
+
     def test_annotation_editor_uses_pointerdown_and_smooth_auto_tangents(self):
         script = MODULE.annotation_editor_script(
             {
@@ -22,6 +285,12 @@ class StrokeTransferTest(unittest.TestCase):
                 "unicode": "U+6418",
                 "source": "G",
                 "candidateGlyphId": 17973,
+                "defaultComponentId": 220,
+                "defaultComponentColor": "#f59e0b",
+                "defaultComponentSequence": [
+                    {"id": 220, "color": "#f59e0b"},
+                    {"id": 934, "color": "#db2777"},
+                ],
             }
         )
 
@@ -42,6 +311,13 @@ class StrokeTransferTest(unittest.TestCase):
         self.assertIn("event.code === 'Space' && document.activeElement === board", script)
         self.assertIn("event.preventDefault();\n        board.focus({preventScroll: true})", script)
         self.assertNotIn("event.key === 'Enter'", script)
+        self.assertIn("if (!annotations.length && metadata.defaultComponentId != null)", script)
+        self.assertIn("labelInput.value = String(metadata.defaultComponentId)", script)
+        self.assertIn("colorInput.value = metadata.defaultComponentColor", script)
+        self.assertIn("let tool = 'polyline'", script)
+        self.assertNotIn("let tool = 'freehand'", script)
+        self.assertIn("const advanceDefaultComponent = () =>", script)
+        self.assertIn("nextTool === labelFollowupTool && advanceDefaultComponent()", script)
 
     def test_directed_stroke_features_change_when_arc_is_reversed(self):
         forward = np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]])
@@ -242,6 +518,131 @@ class StrokeTransferTest(unittest.TestCase):
         matching = MODULE.candidate_alignment_metrics(horizontal, target, 64)
         different = MODULE.candidate_alignment_metrics(vertical, target, 64)
         self.assertLess(matching["score"], different["score"])
+
+    def test_graph_snap_returns_only_connected_skeleton_edges(self):
+        skeleton = np.zeros((32, 32), dtype=bool)
+        skeleton[5, 5:25] = True
+        skeleton[5:25, 24] = True
+        template = np.array([[5.0, 5.0], [24.0, 5.0], [24.0, 24.0]])
+        snapped, _maximum = MODULE.snap_polyline_on_skeleton_graph(
+            template, skeleton
+        )
+        steps = np.abs(np.diff(snapped, axis=0))
+        self.assertTrue(np.all(np.max(steps, axis=1) == 1))
+        self.assertTrue(np.all(skeleton[snapped[:, 1].astype(int), snapped[:, 0].astype(int)]))
+        np.testing.assert_array_equal(snapped[0], [5.0, 5.0])
+        np.testing.assert_array_equal(snapped[-1], [24.0, 24.0])
+
+    def test_sequential_snap_consumes_strokes_in_order(self):
+        target = np.zeros((32, 32), dtype=bool)
+        target[7:10, 4:28] = True
+        target[21:24, 4:28] = True
+        strokes = [
+            {"componentId": 10, "occurrence": 0, "feature": "横"},
+            {"componentId": 20, "occurrence": 0, "feature": "横"},
+        ]
+        lines = [
+            np.array([[4.0, 8.0], [27.0, 8.0]]),
+            np.array([[4.0, 22.0], [27.0, 22.0]]),
+        ]
+        selected, maxima, search = MODULE.snap_centerlines_sequentially(
+            strokes, lines, target, beam_width=8
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(len(maxima), 2)
+        self.assertEqual(
+            [choice["strokeNumber"] for choice in search["choices"]], [1, 2]
+        )
+        self.assertTrue(search["strokeSequenceProfile"]["sequentiallyClosed"])
+        self.assertLess(search["uncoveredSkeletonRatio"], 0.4)
+
+    def test_hierarchical_partition_closes_component_before_strokes(self):
+        target = np.zeros((32, 32), dtype=bool)
+        target[5:9, 3:29] = True
+        target[21:25, 3:29] = True
+        strokes = [
+            {"componentId": 10, "occurrence": 0},
+            {"componentId": 20, "occurrence": 0},
+        ]
+        lines = [
+            np.array([[3.0, 7.0], [28.0, 7.0]]),
+            np.array([[3.0, 23.0], [28.0, 23.0]]),
+        ]
+        masks, _ambiguous, metrics = MODULE.partition_components_then_strokes(
+            target, lines, strokes
+        )
+        self.assertTrue(np.array_equal(masks[0], target & (np.indices(target.shape)[0] < 16)))
+        self.assertTrue(np.array_equal(masks[1], target & (np.indices(target.shape)[0] >= 16)))
+        self.assertEqual(metrics["componentInstanceCount"], 2)
+
+    def test_component_closure_score_prefers_matching_closed_components(self):
+        target = np.zeros((64, 64), dtype=bool)
+        target[14:18, 8:28] = True
+        target[46:50, 36:56] = True
+        matching = [
+            {
+                "componentId": 10,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.array([[12.5, 25.0], [43.5, 25.0]]),
+            },
+            {
+                "componentId": 20,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.array([[56.0, 75.0], [87.5, 75.0]]),
+            },
+        ]
+        mismatching = copy.deepcopy(matching)
+        mismatching[1]["points"] = np.array([[56.0, 25.0], [87.5, 25.0]])
+        good = MODULE.component_closure_alignment_metrics(matching, target, 64)
+        bad = MODULE.component_closure_alignment_metrics(mismatching, target, 64)
+        self.assertLess(good["score"], bad["score"])
+        self.assertEqual([item["lastStroke"] for item in good["componentClosures"]], [1, 2])
+
+    def test_shared_focus_window_is_candidate_independent(self):
+        first = [
+            {"componentId": 99, "points": np.array([[0.0, 0.0], [100.0, 100.0]])},
+            {"componentId": 10, "points": np.array([[10.0, 20.0], [30.0, 20.0]])},
+        ]
+        second = [
+            {"componentId": 99, "points": np.array([[0.0, 0.0], [100.0, 100.0]])},
+            {"componentId": 20, "points": np.array([[60.0, 70.0], [90.0, 70.0]])},
+        ]
+        minimum, maximum = MODULE.shared_focus_window(
+            [first, second], {10, 20}, 100
+        )
+        reversed_minimum, reversed_maximum = MODULE.shared_focus_window(
+            [second, first], {10, 20}, 100
+        )
+        np.testing.assert_array_equal(minimum, reversed_minimum)
+        np.testing.assert_array_equal(maximum, reversed_maximum)
+        first_focus = MODULE.fit_centerlines(first, 100)[1]
+        second_focus = MODULE.fit_centerlines(second, 100)[1]
+        for point in np.concatenate([first_focus, second_focus]):
+            self.assertTrue(np.all(point >= minimum))
+            self.assertTrue(np.all(point <= maximum))
+
+    def test_directed_polyline_distortion_preserves_pen_direction(self):
+        horizontal = np.array([[0.0, 0.0], [20.0, 0.0]])
+        same = np.array([[1.0, 1.0], [21.0, 1.0]])
+        reversed_line = same[::-1]
+        diagonal = np.array([[1.0, 1.0], [15.0, 15.0]])
+
+        self.assertEqual(
+            MODULE.directed_polyline_distortions(horizontal, same),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertEqual(
+            MODULE.directed_polyline_distortions(horizontal, reversed_line),
+            (180.0, 180.0, 180.0),
+        )
+        displacement, start, end = MODULE.directed_polyline_distortions(
+            horizontal, diagonal
+        )
+        self.assertAlmostEqual(displacement, 45.0)
+        self.assertAlmostEqual(start, 45.0)
+        self.assertAlmostEqual(end, 45.0)
 
     def test_vectorizes_holes_with_evenodd_compatible_subpaths(self):
         mask = np.zeros((40, 40), dtype=bool)

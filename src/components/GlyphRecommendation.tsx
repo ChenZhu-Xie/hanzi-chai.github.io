@@ -1,10 +1,8 @@
 import type { ProFormInstance } from "@ant-design/pro-components";
 import {
   ProForm,
-  ProFormDigit,
   ProFormGroup,
   ProFormList,
-  ProFormText,
 } from "@ant-design/pro-components";
 import { Button, Flex, Input, Popconfirm } from "antd";
 import type {
@@ -18,6 +16,7 @@ import { isEqual, maxBy, sumBy } from "lodash-es";
 import type { MutableRefObject, ReactNode } from "react";
 import { useRef, useState } from "react";
 import { createGlyph, updateCharacter } from "~/api";
+import { RECOMMENDATION_SAMPLE_RANGES } from "~/unihan";
 import { errorFeedback } from "~/utils";
 import { 可编辑字形列表原子, 可编辑字符列表原子 } from "../atoms";
 import GlyphSelect from "./GlyphSelect";
@@ -87,7 +86,10 @@ export const BatchGlyphRecommendation = () => {
   const [to, setTo] = useState<number>(0);
 
   const CJKtotal = 20992;
-  const finished = sumBy(visitedRanges, ({ start, end }) => end - start + 1);
+  const finished = sumBy(
+    RECOMMENDATION_SAMPLE_RANGES,
+    ({ start, end }) => end - start + 1,
+  );
   const percentage = (finished / CJKtotal) * 100;
   return (
     <Popconfirm
@@ -216,16 +218,6 @@ export default function GlyphRecommendation({
   );
 }
 
-const visitedRanges = [
-  { start: 0x4e00, end: 0x6400 },
-  { start: 0x7a70, end: 0x7aca },
-  { start: 0x7cf8, end: 0x7f35 },
-  { start: 0x8278, end: 0x866a },
-  { start: 0x89d2, end: 0x8c36 },
-  { start: 0x8d64, end: 0x8d6f },
-  { start: 0x8fb6, end: 0x9fff },
-];
-
 function 计算字形推荐(
   character: 字符数据,
   可编辑字符列表: 字符数据[],
@@ -239,7 +231,7 @@ function 计算字形推荐(
     }),
   );
   const 样本字符范围 = 可编辑字符列表.filter((c) =>
-    visitedRanges.some(
+    RECOMMENDATION_SAMPLE_RANGES.some(
       ({ start, end }) => c.unicode >= start && c.unicode <= end,
     ),
   );

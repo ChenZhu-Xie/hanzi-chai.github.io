@@ -13,6 +13,12 @@ SPEC.loader.exec_module(PDF)
 
 
 class ThresholdCalibrationTest(unittest.TestCase):
+    def test_reviewed_ranges_match_the_current_maintainer_boundaries(self):
+        for codepoint in (0x866A, 0x89D2, 0x8C36, 0x8D64, 0x8D6F, 0x9FFF):
+            self.assertTrue(PDF.reviewed(codepoint))
+        for codepoint in (0x866B, 0x89D1, 0x8C37, 0x8D63, 0x8D70):
+            self.assertFalse(PDF.reviewed(codepoint))
+
     def test_calibrates_strict_and_likely_thresholds_from_the_same_labels(self):
         labels = [
             (0.10, True),

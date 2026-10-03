@@ -30,7 +30,11 @@ def main() -> None:
     parser.add_argument("--answers", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--canvas", type=int, default=256)
-    parser.add_argument("--mode", choices=("global", "focus"), default="global")
+    parser.add_argument(
+        "--mode",
+        choices=("global", "focus", "common-focus", "component-closure"),
+        default="global",
+    )
     args = parser.parse_args()
 
     rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
@@ -68,18 +72,39 @@ def main() -> None:
         target = TRANSFER.normalize_target(source_mask, args.canvas)
         candidate_metrics = {}
         candidate_ids = [int(glyph_id_text) for glyph_id_text in row["candidates"]]
+        candidate_stroke_sets = {
+            glyph_id_text: TRANSFER.candidate_strokes(row, int(glyph_id_text))
+            for glyph_id_text in row["candidates"]
+        }
+        common_focus_window = (
+            TRANSFER.shared_focus_window(
+                list(candidate_stroke_sets.values()),
+                set(row["focusLeafIds"]),
+                args.canvas,
+            )
+            if args.mode == "common-focus"
+            else None
+        )
         for glyph_id_text in row["candidates"]:
             glyph_id = int(glyph_id_text)
-            strokes = TRANSFER.candidate_strokes(row, glyph_id)
-            metrics = TRANSFER.candidate_alignment_metrics(
-                strokes,
-                target,
-                args.canvas,
-                focus_component_ids=(
-                    set(row["focusLeafIds"]) if args.mode == "focus" else None
-                ),
-            )
-            metrics.pop("snapped")
+            strokes = candidate_stroke_sets[glyph_id_text]
+            if args.mode == "component-closure":
+                metrics = TRANSFER.component_closure_alignment_metrics(
+                    strokes, target, args.canvas
+                )
+            else:
+                metrics = TRANSFER.candidate_alignment_metrics(
+                    strokes,
+                    target,
+                    args.canvas,
+                    focus_component_ids=(
+                        set(row["focusLeafIds"])
+                        if args.mode in {"focus", "common-focus"}
+                        else None
+                    ),
+                    focus_window=common_focus_window,
+                )
+                metrics.pop("snapped")
             candidate_metrics[glyph_id_text] = metrics
         ranking = sorted(
             (metrics["score"], int(glyph_id))

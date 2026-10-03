@@ -31,9 +31,10 @@ export const RECOMMENDATION_SAMPLE_RANGES = [
   { start: 0x4e00, end: 0x6400 },
   { start: 0x7a70, end: 0x7aca },
   { start: 0x7cf8, end: 0x7f35 },
-  { start: 0x8fb6, end: 0x9090 },
-  { start: 0x96e8, end: 0x9761 },
-  { start: 0x8278, end: 0x827f },
+  { start: 0x8278, end: 0x866a },
+  { start: 0x89d2, end: 0x8c36 },
+  { start: 0x8d64, end: 0x8d6f },
+  { start: 0x8fb6, end: 0x9fff },
 ] as const;
 
 export type UnihanSourceMap = Map<number, string[]>;
@@ -333,11 +334,12 @@ export function isRecommendationSample(unicode: number): boolean {
 export function buildSourceEvidenceIndex(
   characters: 字符数据[],
   glyphs: 基本字形数据[],
+  reviewedSamplePredicate: (unicode: number) => boolean = isRecommendationSample,
 ): SourceEvidenceIndex {
   const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
   const index: SourceEvidenceIndex = new Map();
   for (const character of characters) {
-    if (!isRecommendationSample(character.unicode)) continue;
+    if (!reviewedSamplePredicate(character.unicode)) continue;
     const gEntry = character.glyphs.find((entry) =>
       entry.sources.includes("G"),
     );
@@ -468,12 +470,13 @@ export function augmentSourceEvidenceWithReviews(
 export function buildGlyphEvidenceIndex(
   characters: 字符数据[],
   glyphs: 基本字形数据[],
+  reviewedSamplePredicate: (unicode: number) => boolean = isRecommendationSample,
 ): GlyphEvidenceIndex {
   const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
   const glyphIds = new Set(glyphById.keys());
   const index: GlyphEvidenceIndex = new Map();
   for (const character of characters) {
-    if (!isRecommendationSample(character.unicode)) continue;
+    if (!reviewedSamplePredicate(character.unicode)) continue;
     const gEntry = character.glyphs.find((entry) =>
       entry.sources.includes("G"),
     );
@@ -539,11 +542,12 @@ function addSiblingExample(
 export function buildReviewedGlyphSiblingIndex(
   characters: 字符数据[],
   glyphs: 基本字形数据[],
+  reviewedSamplePredicate: (unicode: number) => boolean = isRecommendationSample,
 ): Map<number, GlyphSiblingCandidate[]> {
   const glyphById = new Map(glyphs.map((glyph) => [glyph.id, glyph]));
   const raw = new Map<number, Map<number, GlyphSiblingExample[]>>();
   for (const character of characters) {
-    if (!isRecommendationSample(character.unicode)) continue;
+    if (!reviewedSamplePredicate(character.unicode)) continue;
     const gEntry = character.glyphs.find((entry) =>
       entry.sources.includes("G"),
     );
@@ -1110,6 +1114,7 @@ export function auditUnihanSources(
     minimumDominance?: number;
     reviewedDecisions?: ReviewedSourceDecision[];
     visualEvidence?: ReadonlyMap<number, SourceVisualEvidence>;
+    reviewedSamplePredicate?: (unicode: number) => boolean;
   } = {},
 ): UnihanAudit {
   const from = options.from ?? CJK_UNIFIED_START;
@@ -1121,14 +1126,28 @@ export function auditUnihanSources(
     characters.map((character) => [character.unicode, character]),
   );
   const glyphIndex = buildGlyphIndex(glyphs);
-  const evidenceIndex = buildSourceEvidenceIndex(characters, glyphs);
+  const reviewedSamplePredicate =
+    options.reviewedSamplePredicate ?? isRecommendationSample;
+  const evidenceIndex = buildSourceEvidenceIndex(
+    characters,
+    glyphs,
+    reviewedSamplePredicate,
+  );
   augmentSourceEvidenceWithReviews(
     evidenceIndex,
     options.reviewedDecisions ?? [],
     glyphs,
   );
-  const glyphEvidenceIndex = buildGlyphEvidenceIndex(characters, glyphs);
-  const knownSiblingIndex = buildReviewedGlyphSiblingIndex(characters, glyphs);
+  const glyphEvidenceIndex = buildGlyphEvidenceIndex(
+    characters,
+    glyphs,
+    reviewedSamplePredicate,
+  );
+  const knownSiblingIndex = buildReviewedGlyphSiblingIndex(
+    characters,
+    glyphs,
+    reviewedSamplePredicate,
+  );
   const knownSiblingIds = new Set<number>();
   const markKnownSiblingTree = (
     referenceId: number,
@@ -1214,7 +1233,7 @@ export function auditUnihanSources(
     if (!character) {
       status = "unsupported";
       reason = "当前 hanzi-chai 数据中没有这个字符。";
-    } else if (isRecommendationSample(unicode)) {
+    } else if (reviewedSamplePredicate(unicode)) {
       status = "reviewed-reference";
       reason = "属于维护者已完成区间；只作为推荐训练样本，不进入自动写入。";
     } else if (!expectedSet.has("G") || !existingSet.has("G")) {

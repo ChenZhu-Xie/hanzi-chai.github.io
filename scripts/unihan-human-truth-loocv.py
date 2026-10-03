@@ -1,9 +1,9 @@
-"""Five-fold human-truth evaluation without reading the held-out answer.
+"""Leave-one-human-truth-out evaluation without reading the held-out answer.
 
 The feature files may contain historical answer fields, but this module only
-loads candidate measurements.  Each fold receives four labels from exported
-annotation files.  ``predict_fold`` has no held-out-label parameter; the fifth
-annotation is opened only after its prediction has been frozen.
+loads candidate measurements.  Each fold receives every other exported label.
+``predict_fold`` has no held-out-label parameter; the held-out annotation is
+opened only after its prediction has been frozen.
 """
 
 from __future__ import annotations
@@ -311,7 +311,7 @@ def main() -> None:
 
     payload = {
         "protocol": {
-            "name": "five-fold leave-one-human-truth-out",
+            "name": "leave-one-human-truth-out",
             "trainingAnnotationsPerFold": len(paths) - 1,
             "heldoutAnnotationsPerFold": 1,
             "regularization": args.regularization,
