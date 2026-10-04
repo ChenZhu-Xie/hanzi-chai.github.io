@@ -439,6 +439,74 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertNotEqual(mapping[(10, 0)], mapping[(20, 0)])
         self.assertEqual(mapping[(20, 0)], mapping[(30, 0)])
 
+    def test_equal_island_count_respects_recursive_left_right_structure(self):
+        skeleton = np.zeros((13, 13), dtype=bool)
+        skeleton[1:12, 1] = True
+        for y in (1, 4, 7, 10):
+            skeleton[y, 7:12] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+
+        def hierarchy(component, parent=None):
+            items = [
+                {
+                    "id": component,
+                    "type": "component",
+                    "label": "末级部件",
+                    "familyKey": str(component),
+                }
+            ]
+            if parent is not None:
+                items.append(
+                    {
+                        "id": parent,
+                        "type": "compound",
+                        "label": "⿱",
+                        "familyKey": str(parent),
+                    }
+                )
+            items.append(
+                {
+                    "id": 900000,
+                    "type": "glyph",
+                    "label": "⿰",
+                    "familyKey": "900000",
+                }
+            )
+            return items
+
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 1.0], [0.0, 11.0]]),
+                "hierarchy": hierarchy(220),
+            }
+        ]
+        for occurrence, y in enumerate((1.0, 4.0, 7.0, 10.0)):
+            strokes.append(
+                {
+                    "componentId": 117 + occurrence,
+                    "occurrence": 0,
+                    "points": np.asarray([[7.0, y], [11.0, y]]),
+                    "hierarchy": hierarchy(117 + occurrence, 127533),
+                }
+            )
+        mapping = MODULE.component_mapping(strokes, graph)
+        target_centres = {
+            label: np.argwhere(graph.components == label)[:, ::-1].mean(axis=0)
+            for label in set(graph.components[graph.components > 0].tolist())
+        }
+        leftmost = min(target_centres, key=lambda label: target_centres[label][0])
+        self.assertEqual(mapping[(220, 0)], leftmost)
+        right_labels = sorted(
+            (label for label in target_centres if label != leftmost),
+            key=lambda label: target_centres[label][1],
+        )
+        self.assertEqual(
+            [mapping[(117 + index, 0)] for index in range(4)],
+            right_labels,
+        )
+
     def test_structural_columns_anchor_first_and_last_leaf_but_leave_middle_open(self):
         skeleton = np.zeros((12, 12), dtype=bool)
         skeleton[1:11, 1] = True

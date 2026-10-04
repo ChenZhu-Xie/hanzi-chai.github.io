@@ -383,7 +383,11 @@ def component_mapping(strokes: list[dict], graph: SkeletonGraph) -> dict[tuple[i
         points = np.vstack([member["points"] for member in members])
         candidate_groups.append((key, points.mean(axis=0)))
     if len(candidate_groups) == len(target_components):
-        # This is an ordinal structural mapping, not a geometric warp.
+        structural = recursive_structural_component_mapping(groups, target_components)
+        if structural is not None:
+            return structural
+        # Hierarchy-free legacy candidates retain an ordinal fallback.  New
+        # candidates must use their recursive decomposition above.
         candidate_groups.sort(key=lambda item: (item[1][1], item[1][0]))
         target_components.sort(key=lambda item: (item[1][1], item[1][0]))
         return {candidate[0]: target[0] for candidate, target in zip(candidate_groups, target_components)}
@@ -411,6 +415,110 @@ def component_mapping(strokes: list[dict], graph: SkeletonGraph) -> dict[tuple[i
         ][0]
         for (key, _raw_centre), centre in zip(candidate_groups, candidate_centres)
     }
+
+
+def recursive_structural_component_mapping(
+    groups: dict[tuple[int, int], list[dict]],
+    target_components: list[tuple[int, np.ndarray]],
+) -> dict[tuple[int, int], int] | None:
+    """Map equal-count PDF islands by the candidate decomposition tree.
+
+    Candidate geometry contributes sibling *order* only.  Its absolute size,
+    position, and outline never cross into the PDF.  At each ⿰/⿱ node the
+    matching target islands are partitioned recursively along that operator's
+    axis before any stroke route is ranked.
+    """
+    if not groups or len(groups) != len(target_components):
+        return None
+    hierarchy_by_key = {
+        key: list((members[0].get("hierarchy") or []))
+        for key, members in groups.items()
+    }
+    if any(len(hierarchy) < 2 for hierarchy in hierarchy_by_key.values()):
+        return None
+    roots = {
+        (int(hierarchy[-1]["id"]), str(hierarchy[-1].get("label", "")))
+        for hierarchy in hierarchy_by_key.values()
+    }
+    if len(roots) != 1:
+        return None
+    group_centres = {
+        key: np.vstack([member["points"] for member in members]).mean(axis=0)
+        for key, members in groups.items()
+    }
+    target_centres = {int(label): np.asarray(centre, dtype=float) for label, centre in target_components}
+    mapping: dict[tuple[int, int], int] = {}
+
+    def assign(
+        keys: list[tuple[int, int]],
+        labels: list[int],
+        parent_id: int,
+    ) -> bool:
+        if len(keys) != len(labels) or not keys:
+            return False
+        if len(keys) == 1:
+            mapping[keys[0]] = labels[0]
+            return True
+        parent_items = []
+        child_buckets: dict[tuple, list[tuple[int, int]]] = {}
+        child_parent_ids: dict[tuple, int | None] = {}
+        for key in keys:
+            hierarchy = hierarchy_by_key[key]
+            positions = [
+                index for index, item in enumerate(hierarchy) if int(item["id"]) == parent_id
+            ]
+            if not positions or positions[-1] == 0:
+                return False
+            position = positions[-1]
+            parent_items.append(hierarchy[position])
+            child = hierarchy[position - 1]
+            if position - 1 == 0:
+                token = ("leaf", key)
+                child_parent_ids[token] = None
+            else:
+                token = (
+                    "node",
+                    int(child["id"]),
+                    str(child.get("familyKey", child["id"])),
+                )
+                child_parent_ids[token] = int(child["id"])
+            child_buckets.setdefault(token, []).append(key)
+        operators = {str(item.get("label", "")) for item in parent_items}
+        if len(operators) != 1:
+            return False
+        operator = operators.pop()
+        if operator in {"⿰", "⿲"}:
+            axis = 0
+        elif operator in {"⿱", "⿳"}:
+            axis = 1
+        else:
+            return False
+        ordered_children = sorted(
+            child_buckets,
+            key=lambda token: float(
+                np.vstack([group_centres[key] for key in child_buckets[token]])[:, axis].mean()
+            ),
+        )
+        ordered_labels = sorted(labels, key=lambda label: float(target_centres[label][axis]))
+        offset = 0
+        for token in ordered_children:
+            child_keys = child_buckets[token]
+            child_labels = ordered_labels[offset : offset + len(child_keys)]
+            offset += len(child_keys)
+            child_parent = child_parent_ids[token]
+            if child_parent is None:
+                if len(child_keys) != 1 or len(child_labels) != 1:
+                    return False
+                mapping[child_keys[0]] = child_labels[0]
+            elif not assign(child_keys, child_labels, child_parent):
+                return False
+        return offset == len(ordered_labels)
+
+    root_id, _root_operator = next(iter(roots))
+    labels = [int(label) for label, _centre in target_components]
+    if not assign(list(groups), labels, root_id) or len(mapping) != len(groups):
+        return None
+    return mapping
 
 
 def component_label_options(
