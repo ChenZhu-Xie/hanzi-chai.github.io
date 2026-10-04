@@ -14,6 +14,87 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_stroke_rule_signature_binds_exact_leaf_and_ordinal(self):
+        strokes = [
+            {"componentId": 220, "occurrence": 0, "feature": "横"},
+            {"componentId": 220, "occurrence": 0, "feature": "竖钩"},
+            {"componentId": 220, "occurrence": 0, "feature": "提"},
+            {"componentId": 9, "occurrence": 0, "feature": "点"},
+        ]
+        signatures = MODULE.stroke_rule_signatures(strokes)
+        self.assertEqual(signatures[1]["key"], "220|2|3|竖钩")
+        self.assertEqual(signatures[3]["key"], "9|1|1|点")
+
+    def test_held_out_learned_rule_requires_two_other_cases_to_score(self):
+        signature = {
+            "key": "220|1|3|横",
+            "componentId": 220,
+            "occurrence": 0,
+            "ordinal": 1,
+            "count": 3,
+            "feature": "横",
+        }
+        model = {
+            "examplesBySignature": {
+                signature["key"]: [
+                    {
+                        "case": case,
+                        "start": {
+                            "topologyRole": "endpoint",
+                            "directionSector": "E",
+                            "componentNormalized": [0, 0],
+                            "glyphNormalized": [0, 0],
+                        },
+                        "junctionTurnSequence": [],
+                        "junctions": [],
+                    }
+                    for case in ("U+1111-G", "U+2222-G", "U+3333-G")
+                ]
+            }
+        }
+        rule = MODULE.learned_rule_for_stroke(model, signature, "U+1111-G")
+        self.assertEqual(rule["support"], 2)
+        self.assertEqual(rule["cases"], ["U+2222-G", "U+3333-G"])
+
+        skeleton = np.zeros((9, 9), dtype=bool)
+        skeleton[4, 1:8] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        endpoint_route = {"points": np.asarray([[1.0, 4.0], [7.0, 4.0]])}
+        path_route = {"points": np.asarray([[4.0, 4.0], [7.0, 4.0]])}
+        endpoint_cost, endpoint_evidence = MODULE.route_learned_cost(
+            endpoint_route, graph, rule, (np.asarray([1.0, 4.0]), np.asarray([7.0, 4.0]))
+        )
+        path_cost, path_evidence = MODULE.route_learned_cost(
+            path_route, graph, rule, (np.asarray([1.0, 4.0]), np.asarray([7.0, 4.0]))
+        )
+        self.assertEqual(endpoint_cost, 0.0)
+        self.assertGreater(path_cost, 0.0)
+        self.assertTrue(path_evidence["startRoleMismatch"])
+        self.assertFalse(path_evidence["startRoleScoringEnabled"])
+        self.assertTrue(endpoint_evidence["learnedScoringEnabled"])
+
+        duplicated = {
+            "examplesBySignature": {
+                signature["key"]: [
+                    {
+                        **model["examplesBySignature"][signature["key"]][0],
+                        "case": "U+2222-G",
+                    }
+                    for _index in range(2)
+                ]
+            }
+        }
+        duplicate_rule = MODULE.learned_rule_for_stroke(duplicated, signature, None)
+        self.assertEqual(duplicate_rule["support"], 1)
+        duplicate_cost, duplicate_evidence = MODULE.route_learned_cost(
+            path_route,
+            graph,
+            duplicate_rule,
+            (np.asarray([1.0, 4.0]), np.asarray([7.0, 4.0])),
+        )
+        self.assertEqual(duplicate_cost, 0.0)
+        self.assertFalse(duplicate_evidence["learnedScoringEnabled"])
+
     def test_turn_landmarks_distinguish_straight_from_right_angle(self):
         straight = np.asarray([[0.0, 0.0], [30.0, 0.0]])
         corner = np.asarray([[0.0, 0.0], [15.0, 0.0], [15.0, 15.0]])

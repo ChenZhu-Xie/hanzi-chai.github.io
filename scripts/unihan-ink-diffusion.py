@@ -523,11 +523,275 @@ def has_forward_continuation(
     return False
 
 
+def stroke_rule_signatures(strokes: list[dict]) -> list[dict]:
+    """Identify a reusable stroke role inside an exact leaf component."""
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
+        groups.setdefault(key, []).append(index)
+    output = []
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
+        members = groups[key]
+        ordinal = members.index(index) + 1
+        count = len(members)
+        feature = str(stroke.get("feature") or "未知")
+        output.append(
+            {
+                "key": f"{key[0]}|{ordinal}|{count}|{feature}",
+                "componentId": key[0],
+                "occurrence": key[1],
+                "ordinal": ordinal,
+                "count": count,
+                "feature": feature,
+            }
+        )
+    return output
+
+
+def point_topology_role(graph: SkeletonGraph, point: np.ndarray) -> str:
+    distances = np.linalg.norm(graph.points[:, ::-1].astype(float) - point, axis=1)
+    nearest = graph.points[int(np.argmin(distances))]
+    crossing = int(graph.crossing[tuple(nearest)])
+    if crossing <= 1:
+        return "endpoint"
+    if crossing >= 3:
+        return "junction"
+    return "path"
+
+
+def direction_sector(points: np.ndarray) -> str:
+    sampled = resample(points, 24)
+    window = min(6, len(sampled) - 1)
+    vector = sampled[window] - sampled[0]
+    angle = (math.degrees(math.atan2(float(vector[1]), float(vector[0]))) + 360.0) % 360.0
+    sectors = ("E", "SE", "S", "SW", "W", "NW", "N", "NE")
+    return sectors[int((angle + 22.5) // 45.0) % 8]
+
+
+def relative_turn_class(incoming: np.ndarray, outgoing: np.ndarray) -> str:
+    left_norm = float(np.linalg.norm(incoming))
+    right_norm = float(np.linalg.norm(outgoing))
+    if left_norm < 1e-6 or right_norm < 1e-6:
+        return "unknown"
+    incoming = incoming / left_norm
+    outgoing = outgoing / right_norm
+    signed = math.degrees(
+        math.atan2(
+            float(incoming[0] * outgoing[1] - incoming[1] * outgoing[0]),
+            float(np.dot(incoming, outgoing)),
+        )
+    )
+    if abs(signed) <= 28.0:
+        return "straight"
+    if abs(signed) >= 152.0:
+        return "reverse"
+    # SVG/PDF y grows downward, so use unambiguous screen-clock terminology.
+    return "clockwise" if signed > 0 else "counterclockwise"
+
+
+def junction_decision_details(points: np.ndarray, graph: SkeletonGraph) -> list[dict]:
+    """Describe chosen and locally available exits at real T/cross junctions."""
+    trace = critical_node_trace(points, graph)
+    if not trace:
+        return []
+    sampled = resample(points, 180)
+    adjacency = graph_adjacency(graph.matrix)
+    output = []
+    for item in trace:
+        point = np.asarray(item["point"], dtype=float)
+        index = int(np.argmin(np.linalg.norm(sampled - point, axis=1)))
+        before = max(0, index - 6)
+        after = min(len(sampled) - 1, index + 6)
+        if before == index or after == index:
+            continue
+        incoming = sampled[index] - sampled[before]
+        chosen = relative_turn_class(incoming, sampled[after] - sampled[index])
+        critical_yx = graph.critical[int(item["node"])]
+        graph_index = graph.point_index.get(critical_yx)
+        available = set()
+        if graph_index is not None:
+            origin = graph.points[graph_index][::-1].astype(float)
+            for neighbour, _weight in adjacency[graph_index]:
+                outgoing = graph.points[neighbour][::-1].astype(float) - origin
+                available.add(relative_turn_class(incoming, outgoing))
+        available.discard("unknown")
+        output.append(
+            {
+                "point": item["point"],
+                "fraction": item["fraction"],
+                "chosen": chosen,
+                "available": sorted(available),
+                "rejected": sorted(available - {chosen, "reverse"}),
+            }
+        )
+    return output
+
+
+def junction_turn_sequence(points: np.ndarray, graph: SkeletonGraph) -> list[str]:
+    """Return the directed decisions made at real T/cross junctions."""
+    return [item["chosen"] for item in junction_decision_details(points, graph)]
+
+
+def learned_rule_for_stroke(
+    model: dict | None,
+    signature: dict,
+    excluded_case: str | None,
+) -> dict | None:
+    if not model:
+        return None
+    examples = [
+        example
+        for example in model.get("examplesBySignature", {}).get(signature["key"], [])
+        if example.get("case") != excluded_case
+    ]
+    if not examples:
+        return None
+    cases = sorted({str(example["case"]) for example in examples})
+    role_counts: dict[str, int] = {}
+    sector_counts: dict[str, int] = {}
+    turn_counts: dict[tuple[str, ...], int] = {}
+    junction_choice_counts: dict[str, int] = {}
+    positions = []
+    glyph_positions = []
+    for example in examples:
+        role = str(example["start"]["topologyRole"])
+        role_counts[role] = role_counts.get(role, 0) + 1
+        sector = str(example["start"]["directionSector"])
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        turns = tuple(example["junctionTurnSequence"])
+        turn_counts[turns] = turn_counts.get(turns, 0) + 1
+        for junction in example.get("junctions", []):
+            choice = str(junction["chosen"])
+            junction_choice_counts[choice] = junction_choice_counts.get(choice, 0) + 1
+        positions.append(example["start"]["componentNormalized"])
+        glyph_positions.append(example["start"]["glyphNormalized"])
+    dominant_role, role_support = max(role_counts.items(), key=lambda item: item[1])
+    dominant_sector, sector_support = max(sector_counts.items(), key=lambda item: item[1])
+    dominant_turns, turn_support = max(turn_counts.items(), key=lambda item: item[1])
+    dominant_choice, choice_support = (
+        max(junction_choice_counts.items(), key=lambda item: item[1])
+        if junction_choice_counts
+        else (None, 0)
+    )
+    component_positions = np.asarray(positions, dtype=float)
+    glyph_positions_array = np.asarray(glyph_positions, dtype=float)
+    return {
+        "signature": signature["key"],
+        "support": len(cases),
+        "exampleCount": len(examples),
+        "cases": cases,
+        "startRole": dominant_role,
+        "startRoleConfidence": role_support / len(examples),
+        "startSector": dominant_sector,
+        "startSectorConfidence": sector_support / len(examples),
+        "componentStartMean": component_positions.mean(axis=0).tolist(),
+        "componentStartStd": component_positions.std(axis=0).tolist(),
+        "glyphStartMean": glyph_positions_array.mean(axis=0).tolist(),
+        "glyphStartStd": glyph_positions_array.std(axis=0).tolist(),
+        "junctionTurns": list(dominant_turns),
+        "junctionConfidence": turn_support / len(examples),
+        "junctionChoice": dominant_choice,
+        "junctionChoiceConfidence": (
+            choice_support / sum(junction_choice_counts.values())
+            if junction_choice_counts
+            else 0.0
+        ),
+    }
+
+
+def route_learned_cost(
+    route: dict,
+    graph: SkeletonGraph,
+    rule: dict | None,
+    target_glyph_bounds: tuple[np.ndarray, np.ndarray],
+) -> tuple[float, dict]:
+    role = point_topology_role(graph, route["points"][0])
+    sector = direction_sector(route["points"])
+    turns = junction_turn_sequence(route["points"], graph)
+    if rule is None:
+        return 0.0, {
+            "trainingSupport": 0,
+            "routeStartRole": role,
+            "routeJunctionTurns": turns,
+            "explanation": "no held-out exact-component training rule; no learned score applied",
+        }
+    # One example is useful explanatory evidence but is too brittle to steer
+    # the route. Two or more independent cases unlock a bounded learned cost.
+    enabled = int(rule["support"]) >= 2
+    role_mismatch = role != rule["startRole"]
+    sector_mismatch = sector != rule["startSector"]
+    route_glyph_start = normalized_point(route["points"][0], target_glyph_bounds)
+    glyph_start_distance = float(
+        np.linalg.norm(route_glyph_start - np.asarray(rule["glyphStartMean"], dtype=float))
+    )
+    # Skeleton role is deliberately explanatory only: a pen start can change
+    # from endpoint to ordinary path merely because another stroke crosses it.
+    # A glyph-relative start prior is allowed only when independent cases put
+    # this exact leaf stroke in a tight, repeatable region.
+    stable_start = max(rule["glyphStartStd"]) <= 0.08
+    position_cost = (
+        min(0.35, max(0.0, glyph_start_distance - 0.10) * 0.8)
+        if enabled and stable_start
+        else 0.0
+    )
+    sector_cost = (
+        0.12 * float(rule["startSectorConfidence"])
+        if enabled and rule["startSectorConfidence"] >= 0.8 and sector_mismatch
+        else 0.0
+    )
+    # Compare each encountered decision, not the number of detected junctions.
+    # Different fonts can merge/split a junction cluster; absence of a detected
+    # node is therefore never penalised.  A consistent human choice can only
+    # reject an explicit contradictory turn.
+    expected_choice = rule["junctionChoice"]
+    contradictory_turns = (
+        sum(turn != expected_choice for turn in turns)
+        if expected_choice is not None
+        else 0
+    )
+    turn_cost = (
+        min(0.7, 0.35 * contradictory_turns * float(rule["junctionChoiceConfidence"]))
+        if enabled and rule["junctionChoiceConfidence"] >= 0.85
+        else 0.0
+    )
+    turns_mismatch = bool(contradictory_turns)
+    clauses = [
+        f"start role {rule['startRole']} is explanatory only",
+        f"start sector {rule['startSector']} ({rule['startSectorConfidence']:.0%})",
+        "junction choices " + ("do not contradict" if not turns_mismatch else "contradict held-out truth"),
+    ]
+    return position_cost + sector_cost + turn_cost, {
+        "trainingSupport": int(rule["support"]),
+        "trainingCases": rule["cases"],
+        "learnedScoringEnabled": enabled,
+        "learnedStartRole": rule["startRole"],
+        "routeStartRole": role,
+        "startRoleMismatch": role_mismatch,
+        "startRoleScoringEnabled": False,
+        "learnedStartSector": rule["startSector"],
+        "routeStartSector": sector,
+        "startSectorMismatch": sector_mismatch,
+        "stableGlyphStart": stable_start,
+        "learnedGlyphStart": [round(float(value), 5) for value in rule["glyphStartMean"]],
+        "routeGlyphStart": [round(float(value), 5) for value in route_glyph_start],
+        "glyphStartDistance": round(glyph_start_distance, 5),
+        "learnedJunctionTurns": rule["junctionTurns"],
+        "routeJunctionTurns": turns,
+        "junctionTurnsMismatch": turns_mismatch,
+        "learnedStartCost": round(position_cost + sector_cost, 5),
+        "learnedJunctionCost": round(turn_cost, 5),
+        "explanation": "; ".join(clauses),
+    }
+
+
 def rank_routes(
     strokes: list[dict],
     graph: SkeletonGraph,
     raw_routes: list[dict],
     ordinal_weight: float = 0.12,
+    learned_model: dict | None = None,
+    excluded_training_case: str | None = None,
 ) -> list[list[RouteCandidate]]:
     allowed_components = component_label_options(strokes, graph)
     all_candidate_points = np.vstack([stroke["points"] for stroke in strokes])
@@ -563,6 +827,7 @@ def rank_routes(
         candidate_end_is_contact.append(constrained)
 
     adjacency = graph_adjacency(graph.matrix)
+    signatures = stroke_rule_signatures(strokes)
     ranked = []
     for stroke_index, stroke in enumerate(strokes):
         key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
@@ -576,6 +841,9 @@ def rank_routes(
         # connected PDF skeleton the latter would incorrectly stretch every
         # leaf component over the whole character.
         expected_start = normalized_point(stroke["points"][0], candidate_glyph_bounds)
+        learned_rule = learned_rule_for_stroke(
+            learned_model, signatures[stroke_index], excluded_training_case
+        )
         options = []
         for route in raw_routes:
             if route["component"] not in allowed_components[key]:
@@ -595,11 +863,15 @@ def rank_routes(
             # Direction/turn grammar dominates. Ordinal position is a weak tie
             # breaker. A free pen-up cannot truncate a visibly continuing road.
             premature_stop_cost = 1.6 if premature_stop else 0.0
+            learned_cost, learned_evidence = route_learned_cost(
+                route, graph, learned_rule, target_glyph_bounds
+            )
             score = (
                 5.0 * direction
                 + 0.8 * turn
                 + ordinal_weight * ordinal
                 + premature_stop_cost
+                + learned_cost
             )
             options.append(
                 RouteCandidate(
@@ -617,6 +889,9 @@ def rank_routes(
                         "prematureStopCost": premature_stop_cost,
                         "candidateLengthFraction": round(expected_length_fraction, 5),
                         "routeLengthFraction": round(route_length_fraction, 5),
+                        "learnedRuleSignature": signatures[stroke_index]["key"],
+                        "learnedCost": round(learned_cost, 5),
+                        **learned_evidence,
                     },
                 )
             )
@@ -1499,6 +1774,7 @@ def main():
     parser.add_argument("--canvas", type=int, default=256)
     parser.add_argument("--ordinal-weight", type=float, default=0.12)
     parser.add_argument("--coverage-weight", type=float, default=12.0)
+    parser.add_argument("--learned-rules", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit-output", type=Path)
     args = parser.parse_args()
@@ -1522,8 +1798,19 @@ def main():
     skeleton = TRANSFER.skeletonize(target)
     graph = build_skeleton_graph(skeleton)
     raw_routes = all_routes(graph)
+    learned_model = (
+        json.loads(args.learned_rules.read_text("utf-8"))
+        if args.learned_rules
+        else None
+    )
+    excluded_training_case = f"U+{codepoint:04X}-{args.source}"
     ranked = rank_routes(
-        candidate, graph, raw_routes, ordinal_weight=args.ordinal_weight
+        candidate,
+        graph,
+        raw_routes,
+        ordinal_weight=args.ordinal_weight,
+        learned_model=learned_model,
+        excluded_training_case=excluded_training_case,
     )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
@@ -1559,6 +1846,12 @@ def main():
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,
             "criticalNodeCount": len(graph.critical),
             "routeHypothesisCount": len(raw_routes),
+            "learnedRules": {
+                "enabled": learned_model is not None,
+                "model": str(args.learned_rules) if args.learned_rules else None,
+                "excludedTargetCase": excluded_training_case if learned_model else None,
+                "minimumSupportForScoring": 2,
+            },
             "unexplainedSkeletonPixels": int(
                 skeleton.sum() - len(set().union(*(route.pixels for route in routes)))
             ),
