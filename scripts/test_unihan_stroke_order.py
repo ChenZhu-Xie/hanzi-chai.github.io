@@ -89,6 +89,10 @@ class StrokeOrderTests(unittest.TestCase):
         self.assertFalse(ORDER.sector_compatible("S", "E"))
         self.assertFalse(ORDER.sector_compatible("S", "N"))
 
+    def test_pen_down_sector_uses_initial_arc_not_the_distant_endpoint(self):
+        points = np.asarray([[0.0, 0.0], [6.0, 0.0], [6.0, 20.0]])
+        self.assertEqual(ORDER.direction_sector(points), "E")
+
     def test_after_subtracting_first_horizontal_next_horizontal_is_lower_one(self):
         skeleton, graph, directed, ledger, expectations = self.old_head_fixture()
         upper = np.zeros_like(skeleton)

@@ -947,6 +947,90 @@ def rank_routes(
     return ranked
 
 
+def apply_stroke_order_guard(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    source: str,
+    codepoint: int,
+    normative_catalog=None,
+) -> tuple[list[list[RouteCandidate]], list[dict]]:
+    """Add stroke-order knowledge without replacing the classic decoder.
+
+    Candidate geometry already supplies a directed stroke grammar.  This guard
+    makes its pen-down direction explicit and source-auditable.  It rejects an
+    opposite/quarter-turn start only when another classic candidate remains;
+    otherwise it preserves the complete classic set and reports the conflict.
+    That fallback is deliberate: incomplete source conventions must never
+    erase the formerly successful global solution.
+    """
+    order = RESIDUAL_DECODER.ORDER
+    expectations = order.compile_stroke_expectations(
+        strokes,
+        source,
+        codepoint,
+        normative_catalog,
+    )
+    guarded: list[list[RouteCandidate]] = []
+    audit = []
+    for expectation, options in zip(expectations, ranked):
+        compatible = []
+        rejected = []
+        for option in options:
+            observed = order.direction_sector(option.points)
+            if order.sector_compatible(expectation.expected_sector, observed):
+                evidence = {
+                    **option.evidence,
+                    "strokeOrderExpectedSector": expectation.expected_sector,
+                    "strokeOrderObservedSector": observed,
+                    "strokeOrderEvidence": [
+                        {
+                            "level": item.level,
+                            "provenance": item.provenance,
+                            "rule": item.rule,
+                            "hard": item.hard,
+                        }
+                        for item in expectation.evidence
+                    ],
+                }
+                compatible.append(
+                    RouteCandidate(
+                        start_node=option.start_node,
+                        end_node=option.end_node,
+                        points=option.points,
+                        pixels=option.pixels,
+                        component=option.component,
+                        score=option.score,
+                        evidence=evidence,
+                    )
+                )
+            else:
+                rejected.append(option)
+        fallback = bool(options) and not compatible
+        guarded.append(list(options) if fallback else compatible)
+        audit.append(
+            {
+                "stroke": expectation.stroke_index + 1,
+                "componentId": expectation.component_id,
+                "feature": expectation.feature,
+                "expectedSector": expectation.expected_sector,
+                "classicCandidateCount": len(options),
+                "acceptedCandidateCount": len(options) if fallback else len(compatible),
+                "rejectedOppositeDirection": len(rejected),
+                "fallbackToClassicCandidates": fallback,
+                "evidence": [
+                    {
+                        "level": item.level,
+                        "provenance": item.provenance,
+                        "rule": item.rule,
+                        "hard": item.hard,
+                    }
+                    for item in expectation.evidence
+                ],
+            }
+        )
+    return guarded, audit
+
+
 def observed_contact(first: RouteCandidate, second: RouteCandidate) -> bool:
     if first.pixels & second.pixels:
         return True
@@ -2005,7 +2089,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--canvas", type=int, default=256)
     parser.add_argument("--ordinal-weight", type=float, default=0.12)
     parser.add_argument("--coverage-weight", type=float, default=12.0)
-    parser.add_argument("--decoder", choices=("legacy", "residual"), default="legacy")
+    parser.add_argument(
+        "--decoder",
+        choices=("hybrid", "legacy", "residual"),
+        default="hybrid",
+    )
     parser.add_argument("--learned-rules", type=Path)
     parser.add_argument("--stroke-order-catalog", type=Path)
     parser.add_argument("--beam-width", type=int, default=350)
@@ -2074,15 +2162,24 @@ def main():
         learned_model=learned_model,
         excluded_training_case=excluded_training_case,
         source=args.source,
-        enforce_component_labels=args.decoder == "legacy",
+        enforce_component_labels=args.decoder != "residual",
     )
+    normative_catalog = RESIDUAL_DECODER.ORDER.load_normative_catalog(
+        args.stroke_order_catalog
+    )
+    order_guard_audit = None
+    if args.decoder == "hybrid":
+        ranked, order_guard_audit = apply_stroke_order_guard(
+            candidate,
+            ranked,
+            source=args.source,
+            codepoint=codepoint,
+            normative_catalog=normative_catalog,
+        )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
     residual_result = None
     if args.decoder == "residual":
-        normative_catalog = RESIDUAL_DECODER.ORDER.load_normative_catalog(
-            args.stroke_order_catalog
-        )
         residual_result = RESIDUAL_DECODER.decode_residual_routes(
             target,
             graph,
@@ -2105,7 +2202,9 @@ def main():
             coverage_weight=args.coverage_weight,
         )
         owner, _owner_distance = geodesic_owners(target, graph, routes)
-        decision["decoder"] = "legacy"
+        decision["decoder"] = args.decoder
+        if order_guard_audit is not None:
+            decision["strokeOrderGuard"] = order_guard_audit
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
     # The prediction is now frozen. Only evaluation below may read target truth.
@@ -2129,7 +2228,11 @@ def main():
             "model": (
                 "sequential-directed-residual-ink-v1"
                 if args.decoder == "residual"
-                else "directed-skeleton-front-plus-bounded-radial-wetting-v2"
+                else (
+                    "classic-directed-skeleton-with-stroke-order-guard-v1"
+                    if args.decoder == "hybrid"
+                    else "directed-skeleton-front-plus-bounded-radial-wetting-v2"
+                )
             ),
             "candidateGeometryUsedForTargetMask": False,
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,

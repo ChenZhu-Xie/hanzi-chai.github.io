@@ -97,12 +97,23 @@ def load_normative_catalog(path: Path | None) -> NormativeCatalog:
     return NormativeCatalog(entries=entries)
 
 
-def _direction_sector(points: np.ndarray) -> str:
+def direction_sector(points: np.ndarray) -> str:
     points = np.asarray(points, dtype=float)
     if len(points) < 2:
         return "unknown"
-    distances = np.linalg.norm(points[1:] - points[0], axis=1)
-    end = points[1 + int(np.argmax(distances))]
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    total = float(segment_lengths.sum())
+    if total < 1e-6:
+        return "unknown"
+    target = total * 0.25
+    travelled = 0.0
+    end = points[-1]
+    for index, length in enumerate(segment_lengths):
+        if travelled + float(length) >= target and length > 1e-6:
+            fraction = (target - travelled) / float(length)
+            end = points[index] + fraction * (points[index + 1] - points[index])
+            break
+        travelled += float(length)
     vector = end - points[0]
     angle = (math.degrees(math.atan2(float(vector[1]), float(vector[0]))) + 360.0) % 360.0
     return SECTORS[int((angle + 22.5) // 45.0) % 8]
@@ -220,7 +231,7 @@ def compile_stroke_expectations(
                 occurrence=occurrence,
                 component_ordinal=ordinal,
                 feature=feature,
-                expected_sector=_direction_sector(np.asarray(stroke["points"], dtype=float)),
+                expected_sector=direction_sector(np.asarray(stroke["points"], dtype=float)),
                 expected_turns=tuple(str(value) for value in stroke.get("expectedTurns", ())),
                 closes_component=next_key != key,
                 evidence=tuple(sorted(evidence, key=lambda item: item.level)),

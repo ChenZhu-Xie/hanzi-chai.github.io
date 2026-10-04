@@ -60,12 +60,67 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         final_owner = {tuple(pixel[:2]): pixel[2] for pixel in payload["visibleOwner"]}
         self.assertEqual(final_owner[(1, 1)], 1)
         self.assertEqual(len(payload["residualLayers"]), 2)
-    def test_cli_exposes_legacy_and_residual_decoder_choices(self):
+    def test_cli_defaults_to_classic_search_with_order_guard(self):
         self.assertTrue(hasattr(MODULE, "build_argument_parser"))
         parser = MODULE.build_argument_parser()
         decoder = next(action for action in parser._actions if action.dest == "decoder")
-        self.assertEqual(tuple(decoder.choices), ("legacy", "residual"))
-        self.assertEqual(decoder.default, "legacy")
+        self.assertEqual(tuple(decoder.choices), ("hybrid", "legacy", "residual"))
+        self.assertEqual(decoder.default, "hybrid")
+
+    def test_hybrid_order_guard_removes_opposite_pen_direction(self):
+        def option(points, score):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(
+                0,
+                1,
+                points,
+                frozenset((int(x), int(y)) for x, y in points),
+                7,
+                score,
+                {},
+            )
+
+        strokes = [
+            {
+                "componentId": 7,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 0.0], [8.0, 0.0]]),
+            }
+        ]
+        ranked = [[option([[8, 2], [0, 2]], 0.1), option([[0, 2], [8, 2]], 0.2)]]
+        guarded, audit = MODULE.apply_stroke_order_guard(
+            strokes,
+            ranked,
+            source="G",
+            codepoint=0x4E00,
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        self.assertEqual(guarded[0][0].points[0].tolist(), [0.0, 2.0])
+        self.assertEqual(audit[0]["rejectedOppositeDirection"], 1)
+        self.assertFalse(audit[0]["fallbackToClassicCandidates"])
+
+    def test_hybrid_order_guard_never_deletes_every_classic_candidate(self):
+        points = np.asarray([[8.0, 2.0], [0.0, 2.0]])
+        option = MODULE.RouteCandidate(
+            0, 1, points, frozenset((int(x), int(y)) for x, y in points), 7, 0.1, {}
+        )
+        strokes = [
+            {
+                "componentId": 7,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 0.0], [8.0, 0.0]]),
+            }
+        ]
+        guarded, audit = MODULE.apply_stroke_order_guard(
+            strokes,
+            [[option]],
+            source="G",
+            codepoint=0x4E00,
+        )
+        self.assertEqual(guarded, [[option]])
+        self.assertTrue(audit[0]["fallbackToClassicCandidates"])
 
     def test_residual_decision_payload_exposes_new_safety_metrics(self):
         self.assertTrue(hasattr(MODULE, "residual_decision_payload"))
