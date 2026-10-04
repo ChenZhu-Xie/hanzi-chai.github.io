@@ -1481,6 +1481,24 @@ def observed_contact(first: RouteCandidate, second: RouteCandidate) -> bool:
     return polyline_distance(first.points, second.points) <= 2.2
 
 
+def relative_stroke_signature(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Pairwise position inside one leaf, independent of translation/scale."""
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    combined = np.vstack([first, second])
+    minimum = combined.min(axis=0)
+    maximum = combined.max(axis=0)
+    span = np.maximum(maximum - minimum, 1e-6)
+    displacement = (first.mean(axis=0) - second.mean(axis=0)) / span
+    first_min, first_max = first.min(axis=0), first.max(axis=0)
+    second_min, second_max = second.min(axis=0), second.max(axis=0)
+    overlap = np.maximum(
+        0.0,
+        np.minimum(first_max, second_max) - np.maximum(first_min, second_min),
+    ) / span
+    return np.r_[displacement, overlap]
+
+
 def choose_routes(
     strokes: list[dict],
     ranked: list[list[RouteCandidate]],
@@ -1543,7 +1561,9 @@ def choose_routes(
                 expected_signatures[current, previous] = contact_signature(
                     strokes[current]["points"], strokes[previous]["points"]
                 )[:2]
-    relation_cache: dict[tuple[int, int, int, int], tuple[float, float, list[str]]] = {}
+    relation_cache: dict[
+        tuple[int, int, int, int], tuple[float, float, float, list[str], bool]
+    ] = {}
     for current_index, current_options in enumerate(ranked):
         for previous_index in range(current_index):
             expected = bool(expected_contact[current_index, previous_index])
@@ -1551,11 +1571,19 @@ def choose_routes(
                 for previous_rank, previous_option in enumerate(ranked[previous_index]):
                     relation_cost = 0.0
                     contact_role_cost = 0.0
+                    relative_position_cost = 0.0
                     notes = []
                     observed = observed_contact(current_option, previous_option)
+                    same_leaf = (
+                        group_keys[current_index][0] >= 0
+                        and group_keys[current_index] == group_keys[previous_index]
+                    )
+                    hard_contact_violation = same_leaf and expected != observed
                     if expected and not observed:
                         relation_cost += 0.25
                         notes.append(f"missing-contact-{previous_index + 1}")
+                        if same_leaf:
+                            notes.append(f"required-contact-{previous_index + 1}")
                         if (
                             group_keys[current_index] == group_keys[previous_index]
                             and current_option.evidence.get("learnedScoringEnabled")
@@ -1574,6 +1602,8 @@ def choose_routes(
                     elif observed and not expected:
                         relation_cost += 0.15
                         notes.append(f"extra-contact-{previous_index + 1}")
+                        if same_leaf:
+                            notes.append(f"forbidden-contact-{previous_index + 1}")
                     elif expected and observed:
                         expected_current, expected_previous = expected_signatures[
                             current_index, previous_index
@@ -1584,12 +1614,30 @@ def choose_routes(
                         mismatch = abs(observed_current - expected_current) + abs(
                             observed_previous - expected_previous
                         )
-                        contact_role_cost += 0.35 * mismatch
+                        contact_role_cost += (2.0 if same_leaf else 0.35) * mismatch
                         if mismatch > 0.16:
                             notes.append(
                                 f"contact-role-{previous_index + 1}:"
                                 f"{observed_current:.2f}/{observed_previous:.2f}"
                                 f"!={expected_current:.2f}/{expected_previous:.2f}"
+                            )
+                    if same_leaf:
+                        expected_relative = relative_stroke_signature(
+                            strokes[current_index]["points"],
+                            strokes[previous_index]["points"],
+                        )
+                        observed_relative = relative_stroke_signature(
+                            current_option.points,
+                            previous_option.points,
+                        )
+                        relative_mismatch = float(
+                            np.mean(np.abs(expected_relative - observed_relative))
+                        )
+                        relative_position_cost = 1.2 * relative_mismatch
+                        if relative_mismatch > 0.28:
+                            notes.append(
+                                f"same-leaf-relative-position-{previous_index + 1}:"
+                                f"{relative_mismatch:.2f}"
                             )
                     if (
                         find(current_index) == find(previous_index)
@@ -1599,7 +1647,13 @@ def choose_routes(
                         notes.append(f"same-leaf-split-island-{previous_index + 1}")
                     relation_cache[
                         current_index, current_rank, previous_index, previous_rank
-                    ] = relation_cost, contact_role_cost, notes
+                    ] = (
+                        relation_cost,
+                        contact_role_cost,
+                        relative_position_cost,
+                        notes,
+                        hard_contact_violation,
+                    )
 
     beam = [
         {
@@ -1608,24 +1662,30 @@ def choose_routes(
             "routeRanks": [],
             "occupied": frozenset(),
             "steps": [],
+            "usedHardContactFallback": False,
         }
     ]
     for index, options in enumerate(ranked):
         next_beam = []
+        contact_fallback_beam = []
         for state in beam:
             for option_rank, option in enumerate(options):
                 score = state["score"] + option.score
                 shared = len(state["occupied"] & option.pixels)
                 relation_cost = 0.0
                 contact_role_cost = 0.0
+                relative_position_cost = 0.0
                 relation_notes = []
+                hard_contact_violation = False
                 for previous_index, previous_rank in enumerate(state["routeRanks"]):
-                    relation, role, notes = relation_cache[
+                    relation, role, relative, notes, hard_violation = relation_cache[
                         index, option_rank, previous_index, previous_rank
                     ]
                     relation_cost += relation
                     contact_role_cost += role
+                    relative_position_cost += relative
                     relation_notes.extend(notes)
+                    hard_contact_violation = hard_contact_violation or hard_violation
                 structural_order_cost = 0.0
                 predecessor = sibling_predecessor.get(index)
                 if predecessor is not None:
@@ -1653,16 +1713,22 @@ def choose_routes(
                 score += (
                     relation_cost
                     + contact_role_cost
+                    + relative_position_cost
                     + structural_order_cost
                     + reuse_cost
                     - coverage_reward
                 )
-                next_beam.append(
+                if hard_contact_violation:
+                    relation_notes.append("same-leaf-contact-fallback")
+                destination = contact_fallback_beam if hard_contact_violation else next_beam
+                destination.append(
                     {
-                        "score": score,
+                        "score": score + (1000.0 if hard_contact_violation else 0.0),
                         "routes": state["routes"] + [option],
                         "routeRanks": state["routeRanks"] + [option_rank],
                         "occupied": state["occupied"] | option.pixels,
+                        "usedHardContactFallback": state["usedHardContactFallback"]
+                        or hard_contact_violation,
                         "steps": state["steps"]
                         + [
                             {
@@ -1671,6 +1737,7 @@ def choose_routes(
                                 "baseScore": round(option.score, 5),
                                 "relationCost": round(relation_cost, 5),
                                 "contactRoleCost": round(contact_role_cost, 5),
+                                "relativePositionCost": round(relative_position_cost, 5),
                                 "structuralOrderCost": round(structural_order_cost, 5),
                                 "reuseCost": round(reuse_cost, 5),
                                 "newCoverage": round(new_coverage, 5),
@@ -1681,6 +1748,8 @@ def choose_routes(
                         ],
                     }
                 )
+        if not next_beam:
+            next_beam = contact_fallback_beam
         next_beam.sort(key=lambda item: item["score"])
         beam = next_beam[:350]
     best = beam[0]
@@ -1694,6 +1763,8 @@ def choose_routes(
         review_reasons.append("near-tied-global-solutions")
     if any(step["localRank"] >= 24 for step in best["steps"]):
         review_reasons.append("candidate-stroke-grammar-mismatch")
+    if best["usedHardContactFallback"]:
+        review_reasons.append("same-leaf-contact-fallback")
     return best["routes"], {
         "score": round(best["score"], 6),
         "beamWidth": 350,

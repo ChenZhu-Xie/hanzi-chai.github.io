@@ -643,6 +643,68 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         )
         self.assertIs(routes[1], separate_but_complete)
 
+    def test_same_leaf_requires_the_complete_pairwise_contact_matrix(self):
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 0.0], [5.0, 10.0]]),
+            },
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 20.0], [10.0, 20.0]]),
+            },
+        ]
+        vertical = MODULE.RouteCandidate(
+            0, 1, strokes[0]["points"], frozenset((5, y) for y in range(11)), 1, 0.0, {}
+        )
+        missing_required_contact = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[0.0, 14.0], [10.0, 14.0]]),
+            frozenset((x, 14) for x in range(11)),
+            1,
+            -10.0,
+            {},
+        )
+        correct_crossing = MODULE.RouteCandidate(
+            4, 5, strokes[1]["points"], frozenset((x, 5) for x in range(11)), 1, 1.0, {}
+        )
+        extra_forbidden_contact = MODULE.RouteCandidate(
+            6, 7, strokes[1]["points"], frozenset((x, 5) for x in range(11)), 1, -10.0, {}
+        )
+        correct_separate = MODULE.RouteCandidate(
+            8, 9, strokes[2]["points"], frozenset((x, 20) for x in range(11)), 1, 1.0, {}
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [
+                [vertical],
+                [missing_required_contact, correct_crossing],
+                [extra_forbidden_contact, correct_separate],
+            ],
+            total_skeleton_pixels=33,
+        )
+        self.assertIs(routes[1], correct_crossing)
+        self.assertIs(routes[2], correct_separate)
+        self.assertNotIn("same-leaf-contact-fallback", decision["reviewReasons"])
+
+    def test_relative_stroke_signature_is_translation_and_scale_invariant(self):
+        first = np.asarray([[0.0, 0.0], [0.0, 10.0]])
+        second = np.asarray([[-5.0, 7.0], [5.0, 3.0]])
+        transformed_first = first * 3.0 + np.asarray([40.0, 70.0])
+        transformed_second = second * 3.0 + np.asarray([40.0, 70.0])
+        np.testing.assert_allclose(
+            MODULE.relative_stroke_signature(first, second),
+            MODULE.relative_stroke_signature(transformed_first, transformed_second),
+        )
+
     def test_direct_sibling_order_rejects_a_lower_leaf_above_its_predecessor(self):
         upper = {
             "componentId": 10,
