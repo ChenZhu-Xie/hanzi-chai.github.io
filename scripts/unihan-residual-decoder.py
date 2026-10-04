@@ -79,8 +79,9 @@ def _route_hard_rejections(
         return ["route-does-not-follow-directed-roads"]
     first_edge = directed.edges[route_edge_ids[0]]
     if (
-        expectation.expected_sector != "unknown"
-        and first_edge.start_sector != expectation.expected_sector
+        not ORDER.sector_compatible(
+            expectation.expected_sector, first_edge.start_sector
+        )
     ):
         rejections.append("wrong-start-direction")
 
@@ -174,6 +175,8 @@ def decode_residual_routes(
         evidence=(),
     )
     beam = [initial]
+    full_ledger = RESIDUAL.initial_ledger(target)
+    region_partition_cache: dict[tuple[int, ...], object] = {}
 
     for index, (expectation, options) in enumerate(zip(expectations, ranked_routes)):
         next_beam = []
@@ -198,13 +201,22 @@ def decode_residual_routes(
                     for reason in rejections:
                         rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                     continue
-                region = RESIDUAL.recover_stroke_region(
-                    target,
-                    graph,
-                    directed,
-                    edge_ids,
-                    route.points,
-                    state.ledger,
+                base_region = region_partition_cache.get(edge_ids)
+                if base_region is None:
+                    base_region = RESIDUAL.recover_stroke_region(
+                        target,
+                        graph,
+                        directed,
+                        edge_ids,
+                        route.points,
+                        full_ledger,
+                    )
+                    region_partition_cache[edge_ids] = base_region
+                available = state.ledger.available
+                region = RESIDUAL.StrokeRegion(
+                    mask=base_region.mask & available,
+                    contact_mask=base_region.contact_mask & available,
+                    forbidden_leak_mask=base_region.forbidden_leak_mask & available,
                 )
                 if not region.mask.any():
                     rejection_counts["empty-residual-region"] = (
@@ -233,8 +245,20 @@ def decode_residual_routes(
                     "routeScore": float(route.score),
                     "penDownScore": float(pen.score),
                     "hardRejections": [],
+                    "penDownAlternatives": [
+                        {
+                            "pointIndex": int(item.point_index),
+                            "outgoingEdgeIds": list(item.outgoing_edge_ids),
+                            "score": float(item.score),
+                            "evidence": list(item.evidence),
+                            "hardRejections": list(item.hard_rejections),
+                            "accepted": item.point_index == start_index,
+                        }
+                        for item in candidates[:8]
+                    ],
                     "orderEvidence": [item.__dict__ for item in expectation.evidence],
                     "unexplainedInk": int(ledger.unexplained.sum()),
+                    "remainingLaterStrokeFeasible": True,
                 }
                 next_beam.append(
                     ResidualDecoderState(
@@ -266,6 +290,9 @@ def decode_residual_routes(
                 )
                 return ResidualDecodeResult(**{**result.__dict__, "steps": steps})
             return result
+        for state in next_beam:
+            if state.evidence:
+                state.evidence[-1]["hardRejectionCounts"] = dict(rejection_counts)
         next_beam.sort(key=lambda item: item.score)
         beam = next_beam[:beam_width]
 

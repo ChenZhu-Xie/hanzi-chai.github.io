@@ -823,6 +823,7 @@ def rank_routes(
     learned_model: dict | None = None,
     excluded_training_case: str | None = None,
     source: str | None = None,
+    enforce_component_labels: bool = True,
 ) -> list[list[RouteCandidate]]:
     allowed_components = component_label_options(strokes, graph)
     all_candidate_points = np.vstack([stroke["points"] for stroke in strokes])
@@ -880,7 +881,7 @@ def rank_routes(
         )
         options = []
         for route in raw_routes:
-            if route["component"] not in allowed_components[key]:
+            if enforce_component_labels and route["component"] not in allowed_components[key]:
                 continue
             direction = direction_dtw(stroke["points"], route["points"])
             turn = abs(total_turn(route["points"]) - expected_turn) / math.pi
@@ -930,6 +931,9 @@ def rank_routes(
                 )
             )
         options.sort(key=lambda item: item.score)
+        if not options:
+            ranked.append([])
+            continue
         best_direction = min(item.evidence["directionGrammar"] for item in options)
         # Pen direction is a hard local constraint.  Global contact consistency
         # may choose among compatible roads, but must not turn a horizontal
@@ -1557,6 +1561,27 @@ def evaluate_truth(
         }
     per_stroke = []
     for index, item in enumerate(truth):
+        if index >= len(routes):
+            per_stroke.append(
+                {
+                    "stroke": index + 1,
+                    "feature": item.get("feature"),
+                    "componentId": int(item["componentId"]),
+                    "predictedStart": None,
+                    "truthStart": [round(float(value), 2) for value in item["points"][0]],
+                    "predictedEnd": None,
+                    "truthEnd": [round(float(value), 2) for value in item["points"][-1]],
+                    "directedSequenceDtwMeanPercent": None,
+                    "logicProgressMap": [],
+                    "inkPrecision": round(stroke_precision[index], 6),
+                    "inkRecall": round(stroke_recall[index], 6),
+                    "iou": round(stroke_scores[index], 6),
+                    "turns": None,
+                    "topology": None,
+                    "issues": ["no-feasible-route"],
+                }
+            )
+            continue
         issues = []
         if start_errors[index] / canvas > 0.035:
             issues.append("wrong-start")
@@ -1609,15 +1634,18 @@ def evaluate_truth(
     return (
         {
             "truthReadAfterPrediction": True,
-            "meanStartErrorPercent": round(float(np.mean(start_errors)) / canvas * 100, 4),
+            "partialPrediction": len(routes) != len(truth),
+            "predictedStrokeCount": len(routes),
+            "expectedStrokeCount": len(truth),
+            "meanStartErrorPercent": round(float(np.mean(start_errors)) / canvas * 100, 4) if start_errors else 0.0,
             "perStrokeStartErrorPercent": [round(value / canvas * 100, 4) for value in start_errors],
-            "meanEndErrorPercent": round(float(np.mean(end_errors)) / canvas * 100, 4),
+            "meanEndErrorPercent": round(float(np.mean(end_errors)) / canvas * 100, 4) if end_errors else 0.0,
             "perStrokeEndErrorPercent": [round(value / canvas * 100, 4) for value in end_errors],
-            "meanCenterlineChamferPercent": round(float(np.mean(chamfers)) / canvas * 100, 4),
+            "meanCenterlineChamferPercent": round(float(np.mean(chamfers)) / canvas * 100, 4) if chamfers else 0.0,
             "perStrokeCenterlineChamferPercent": [round(value / canvas * 100, 4) for value in chamfers],
-            "meanDirectedSequenceDtwPercent": round(float(np.mean(sequence_errors)) / canvas * 100, 4),
+            "meanDirectedSequenceDtwPercent": round(float(np.mean(sequence_errors)) / canvas * 100, 4) if sequence_errors else 0.0,
             "trajectoryTimeSemantics": "monotone logical order; local drawing speed is ignored",
-            "meanStartTangentErrorDegrees": round(float(np.mean(start_angles)), 2),
+            "meanStartTangentErrorDegrees": round(float(np.mean(start_angles)), 2) if start_angles else 0.0,
             "perStrokeIoU": [round(value, 6) for value in stroke_scores],
             "perStrokeInkPrecision": [round(value, 6) for value in stroke_precision],
             "perStrokeInkRecall": [round(value, 6) for value in stroke_recall],
@@ -1709,6 +1737,103 @@ def svg_polyline(points: np.ndarray, color: str, width: float = 2.2) -> str:
     return f'<polyline points="{coordinates}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round"/>'
 
 
+def _mask_pixels(mask: np.ndarray) -> list[list[int]]:
+    return [[int(x), int(y)] for y, x in np.argwhere(np.asarray(mask, dtype=bool))]
+
+
+def _half_edge_payload(edge_ids: list[int], directed, graph, contact: np.ndarray) -> list[dict]:
+    if directed is None or graph is None:
+        return [{"edgeId": int(edge_id)} for edge_id in edge_ids]
+    output = []
+    for edge_id in edge_ids:
+        edge = directed.edges[int(edge_id)]
+        points_yx = graph.points[np.asarray(edge.point_indices, dtype=int)]
+        outside_contact = any(not contact[int(y), int(x)] for y, x in points_yx)
+        output.append(
+            {
+                "edgeId": int(edge_id),
+                "roadId": int(edge.road_id),
+                "startSector": edge.start_sector,
+                "endSector": edge.end_sector,
+                "outsideContact": bool(outside_contact),
+                "points": [[int(x), int(y)] for y, x in points_yx],
+            }
+        )
+    return output
+
+
+def _forbidden_half_edges(route_edge_ids: list[int], directed) -> list[int]:
+    if directed is None:
+        return []
+    forbidden = []
+    for incoming_id, outgoing_id in zip(route_edge_ids, route_edge_ids[1:]):
+        incoming = directed.edges[int(incoming_id)]
+        outgoing = directed.edges[int(outgoing_id)]
+        if incoming.end_gate != outgoing.start_gate or incoming.road_id == outgoing.road_id:
+            continue
+        gate = directed.gates[incoming.end_gate]
+        forbidden.extend(
+            edge_id
+            for edge_id in gate.outgoing
+            if directed.edges[edge_id].road_id != incoming.road_id
+            and edge_id != outgoing_id
+        )
+    return list(dict.fromkeys(forbidden))
+
+
+def residual_review_payload(result, target: np.ndarray, graph=None, directed=None) -> dict:
+    """Return sequential, JSON-safe evidence for the review HTML."""
+    target = np.asarray(target, dtype=bool)
+    unexplained = target.copy()
+    reusable = np.zeros(target.shape, dtype=bool)
+    owner = np.full(target.shape, -1, dtype=np.int16)
+    layers = []
+    for index, region in enumerate(result.regions):
+        step = dict(result.steps[index]) if index < len(result.steps) else {"stroke": index + 1}
+        before = unexplained.copy()
+        unexplained &= ~np.asarray(region.mask, dtype=bool)
+        reusable |= np.asarray(region.contact_mask, dtype=bool)
+        owner[np.asarray(region.mask, dtype=bool)] = index
+        selected_ids = [int(item) for item in step.get("routeEdgeIds", ())]
+        forbidden_ids = [int(item) for item in step.get("forbiddenHalfEdges", ())]
+        if not forbidden_ids:
+            forbidden_ids = _forbidden_half_edges(selected_ids, directed)
+        layers.append(
+            {
+                "stroke": index + 1,
+                "residualBefore": _mask_pixels(before),
+                "residualAfter": _mask_pixels(unexplained),
+                "reusableContact": _mask_pixels(reusable),
+                "selectedHalfEdges": _half_edge_payload(
+                    selected_ids, directed, graph, np.asarray(region.contact_mask, dtype=bool)
+                ),
+                "forbiddenHalfEdges": _half_edge_payload(
+                    forbidden_ids, directed, graph, np.asarray(region.contact_mask, dtype=bool)
+                ),
+                "evidence": step,
+            }
+        )
+    return {
+        "residualLayers": layers,
+        "visibleOwner": [
+            [int(x), int(y), int(owner[y, x])]
+            for y, x in np.argwhere(owner >= 0)
+        ],
+    }
+
+
+def residual_review_markup() -> str:
+    return '''<!-- animated from D.residualLayers --><div class="residual-controls">
+<label><input id="show-residual-before" type="checkbox">残余墨迹（本笔前）</label>
+<label><input id="show-residual-after" type="checkbox">残余墨迹（本笔后）</label>
+<label><input id="show-reusable-contact" type="checkbox" checked>可复用接触区</label>
+<label><input id="show-selected-half-edges" type="checkbox" checked><span style="color:#22c55e">已选半边</span></label>
+<label><input id="show-forbidden-half-edges" type="checkbox"><span style="color:#ef4444">禁止出口</span></label>
+<label><input id="show-visible-owner" type="checkbox" checked>当前可见归属</label>
+</div><h3>落笔候选：接受理由 / 拒绝理由</h3>
+<pre id="residual-evidence"></pre><h3>后续笔画可行性</h3><pre id="later-feasibility"></pre>'''
+
+
 def build_html(
     *,
     record: dict,
@@ -1727,8 +1852,25 @@ def build_html(
     decision: dict,
     evaluation: dict | None,
     truth_lines: list[list[list[float]]],
+    residual_result=None,
 ) -> str:
     canvas = target.shape[0]
+    events = [dict(item) for item in events]
+    event_offset = float(maximum_time)
+    while len(events) < len(strokes):
+        stroke_number = len(events) + 1
+        events.append(
+            {
+                "stroke": stroke_number,
+                "start": None,
+                "end": None,
+                "startTime": round(event_offset, 2),
+                "endTime": round(event_offset + 4.0, 2),
+                "stopReason": "残余解码器未找到满足硬约束的路线；保留 needs-review",
+            }
+        )
+        event_offset += 7.0
+    maximum_time = max(1.0, event_offset)
     pixels = []
     for y, x in np.argwhere(target):
         label = int(owner[y, x])
@@ -1771,6 +1913,16 @@ def build_html(
         }
         for index, stroke in enumerate(strokes)
     ]
+    residual_payload = (
+        residual_review_payload(
+            residual_result,
+            target,
+            graph=graph,
+            directed=RESIDUAL_DECODER.DIRECTED.build_directed_skeleton(graph),
+        )
+        if residual_result is not None
+        else {"residualLayers": [], "visibleOwner": []}
+    )
     payload = json.dumps(
         {
             "size": canvas,
@@ -1784,6 +1936,7 @@ def build_html(
             "decision": decision,
             "evaluation": evaluation,
             "truth": truth_lines,
+            **residual_payload,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -1792,10 +1945,16 @@ def build_html(
         "尚未载入人工真值；本页只展示冻结预测。"
         if evaluation is None
         else (
-            f"真值在预测冻结后才读取：起点平均误差 {evaluation['meanStartErrorPercent']:.2f}% · "
-            f"中心线 Chamfer {evaluation['meanCenterlineChamferPercent']:.2f}% · "
-            f"逐笔 Macro IoU {evaluation['strokeMacroIoU'] * 100:.1f}% · "
-            f"部件 Macro IoU {evaluation['componentMacroIoU'] * 100:.1f}%"
+            f"预测在第 {evaluation['predictedStrokeCount'] + 1} 笔前停止："
+            f"只评分 {evaluation['predictedStrokeCount']}/{evaluation['expectedStrokeCount']} 条冻结路线；"
+            "余下笔画保留 no-feasible-route。"
+            if evaluation.get("partialPrediction")
+            else (
+                f"真值在预测冻结后才读取：起点平均误差 {evaluation['meanStartErrorPercent']:.2f}% · "
+                f"中心线 Chamfer {evaluation['meanCenterlineChamferPercent']:.2f}% · "
+                f"逐笔 Macro IoU {evaluation['strokeMacroIoU'] * 100:.1f}% · "
+                f"部件 Macro IoU {evaluation['componentMacroIoU'] * 100:.1f}%"
+            )
         )
     )
     decision_html = (
@@ -1805,13 +1964,13 @@ def build_html(
     )
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>U+{record['unicode']:04X} 有向墨迹扩散</title>
 <style>
-*{{box-sizing:border-box}}body{{margin:0;background:#eef2f7;color:#172033;font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}}header{{background:#0f172a;color:white;padding:14px 20px}}h1{{font-size:20px;margin:0 0 5px}}header p{{margin:3px 0;color:#cbd5e1}}main{{padding:14px;display:grid;grid-template-columns:minmax(260px,.7fr) minmax(430px,1.25fr) minmax(300px,.85fr);gap:12px}}section{{background:white;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}}h2{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.body{{padding:10px}}svg{{display:block;width:100%;height:auto}}.pdf-definitions{{position:absolute;width:0;height:0;overflow:hidden}}.stage{{position:relative;aspect-ratio:1;background:white}}.stage svg,.stage canvas{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}#pdf-native-fill{{z-index:1}}#ink-diffusion-canvas{{z-index:2;image-rendering:auto}}#pdf-native-outline{{z-index:3}}.pdf-fill-use{{fill:#334155;opacity:.16}}.pdf-outline-use{{fill:none;stroke:#0f172a;stroke-width:.38;stroke-linejoin:round;vector-effect:non-scaling-stroke;opacity:.58}}.controls{{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-bottom:8px}}button{{padding:5px 10px;border:1px solid #94a3b8;border-radius:6px;background:white;cursor:pointer}}input[type=range]{{width:100%}}#outline-opacity{{width:80px}}.stroke-list{{display:grid;gap:6px}}.stroke{{padding:7px;border:1px solid #cbd5e1;border-left:7px solid var(--c);border-radius:6px;cursor:pointer}}.stroke.active{{outline:3px solid #38bdf8}}pre{{white-space:pre-wrap;max-height:310px;overflow:auto;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px}}.legend{{display:flex;gap:8px;flex-wrap:wrap;font-size:12px}}.badge{{padding:3px 7px;border-radius:999px;background:#e2e8f0}}.warning{{background:#fef3c7;border:1px solid #f59e0b;padding:8px;border-radius:6px}}.good{{background:#dcfce7;border:1px solid #4ade80;padding:8px;border-radius:6px}}label{{display:inline-flex;gap:5px;align-items:center}}@media(max-width:1150px){{main{{grid-template-columns:1fr}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:#eef2f7;color:#172033;font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}}header{{background:#0f172a;color:white;padding:14px 20px}}h1{{font-size:20px;margin:0 0 5px}}header p{{margin:3px 0;color:#cbd5e1}}main{{padding:14px;display:grid;grid-template-columns:minmax(260px,.7fr) minmax(430px,1.25fr) minmax(300px,.85fr);gap:12px}}section{{background:white;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}}h2{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.body{{padding:10px}}svg{{display:block;width:100%;height:auto}}.pdf-definitions{{position:absolute;width:0;height:0;overflow:hidden}}.stage{{position:relative;aspect-ratio:1;background:white}}.stage svg,.stage canvas{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}#pdf-native-fill{{z-index:1}}#ink-diffusion-canvas{{z-index:2;image-rendering:auto}}#pdf-native-outline{{z-index:3}}.pdf-fill-use{{fill:#334155;opacity:.16}}.pdf-outline-use{{fill:none;stroke:#0f172a;stroke-width:.38;stroke-linejoin:round;vector-effect:non-scaling-stroke;opacity:.58}}.controls{{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-bottom:8px}}button{{padding:5px 10px;border:1px solid #94a3b8;border-radius:6px;background:white;cursor:pointer}}input[type=range]{{width:100%}}#outline-opacity{{width:80px}}.stroke-list{{display:grid;gap:6px}}.stroke{{padding:7px;border:1px solid #cbd5e1;border-left:7px solid var(--c);border-radius:6px;cursor:pointer}}.stroke.active{{outline:3px solid #38bdf8}}pre{{white-space:pre-wrap;max-height:310px;overflow:auto;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px}}.legend,.residual-controls{{display:flex;gap:8px;flex-wrap:wrap;font-size:12px}}.residual-controls{{padding:7px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px}}.badge{{padding:3px 7px;border-radius:999px;background:#e2e8f0}}.warning{{background:#fef3c7;border:1px solid #f59e0b;padding:8px;border-radius:6px}}.good{{background:#dcfce7;border:1px solid #4ade80;padding:8px;border-radius:6px}}label{{display:inline-flex;gap:5px;align-items:center}}@media(max-width:1150px){{main{{grid-template-columns:1fr}}}}
 </style>
 <header><h1>U+{record['unicode']:04X} {html.escape(chr(record['unicode']))} · {html.escape(record['source'])} 源 · glyph {glyph_id}</h1><p>主前沿只沿 PDF 骨架有向前进；横向墨迹波只负责填满真实轮廓。candidate 坐标未用于生成 PDF 色块。</p><p>{html.escape(decision_html)}</p><p>{html.escape(evaluation_html)}</p></header>
 <main>
 <section><h2>Candidate：只读符号化假说</h2><div class="body"><svg viewBox="0 0 100 100">{candidate_svgs}</svg><div class="warning">这里的坐标、大小和占据空间不可信；只读取笔顺、方向、转折、接触关系和叶部件 ID。</div><div class="stroke-list" id="stroke-list"></div></div></section>
 <section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-pdf-fill" type="checkbox" checked>PDF 原生实体</label><label><input id="show-pdf-outline" type="checkbox" checked>PDF 原生轮廓</label><label>轮廓透明度 <input id="outline-opacity" type="range" min="10" max="100" value="58"></label><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox" checked>人工真值笔尖轨迹（仅验收）</label><span class="badge">红点＝模型笔尖</span><span class="badge">青点＝人工笔尖（单调逻辑对齐，非等时）</span><span class="badge">白圈＝候选起点</span></div><svg class="pdf-definitions" aria-hidden="true"><defs>{glyph['definitions']}</defs></svg><div class="stage"><svg id="pdf-native-fill" viewBox="0 0 100 100" aria-label="原生 PDF 实体背景"><g class="pdf-fill-use pdf-source-fit">{original_use}</g></svg><canvas id="ink-diffusion-canvas" width="{canvas}" height="{canvas}"></canvas><svg id="pdf-native-outline" viewBox="0 0 100 100" aria-label="原生 PDF 顶层轮廓"><defs>{outline_glyph['definitions']}</defs><g class="pdf-outline-use pdf-source-fit">{outline_use}</g></svg></div></div></section>
-<section><h2>当前定格与路口裁决</h2><div class="body"><div id="state" class="good"></div><h3>起点候选（前八）</h3><pre id="options"></pre><h3>全局离散解</h3><pre>{html.escape(json.dumps(decision, ensure_ascii=False, indent=2))}</pre></div></section>
+<section><h2>当前定格与路口裁决</h2><div class="body"><div id="state" class="good"></div><h3>起点候选（前八）</h3><pre id="options"></pre>{residual_review_markup()}<h3>全局离散解</h3><pre>{html.escape(json.dumps(decision, ensure_ascii=False, indent=2))}</pre></div></section>
 </main>
 <script>
 const D={payload}; const canvas=document.querySelector('#ink-diffusion-canvas'),ctx=canvas.getContext('2d'); const slider=document.querySelector('#time'); const clock=document.querySelector('#clock'); const requestedTime=new URLSearchParams(location.search).get('time'); if(requestedTime!==null)slider.value=Math.max(0,Math.min(1000,Number(requestedTime))); let playing=false,activeStroke=0,last=performance.now();
@@ -1821,12 +1980,14 @@ document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource);
 function stageTime(){{return Number(slider.value)/1000*D.maximumTime}}
 function logicTruthFraction(audit,fraction){{const map=audit?.logicProgressMap;if(!map?.length)return fraction;const position=Math.max(0,Math.min(map.length-1,fraction*(map.length-1))),left=Math.floor(position),right=Math.min(map.length-1,left+1),mix=position-left;return map[left]*(1-mix)+map[right]*mix}}
 function arcLengthPrefix(points,fraction){{if(!points.length)return[];const clamped=Math.max(0,Math.min(1,fraction));if(clamped<=0)return[points[0]];if(clamped>=1)return points.slice();const lengths=[0];for(let i=1;i<points.length;i++)lengths.push(lengths.at(-1)+Math.hypot(points[i][0]-points[i-1][0],points[i][1]-points[i-1][1]));const total=lengths.at(-1);if(total<=1e-9)return[points[0],points.at(-1)];const target=clamped*total,prefix=[points[0]];for(let i=1;i<points.length;i++){{if(lengths[i]<target-1e-9){{prefix.push(points[i]);continue}}const segment=lengths[i]-lengths[i-1],mix=segment<=1e-9?1:(target-lengths[i-1])/segment;prefix.push([points[i-1][0]+(points[i][0]-points[i-1][0])*mix,points[i-1][1]+(points[i][1]-points[i-1][1])*mix]);break}}return prefix}}
-function render(){{const t=stageTime(),img=ctx.createImageData(D.size,D.size);document.querySelector('#pdf-native-fill').style.display=document.querySelector('#show-pdf-fill').checked?'block':'none';document.querySelector('#pdf-native-outline').style.display=document.querySelector('#show-pdf-outline').checked?'block':'none';document.querySelector('.pdf-outline-use').style.opacity=Number(document.querySelector('#outline-opacity').value)/100;if(document.querySelector('#show-skeleton').checked)for(const [x,y] of D.skeleton){{const i=(y*D.size+x)*4;img.data[i]=100;img.data[i+1]=116;img.data[i+2]=139;img.data[i+3]=105}}
-for(const [x,y,label,at] of D.pixels){{if(at>t)continue;const i=(y*D.size+x)*4,[r,g,b]=colors[label];img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=220}}ctx.putImageData(img,0,0);
+function paintPixels(img,pixels,r,g,b,a){{for(const [x,y] of pixels){{const i=(y*D.size+x)*4;img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=a}}}}
+function drawHalfEdges(edges,color,width){{ctx.strokeStyle=color;ctx.lineWidth=width;ctx.setLineDash([]);for(const edge of edges){{if(!edge.points?.length)continue;ctx.beginPath();edge.points.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke()}}}}
+function render(){{const t=stageTime(),img=ctx.createImageData(D.size,D.size),currentEvent=D.events.find(e=>t>=e.startTime&&t<=e.endTime)||D.events.find(e=>t<e.startTime)||D.events.at(-1),layerIndex=Math.max(0,(currentEvent?.stroke||1)-1),layer=D.residualLayers?.[layerIndex];document.querySelector('#pdf-native-fill').style.display=document.querySelector('#show-pdf-fill').checked?'block':'none';document.querySelector('#pdf-native-outline').style.display=document.querySelector('#show-pdf-outline').checked?'block':'none';document.querySelector('.pdf-outline-use').style.opacity=Number(document.querySelector('#outline-opacity').value)/100;if(document.querySelector('#show-skeleton').checked)for(const [x,y] of D.skeleton){{const i=(y*D.size+x)*4;img.data[i]=100;img.data[i+1]=116;img.data[i+2]=139;img.data[i+3]=105}}
+if(document.querySelector('#show-visible-owner')?.checked!==false)for(const [x,y,label,at] of D.pixels){{if(at>t)continue;const i=(y*D.size+x)*4,[r,g,b]=colors[label];img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=220}}if(layer&&document.querySelector('#show-residual-before').checked)paintPixels(img,layer.residualBefore,59,130,246,90);if(layer&&document.querySelector('#show-residual-after').checked)paintPixels(img,layer.residualAfter,168,85,247,105);if(layer&&document.querySelector('#show-reusable-contact').checked)paintPixels(img,layer.reusableContact,250,204,21,180);ctx.putImageData(img,0,0);if(layer&&document.querySelector('#show-selected-half-edges').checked)drawHalfEdges(layer.selectedHalfEdges,'#22c55e',2.2);if(layer&&document.querySelector('#show-forbidden-half-edges').checked)drawHalfEdges(layer.forbiddenHalfEdges,'#ef4444',2.2);
 if(document.querySelector('#show-routes').checked){{ctx.lineWidth=1.2;for(let i=0;i<D.routes.length;i++){{const route=D.routes[i],event=D.events[i];if(t<event.startTime)continue;const fraction=Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime));const count=Math.max(1,Math.floor(route.length*fraction));ctx.strokeStyle=D.strokes[i].color;ctx.beginPath();for(let j=0;j<count;j++){{const [x,y]=route[j];j?ctx.lineTo(x,y):ctx.moveTo(x,y)}}ctx.stroke();ctx.fillStyle='white';ctx.strokeStyle='#0f172a';ctx.beginPath();ctx.arc(route[0][0],route[0][1],3,0,Math.PI*2);ctx.fill();ctx.stroke();if(fraction<1){{const p=route[Math.min(route.length-1,count-1)];ctx.fillStyle='#ef4444';ctx.beginPath();ctx.arc(p[0],p[1],3.7,0,Math.PI*2);ctx.fill()}}}}
 }}
-if(document.querySelector('#show-truth').checked&&D.truth.length){{for(let i=0;i<D.truth.length;i++){{const event=D.events[i];if(t<event.startTime)continue;const active=t<=event.endTime,modelFraction=active?Math.max(0,Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime))):1,audit=D.evaluation?.perStrokeTrajectoryAudit?.[i],truthFraction=active?logicTruthFraction(audit,modelFraction):1,truth=D.truth[i].map(([x,y])=>[x/100*D.size,y/100*D.size]),prefix=arcLengthPrefix(truth,truthFraction),truthTip=prefix.at(-1);ctx.strokeStyle='#06b6d4';ctx.lineWidth=2.3;ctx.setLineDash([]);ctx.beginPath();prefix.forEach(([x,y],index)=>index?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke();if(active){{const model=D.routes[i],modelCount=Math.max(1,Math.floor(model.length*modelFraction)),modelTip=model[Math.min(model.length-1,modelCount-1)];ctx.strokeStyle='rgba(15,23,42,.6)';ctx.lineWidth=1;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(modelTip[0],modelTip[1]);ctx.lineTo(truthTip[0],truthTip[1]);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#06b6d4';ctx.beginPath();ctx.arc(truthTip[0],truthTip[1],3.7,0,Math.PI*2);ctx.fill()}}}}}}
-const event=D.events.find(e=>t>=e.startTime&&t<=e.endTime)||D.events.find(e=>t<e.startTime)||D.events.at(-1);activeStroke=Math.max(0,event.stroke-1);document.querySelectorAll('.stroke').forEach((e,i)=>e.classList.toggle('active',i===activeStroke));const s=D.strokes[activeStroke],audit=D.evaluation?.perStrokeTrajectoryAudit?.[activeStroke],auditText=audit?`<br>有向序列 DTW ${{audit.directedSequenceDtwMeanPercent.toFixed(2)}}% · 起点 ${{audit.startErrorPercent.toFixed(2)}}% · 终点 ${{audit.endErrorPercent.toFixed(2)}}%<br>覆盖 P/R ${{(audit.inkPrecision*100).toFixed(1)}}% / ${{(audit.inkRecall*100).toFixed(1)}}% · ${{audit.issues.length?audit.issues.join('、'):'未触发轨迹告警'}}`:'';document.querySelector('#state').innerHTML=`<b>第 ${{s.stroke}} 笔 · ${{s.feature}} · 部件 ${{s.componentId}}</b><br>主前沿：${{t<event.startTime?'等待落笔':t>=event.endTime?'已收笔':'沿唯一合法主路扩散'}}<br>停止条件：${{event.stopReason}}${{auditText}}`;document.querySelector('#options').textContent=JSON.stringify({{routeOptions:D.options[activeStroke],trajectoryAudit:audit}},null,2);clock.textContent=`${{t.toFixed(1)}} / ${{D.maximumTime.toFixed(1)}}`;}}
+if(document.querySelector('#show-truth').checked&&D.truth.length){{for(let i=0;i<D.truth.length;i++){{const event=D.events[i];if(t<event.startTime)continue;const active=t<=event.endTime,modelFraction=active?Math.max(0,Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime))):1,audit=D.evaluation?.perStrokeTrajectoryAudit?.[i],truthFraction=active?logicTruthFraction(audit,modelFraction):1,truth=D.truth[i].map(([x,y])=>[x/100*D.size,y/100*D.size]),prefix=arcLengthPrefix(truth,truthFraction),truthTip=prefix.at(-1);ctx.strokeStyle='#06b6d4';ctx.lineWidth=2.3;ctx.setLineDash([]);ctx.beginPath();prefix.forEach(([x,y],index)=>index?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke();if(active){{const model=D.routes[i];if(model?.length){{const modelCount=Math.max(1,Math.floor(model.length*modelFraction)),modelTip=model[Math.min(model.length-1,modelCount-1)];ctx.strokeStyle='rgba(15,23,42,.6)';ctx.lineWidth=1;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(modelTip[0],modelTip[1]);ctx.lineTo(truthTip[0],truthTip[1]);ctx.stroke();ctx.setLineDash([])}}ctx.fillStyle='#06b6d4';ctx.beginPath();ctx.arc(truthTip[0],truthTip[1],3.7,0,Math.PI*2);ctx.fill()}}}}}}
+const event=currentEvent;activeStroke=Math.max(0,event.stroke-1);document.querySelectorAll('.stroke').forEach((e,i)=>e.classList.toggle('active',i===activeStroke));const s=D.strokes[activeStroke],audit=D.evaluation?.perStrokeTrajectoryAudit?.[activeStroke],hasRouteAudit=audit?.directedSequenceDtwMeanPercent!=null,auditText=audit?(hasRouteAudit?`<br>有向序列 DTW ${{audit.directedSequenceDtwMeanPercent.toFixed(2)}}% · 起点 ${{audit.startErrorPercent.toFixed(2)}}% · 终点 ${{audit.endErrorPercent.toFixed(2)}}%<br>覆盖 P/R ${{(audit.inkPrecision*100).toFixed(1)}}% / ${{(audit.inkRecall*100).toFixed(1)}}% · ${{audit.issues.length?audit.issues.join('、'):'未触发轨迹告警'}}`:`<br>${{audit.issues.join('、')}}`):'';document.querySelector('#state').innerHTML=`<b>第 ${{s.stroke}} 笔 · ${{s.feature}} · 部件 ${{s.componentId}}</b><br>主前沿：${{t<event.startTime?'等待落笔':t>=event.endTime?'已收笔':'沿唯一合法主路扩散'}}<br>停止条件：${{event.stopReason}}${{auditText}}`;document.querySelector('#options').textContent=JSON.stringify({{routeOptions:D.options[activeStroke],trajectoryAudit:audit}},null,2);if(document.querySelector('#residual-evidence'))document.querySelector('#residual-evidence').textContent=JSON.stringify(layer?.evidence||{{status:'no residual route for this stroke'}},null,2);if(document.querySelector('#later-feasibility'))document.querySelector('#later-feasibility').textContent=JSON.stringify({{remainingLaterStrokeFeasible:layer?.evidence?.remainingLaterStrokeFeasible??false,unexplainedInk:layer?.evidence?.unexplainedInk??null}},null,2);clock.textContent=`${{t.toFixed(1)}} / ${{D.maximumTime.toFixed(1)}}`;}}
 for(const [i,s] of D.strokes.entries()){{const e=document.createElement('div');e.className='stroke';e.style.setProperty('--c',s.color);e.innerHTML=`第 ${{i+1}} 笔 · ${{s.feature}}<br>叶部件 ${{s.componentId}} #${{s.occurrence}}`;e.onclick=()=>{{slider.value=Math.round(D.events[i].startTime/D.maximumTime*1000);render()}};document.querySelector('#stroke-list').append(e)}}
 slider.oninput=render;document.querySelectorAll('input[type=checkbox]').forEach(e=>e.onchange=render);document.querySelector('#outline-opacity').oninput=render;document.querySelector('#play').onclick=()=>{{playing=!playing;document.querySelector('#play').textContent=playing?'暂停':'播放';last=performance.now();requestAnimationFrame(tick)}};function tick(now){{if(!playing)return;const next=Math.min(1000,Number(slider.value)+(now-last)/D.maximumTime*160);last=now;slider.value=next;render();if(next>=1000){{playing=false;document.querySelector('#play').textContent='播放'}}else requestAnimationFrame(tick)}}render();
 </script></html>'''
@@ -1847,6 +2008,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder", choices=("legacy", "residual"), default="legacy")
     parser.add_argument("--learned-rules", type=Path)
     parser.add_argument("--stroke-order-catalog", type=Path)
+    parser.add_argument("--beam-width", type=int, default=350)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit-output", type=Path)
     return parser
@@ -1912,9 +2074,11 @@ def main():
         learned_model=learned_model,
         excluded_training_case=excluded_training_case,
         source=args.source,
+        enforce_component_labels=args.decoder == "legacy",
     )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
+    residual_result = None
     if args.decoder == "residual":
         normative_catalog = RESIDUAL_DECODER.ORDER.load_normative_catalog(
             args.stroke_order_catalog
@@ -1928,6 +2092,7 @@ def main():
             codepoint=codepoint,
             learned_model=learned_model,
             normative_catalog=normative_catalog,
+            beam_width=args.beam_width,
         )
         routes = list(residual_result.routes)
         owner = residual_result.ledger.visible_owner
@@ -1968,6 +2133,7 @@ def main():
             ),
             "candidateGeometryUsedForTargetMask": False,
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,
+            "beamWidth": args.beam_width if args.decoder == "residual" else None,
             "criticalNodeCount": len(graph.critical),
             "routeHypothesisCount": len(raw_routes),
             "learnedRules": {
@@ -1980,6 +2146,16 @@ def main():
                 skeleton.sum() - len(set().union(*(route.pixels for route in routes)))
             ),
         }
+    )
+    review_payload = (
+        residual_review_payload(
+            residual_result,
+            target,
+            graph=graph,
+            directed=RESIDUAL_DECODER.DIRECTED.build_directed_skeleton(graph),
+        )
+        if residual_result is not None
+        else None
     )
     document = build_html(
         record=record,
@@ -1998,6 +2174,7 @@ def main():
         decision=decision,
         evaluation=evaluation,
         truth_lines=truth_lines,
+        residual_result=residual_result,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, "utf-8")
@@ -2009,6 +2186,24 @@ def main():
         "output": str(args.output),
         "decision": decision,
         "evaluation": evaluation,
+        "residualReview": review_payload,
+        "strokes": [
+            {
+                "stroke": index + 1,
+                "feature": stroke["feature"],
+                "componentId": int(stroke["componentId"]),
+                "occurrence": int(stroke.get("occurrence", 0)),
+                **(
+                    {
+                        "selectedHalfEdges": review_payload["residualLayers"][index]["selectedHalfEdges"],
+                        "forbiddenHalfEdges": review_payload["residualLayers"][index]["forbiddenHalfEdges"],
+                    }
+                    if residual_result is not None and index < len(residual_result.regions)
+                    else {}
+                ),
+            }
+            for index, stroke in enumerate(candidate)
+        ],
     }
     if args.audit_output:
         args.audit_output.parent.mkdir(parents=True, exist_ok=True)

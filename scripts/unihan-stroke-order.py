@@ -108,6 +108,16 @@ def _direction_sector(points: np.ndarray) -> str:
     return SECTORS[int((angle + 22.5) // 45.0) % 8]
 
 
+def sector_compatible(expected: str, observed: str, tolerance: int = 1) -> bool:
+    """Allow one raster octant of tangent noise, never a quarter turn."""
+    if expected == "unknown" or observed == "unknown":
+        return True
+    if expected not in SECTORS or observed not in SECTORS:
+        return False
+    delta = abs(SECTORS.index(expected) - SECTORS.index(observed))
+    return min(delta, len(SECTORS) - delta) <= tolerance
+
+
 def compile_stroke_expectations(
     strokes: list[dict],
     source: str,
@@ -237,8 +247,9 @@ def rank_pen_down_candidates(
         compatible = tuple(
             edge_id
             for edge_id in edge_ids
-            if expectation.expected_sector == "unknown"
-            or directed.edges[edge_id].start_sector == expectation.expected_sector
+            if sector_compatible(
+                expectation.expected_sector, directed.edges[edge_id].start_sector
+            )
         )
         rejections = []
         if not bool(ledger.available[y, x]):

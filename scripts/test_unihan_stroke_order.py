@@ -82,6 +82,13 @@ class StrokeOrderTests(unittest.TestCase):
         point = graph.points[legal[0].point_index]
         self.assertEqual(tuple(map(int, point)), (3, 3))
 
+    def test_raster_diagonal_neighbour_is_compatible_with_cardinal_direction(self):
+        self.assertTrue(ORDER.sector_compatible("S", "SE"))
+        self.assertTrue(ORDER.sector_compatible("S", "SW"))
+        self.assertTrue(ORDER.sector_compatible("E", "SE"))
+        self.assertFalse(ORDER.sector_compatible("S", "E"))
+        self.assertFalse(ORDER.sector_compatible("S", "N"))
+
     def test_after_subtracting_first_horizontal_next_horizontal_is_lower_one(self):
         skeleton, graph, directed, ledger, expectations = self.old_head_fixture()
         upper = np.zeros_like(skeleton)

@@ -15,6 +15,51 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_html_lists_pen_down_acceptance_and_rejection_reasons(self):
+        self.assertTrue(hasattr(MODULE, "residual_review_markup"))
+        markup = MODULE.residual_review_markup()
+        self.assertIn("落笔候选", markup)
+        self.assertIn("接受理由", markup)
+        self.assertIn("拒绝理由", markup)
+        self.assertIn("后续笔画可行性", markup)
+
+    def test_html_draws_selected_and_forbidden_half_edges_distinctly(self):
+        markup = MODULE.residual_review_markup()
+        self.assertIn("show-selected-half-edges", markup)
+        self.assertIn("show-forbidden-half-edges", markup)
+        self.assertIn("#22c55e", markup)
+        self.assertIn("#ef4444", markup)
+
+    def test_html_animates_residual_ink_after_each_stroke(self):
+        markup = MODULE.residual_review_markup()
+        self.assertIn("show-residual-before", markup)
+        self.assertIn("show-residual-after", markup)
+        self.assertIn("D.residualLayers", markup)
+
+    def test_html_uses_later_stroke_colour_at_shared_contact(self):
+        self.assertTrue(hasattr(MODULE, "residual_review_payload"))
+        target = np.ones((3, 3), dtype=bool)
+        first = np.zeros((3, 3), dtype=bool)
+        first[1, 0:2] = True
+        second = np.zeros((3, 3), dtype=bool)
+        second[1, 1:3] = True
+        contact = np.zeros((3, 3), dtype=bool)
+        contact[1, 1] = True
+        empty = np.zeros((3, 3), dtype=bool)
+        result = SimpleNamespace(
+            regions=(
+                SimpleNamespace(mask=first, contact_mask=contact, forbidden_leak_mask=empty),
+                SimpleNamespace(mask=second, contact_mask=contact, forbidden_leak_mask=empty),
+            ),
+            steps=(
+                {"stroke": 1, "routeEdgeIds": [2], "forbiddenHalfEdges": [4]},
+                {"stroke": 2, "routeEdgeIds": [6], "forbiddenHalfEdges": [8]},
+            ),
+        )
+        payload = MODULE.residual_review_payload(result, target)
+        final_owner = {tuple(pixel[:2]): pixel[2] for pixel in payload["visibleOwner"]}
+        self.assertEqual(final_owner[(1, 1)], 1)
+        self.assertEqual(len(payload["residualLayers"]), 2)
     def test_cli_exposes_legacy_and_residual_decoder_choices(self):
         self.assertTrue(hasattr(MODULE, "build_argument_parser"))
         parser = MODULE.build_argument_parser()
@@ -273,6 +318,35 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         complete = np.asarray([[5.0, 1.0], [5.0, 9.0]])
         self.assertTrue(MODULE.has_forward_continuation(graph, truncated))
         self.assertFalse(MODULE.has_forward_continuation(graph, complete))
+
+    def test_residual_ranking_does_not_use_candidate_position_as_component_gate(self):
+        skeleton = np.zeros((9, 12), dtype=bool)
+        skeleton[2, 1:10] = True
+        skeleton[6, 1:10] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        raw_routes = MODULE.all_routes(graph)
+        strokes = [
+            {
+                "componentId": 506,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 0.0], [8.0, 0.0]]),
+            }
+        ]
+        original = MODULE.component_label_options
+        kept_component = raw_routes[0]["component"]
+        MODULE.component_label_options = lambda _strokes, _graph: {
+            (506, 0): {kept_component}
+        }
+        try:
+            legacy = MODULE.rank_routes(strokes, graph, raw_routes)
+            residual = MODULE.rank_routes(
+                strokes, graph, raw_routes, enforce_component_labels=False
+            )
+        finally:
+            MODULE.component_label_options = original
+        self.assertGreater(len(legacy[0]), 0)
+        self.assertGreater(len(residual[0]), len(legacy[0]))
 
     def test_absolute_skeleton_coverage_can_outweigh_a_short_local_match(self):
         stroke = {"points": np.asarray([[0.0, 0.0], [10.0, 0.0]])}
