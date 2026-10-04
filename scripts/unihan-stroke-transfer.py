@@ -205,6 +205,29 @@ VERIFIED_LEAF_STROKE_ORDERS: dict[int, tuple[str, ...]] = {
     486: ("横", "竖", "竖", "横"),
 }
 
+# Human corrections to the temporal order of exported reference strokes.
+# Values are one-based source stroke numbers in their verified playback order.
+# U+66DA-N's four-stroke 499 head was exported spatially left-to-right; the
+# verified writing order is the two inner verticals, outer-left dot, outer-right
+# falling stroke.  Keep the source JSON intact and expose the normalization in
+# every audit's annotationOrderCorrections.
+VERIFIED_ANNOTATION_STROKE_PERMUTATIONS: dict[str, tuple[int, ...]] = {
+    "U+66DA-N-57149": (1, 2, 3, 4, 6, 7, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
+}
+
+
+def apply_verified_annotation_stroke_order(
+    metadata: dict, stroke_annotations: list[dict]
+) -> tuple[list[dict], list[int] | None]:
+    permutation = VERIFIED_ANNOTATION_STROKE_PERMUTATIONS.get(
+        str(metadata.get("reviewKey", ""))
+    )
+    if permutation is None or len(permutation) != len(stroke_annotations):
+        return stroke_annotations, None
+    if sorted(permutation) != list(range(1, len(stroke_annotations) + 1)):
+        raise ValueError("verified annotation stroke permutation is invalid")
+    return [stroke_annotations[index - 1] for index in permutation], list(permutation)
+
 
 def apply_verified_leaf_stroke_orders(strokes: list[dict]) -> list[dict]:
     """Return strokes with verified within-leaf order corrections applied.
@@ -656,6 +679,19 @@ def load_human_annotations(
     if len(stroke_annotations) != len(candidate):
         raise ValueError(
             f"human truth has {len(stroke_annotations)} strokes, candidate has {len(candidate)}"
+        )
+    stroke_annotations, verified_permutation = apply_verified_annotation_stroke_order(
+        metadata, stroke_annotations
+    )
+    if verified_permutation is not None:
+        corrections.append(
+            {
+                "type": "verified-human-stroke-order",
+                "display": "人工笔顺纠正",
+                "from": list(range(1, len(verified_permutation) + 1)),
+                "to": verified_permutation,
+                "reason": "maintainer-confirmed directed stroke order",
+            }
         )
     # Older exports preserve the legacy candidate path order.  When a
     # verified semantic correction changes only temporal order (for example

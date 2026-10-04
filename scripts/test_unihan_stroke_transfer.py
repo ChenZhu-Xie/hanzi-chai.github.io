@@ -16,6 +16,15 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_verified_u66da_n_truth_uses_inner_inner_outer_outer_order(self):
+        annotations = [{"token": index} for index in range(1, 19)]
+        reordered, permutation = MODULE.apply_verified_annotation_stroke_order(
+            {"reviewKey": "U+66DA-N-57149"}, annotations
+        )
+
+        self.assertEqual(permutation[4:8], [6, 7, 5, 8])
+        self.assertEqual([item["token"] for item in reordered[4:8]], [6, 7, 5, 8])
+
     def test_disconnected_grass_leaf_uses_verified_horizontal_first_order(self):
         strokes = [
             {"componentId": 486, "occurrence": 0, "feature": "竖", "token": "left-v"},

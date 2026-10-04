@@ -14,6 +14,28 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_ink_width_follows_skeleton_ownership_across_a_junction(self):
+        skeleton = np.zeros((15, 15), dtype=bool)
+        skeleton[7, 1:14] = True
+        skeleton[2:13, 7] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        target = MODULE.cv2.dilate(skeleton.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+
+        def route(points):
+            array = np.asarray(points, dtype=float)
+            pixels = frozenset((int(x), int(y)) for x, y in points)
+            return MODULE.RouteCandidate(0, 0, array, pixels, 1, 0.0, {})
+
+        horizontal = route([(x, 7) for x in range(1, 14)])
+        vertical = route([(7, y) for y in range(2, 13)])
+        owner, _distance = MODULE.geodesic_owners(
+            target, graph, [horizontal, vertical]
+        )
+
+        self.assertEqual(owner[7, 3], 0)
+        self.assertEqual(owner[3, 7], 1)
+        self.assertEqual(owner[11, 7], 1)
+
     def test_stroke_rule_signature_binds_exact_leaf_and_ordinal(self):
         strokes = [
             {"componentId": 220, "occurrence": 0, "feature": "横"},

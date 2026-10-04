@@ -536,6 +536,9 @@ def stroke_rule_signatures(strokes: list[dict]) -> list[dict]:
         ordinal = members.index(index) + 1
         count = len(members)
         feature = str(stroke.get("feature") or "未知")
+        hierarchy = stroke.get("hierarchy") or []
+        root_operator = str(hierarchy[-1].get("label", "unknown")) if hierarchy else "unknown"
+        context_key = f"depth:{len(hierarchy)}|root:{root_operator}"
         output.append(
             {
                 "key": f"{key[0]}|{ordinal}|{count}|{feature}",
@@ -544,6 +547,7 @@ def stroke_rule_signatures(strokes: list[dict]) -> list[dict]:
                 "ordinal": ordinal,
                 "count": count,
                 "feature": feature,
+                "contextKey": context_key,
             }
         )
     return output
@@ -644,6 +648,7 @@ def learned_rule_for_stroke(
         example
         for example in model.get("examplesBySignature", {}).get(signature["key"], [])
         if example.get("case") != excluded_case
+        and example.get("contextKey") == signature.get("contextKey")
     ]
     if not examples:
         return None
@@ -652,6 +657,7 @@ def learned_rule_for_stroke(
     sector_counts: dict[str, int] = {}
     turn_counts: dict[tuple[str, ...], int] = {}
     junction_choice_counts: dict[str, int] = {}
+    earlier_contact_counts: dict[bool, int] = {}
     positions = []
     glyph_positions = []
     for example in examples:
@@ -664,11 +670,16 @@ def learned_rule_for_stroke(
         for junction in example.get("junctions", []):
             choice = str(junction["chosen"])
             junction_choice_counts[choice] = junction_choice_counts.get(choice, 0) + 1
+        touches_earlier = bool(example["start"].get("touchesEarlierStroke", False))
+        earlier_contact_counts[touches_earlier] = earlier_contact_counts.get(touches_earlier, 0) + 1
         positions.append(example["start"]["componentNormalized"])
         glyph_positions.append(example["start"]["glyphNormalized"])
     dominant_role, role_support = max(role_counts.items(), key=lambda item: item[1])
     dominant_sector, sector_support = max(sector_counts.items(), key=lambda item: item[1])
     dominant_turns, turn_support = max(turn_counts.items(), key=lambda item: item[1])
+    dominant_contact, contact_support = max(
+        earlier_contact_counts.items(), key=lambda item: item[1]
+    )
     dominant_choice, choice_support = (
         max(junction_choice_counts.items(), key=lambda item: item[1])
         if junction_choice_counts
@@ -697,6 +708,8 @@ def learned_rule_for_stroke(
             if junction_choice_counts
             else 0.0
         ),
+        "touchesEarlierStroke": dominant_contact,
+        "touchesEarlierConfidence": contact_support / len(examples),
     }
 
 
@@ -781,6 +794,10 @@ def route_learned_cost(
         "junctionTurnsMismatch": turns_mismatch,
         "learnedStartCost": round(position_cost + sector_cost, 5),
         "learnedJunctionCost": round(turn_cost, 5),
+        "learnedTouchesEarlierStroke": rule["touchesEarlierStroke"],
+        "learnedTouchesEarlierConfidence": round(
+            float(rule["touchesEarlierConfidence"]), 5
+        ),
         "explanation": "; ".join(clauses),
     }
 
@@ -990,6 +1007,21 @@ def choose_routes(
                     if expected and not observed:
                         relation_cost += 0.25
                         notes.append(f"missing-contact-{previous_index + 1}")
+                        if (
+                            group_keys[current_index] == group_keys[previous_index]
+                            and current_option.evidence.get("learnedScoringEnabled")
+                            and current_option.evidence.get("learnedTouchesEarlierStroke")
+                            and float(
+                                current_option.evidence.get(
+                                    "learnedTouchesEarlierConfidence", 0.0
+                                )
+                            )
+                            >= 0.85
+                        ):
+                            relation_cost += 1.25
+                            notes.append(
+                                f"verified-same-leaf-contact-{previous_index + 1}"
+                            )
                     elif observed and not expected:
                         relation_cost += 0.15
                         notes.append(f"extra-contact-{previous_index + 1}")
@@ -1126,34 +1158,55 @@ def choose_routes(
     }
 
 
-def geodesic_owners(target: np.ndarray, routes: list[RouteCandidate]) -> tuple[np.ndarray, np.ndarray]:
-    height, width = target.shape
-    distance = np.full(target.shape, np.inf)
-    owner = np.full(target.shape, -1, dtype=np.int16)
+def geodesic_owners(
+    target: np.ndarray,
+    graph: SkeletonGraph,
+    routes: list[RouteCandidate],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Partition ink through a skeleton gate before restoring stroke width.
+
+    A direct 2-D flood can leave the end of one stroke and run longitudinally
+    into a touching sibling component.  First assign every skeleton road to a
+    directed route by graph distance, then give each ink pixel to its nearest
+    already-owned road.  Thus radial wetting may recover width but cannot use
+    the filled outline as an unapproved turn at a T/cross junction.
+    """
+    skeleton_distance = np.full(len(graph.points), np.inf)
+    skeleton_owner = np.full(len(graph.points), -1, dtype=np.int16)
     queue = []
     for label, route in enumerate(routes):
         for x, y in route.pixels:
-            if 0 <= y < height and 0 <= x < width and target[y, x]:
-                if distance[y, x] > 0 or label < owner[y, x]:
-                    distance[y, x] = 0.0
-                    owner[y, x] = label
-                    heapq.heappush(queue, (0.0, label, y, x))
-    while queue:
-        current, label, y, x = heapq.heappop(queue)
-        if current != distance[y, x] or label != owner[y, x]:
-            continue
-        for dy, dx in NEIGHBOURS:
-            ny, nx = y + dy, x + dx
-            if not (0 <= ny < height and 0 <= nx < width and target[ny, nx]):
+            index = graph.point_index.get((int(y), int(x)))
+            if index is None:
                 continue
-            step = math.sqrt(2) if dy and dx else 1.0
+            if skeleton_distance[index] > 0 or label < skeleton_owner[index]:
+                skeleton_distance[index] = 0.0
+                skeleton_owner[index] = label
+                heapq.heappush(queue, (0.0, label, index))
+    adjacency = graph_adjacency(graph.matrix)
+    while queue:
+        current, label, index = heapq.heappop(queue)
+        if current != skeleton_distance[index] or label != skeleton_owner[index]:
+            continue
+        for neighbour, step in adjacency[index]:
             proposed = current + step
-            if proposed + 1e-9 < distance[ny, nx] or (
-                abs(proposed - distance[ny, nx]) <= 1e-9 and label < owner[ny, nx]
+            if proposed + 1e-9 < skeleton_distance[neighbour] or (
+                abs(proposed - skeleton_distance[neighbour]) <= 1e-9
+                and label < skeleton_owner[neighbour]
             ):
-                distance[ny, nx] = proposed
-                owner[ny, nx] = label
-                heapq.heappush(queue, (proposed, label, ny, nx))
+                skeleton_distance[neighbour] = proposed
+                skeleton_owner[neighbour] = label
+                heapq.heappush(queue, (proposed, label, neighbour))
+
+    owner = np.full(target.shape, -1, dtype=np.int16)
+    distance = np.full(target.shape, np.inf)
+    ink_points = np.argwhere(target)
+    if len(ink_points) and len(graph.points):
+        nearest_distance, nearest_index = cKDTree(
+            graph.points.astype(float)
+        ).query(ink_points.astype(float))
+        owner[ink_points[:, 0], ink_points[:, 1]] = skeleton_owner[nearest_index]
+        distance[ink_points[:, 0], ink_points[:, 1]] = nearest_distance
     return owner, distance
 
 
@@ -1820,7 +1873,7 @@ def main():
         int(skeleton.sum()),
         coverage_weight=args.coverage_weight,
     )
-    owner, _owner_distance = geodesic_owners(target, routes)
+    owner, _owner_distance = geodesic_owners(target, graph, routes)
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
     # The prediction is now frozen. Only evaluation below may read target truth.
