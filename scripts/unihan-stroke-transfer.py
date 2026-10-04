@@ -196,6 +196,52 @@ def sample_svg_centerline(
     return output, fractions
 
 
+# Human-verified corrections to stroke order inside an otherwise valid leaf.
+# The repository geometry for 486 is correct, but its legacy path order starts
+# with the vertical.  A disconnected four-stroke grass head is written
+# horizontal, vertical, vertical, horizontal (一丨丨一).  Keep this correction
+# at the semantic leaf boundary so every glyph using 486 receives it.
+VERIFIED_LEAF_STROKE_ORDERS: dict[int, tuple[str, ...]] = {
+    486: ("横", "竖", "竖", "横"),
+}
+
+
+def apply_verified_leaf_stroke_orders(strokes: list[dict]) -> list[dict]:
+    """Return strokes with verified within-leaf order corrections applied.
+
+    Matching is deliberately strict: component ID, occurrence, stroke count,
+    and feature multiset must all agree.  Geometry remains attached to its
+    feature; only the temporal order changes.
+    """
+    output = list(strokes)
+    instance_indices: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(output):
+        key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
+        instance_indices.setdefault(key, []).append(index)
+    for (component_id, _occurrence), indices in instance_indices.items():
+        expected = VERIFIED_LEAF_STROKE_ORDERS.get(component_id)
+        if expected is None or len(indices) != len(expected):
+            continue
+        available = [output[index] for index in indices]
+        if sorted(str(item.get("feature")) for item in available) != sorted(expected):
+            continue
+        reordered = []
+        for feature in expected:
+            match = next(
+                (index for index, item in enumerate(available) if item.get("feature") == feature),
+                None,
+            )
+            if match is None:
+                reordered = []
+                break
+            reordered.append(available.pop(match))
+        for index, stroke in zip(indices, reordered):
+            output[index] = stroke
+    for stroke_index, stroke in enumerate(output):
+        stroke["strokeIndex"] = stroke_index
+    return output
+
+
 def candidate_strokes(row: dict, glyph_id: int) -> list[dict]:
     by_index = {}
     for leaf in row["candidateLeafSvgs"][str(glyph_id)]:
@@ -235,7 +281,9 @@ def candidate_strokes(row: dict, glyph_id: int) -> list[dict]:
     expected = len(row["candidates"][str(glyph_id)])
     if sorted(by_index) != list(range(expected)):
         raise ValueError(f"candidate {glyph_id} has incomplete stroke ownership")
-    return [by_index[index] for index in range(expected)]
+    return apply_verified_leaf_stroke_orders(
+        [by_index[index] for index in range(expected)]
+    )
 
 
 def merge_intersecting_annotation_strokes(
@@ -609,6 +657,60 @@ def load_human_annotations(
         raise ValueError(
             f"human truth has {len(stroke_annotations)} strokes, candidate has {len(candidate)}"
         )
+    # Older exports preserve the legacy candidate path order.  When a
+    # verified semantic correction changes only temporal order (for example
+    # leaf 486's disconnected grass head), reorder the reference strokes by
+    # the exported feature labels and normalized leaf IDs.  This is a stable
+    # permutation, never a geometric guess, and the source JSON stays intact.
+    exported_order = metadata.get("candidateStrokeOrder")
+    candidate_order = [str(stroke.get("feature")) for stroke in candidate]
+    if (
+        isinstance(exported_order, list)
+        and len(exported_order) == len(stroke_annotations)
+        and [str(value) for value in exported_order] != candidate_order
+    ):
+        available = [
+            {
+                "annotation": annotation,
+                "feature": str(feature),
+                "componentId": int(annotation.get("label")),
+                "oldStroke": index + 1,
+            }
+            for index, (annotation, feature) in enumerate(
+                zip(stroke_annotations, exported_order)
+            )
+            if str(annotation.get("label", "")).isdigit()
+        ]
+        reordered = []
+        permutation = []
+        for stroke in candidate:
+            component_id = int(stroke["componentId"])
+            feature = str(stroke.get("feature"))
+            match = next(
+                (
+                    index
+                    for index, item in enumerate(available)
+                    if item["componentId"] == component_id and item["feature"] == feature
+                ),
+                None,
+            )
+            if match is None:
+                reordered = []
+                break
+            selected = available.pop(match)
+            reordered.append(selected["annotation"])
+            permutation.append(selected["oldStroke"])
+        if len(reordered) == len(stroke_annotations):
+            stroke_annotations = reordered
+            corrections.append(
+                {
+                    "type": "verified-stroke-order",
+                    "display": "笔顺归一化",
+                    "from": list(range(1, len(permutation) + 1)),
+                    "to": permutation,
+                    "reason": "verified semantic leaf stroke order",
+                }
+            )
     manual = []
     scale = canvas / 100
     for index, (annotation, fallback) in enumerate(zip(stroke_annotations, candidate)):

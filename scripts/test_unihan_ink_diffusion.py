@@ -14,6 +14,43 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_turn_landmarks_distinguish_straight_from_right_angle(self):
+        straight = np.asarray([[0.0, 0.0], [30.0, 0.0]])
+        corner = np.asarray([[0.0, 0.0], [15.0, 0.0], [15.0, 15.0]])
+        self.assertEqual(MODULE.turn_landmarks(straight), [])
+        turns = MODULE.turn_landmarks(corner)
+        self.assertEqual(len(turns), 1)
+        self.assertAlmostEqual(turns[0], 0.5, delta=0.12)
+
+    def test_directed_sequence_dtw_ignores_local_drawing_speed(self):
+        uniform = np.asarray([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [10.0, 10.0]])
+        delayed_turn = np.asarray(
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [9.0, 0.0], [10.0, 0.0], [10.0, 10.0]]
+        )
+        aligned = MODULE.directed_sequence_dtw(uniform, delayed_turn)
+        reversed_arc = MODULE.directed_sequence_dtw(uniform, delayed_turn[::-1])
+        self.assertLess(aligned["mean"], reversed_arc["mean"])
+        self.assertEqual(aligned["logicProgressMap"][0], 0.0)
+        self.assertEqual(aligned["logicProgressMap"][-1], 1.0)
+
+    def test_critical_node_trace_preserves_directed_junction_order(self):
+        skeleton = np.zeros((15, 25), dtype=bool)
+        skeleton[7, 1:24] = True
+        skeleton[3:12, 7] = True
+        skeleton[3:12, 17] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        forward = MODULE.critical_node_trace(
+            np.asarray([[1.0, 7.0], [23.0, 7.0]]), graph, radius=3.0
+        )
+        backward = MODULE.critical_node_trace(
+            np.asarray([[23.0, 7.0], [1.0, 7.0]]), graph, radius=3.0
+        )
+        self.assertGreaterEqual(len(forward), 2)
+        self.assertEqual(
+            [item["node"] for item in forward],
+            list(reversed([item["node"] for item in backward])),
+        )
+
     def test_total_turn_ignores_one_pixel_skeleton_stair_steps(self):
         noisy_vertical = np.asarray(
             [[5.0 + (index % 2), float(index)] for index in range(30)]
@@ -222,6 +259,13 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertIn('class="pdf-fill-use pdf-source-fit"', page)
         self.assertIn('class="pdf-outline-use pdf-source-fit"', page)
         self.assertIn("document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource)", page)
+        self.assertIn("红点＝模型笔尖", page)
+        self.assertIn("青点＝人工笔尖", page)
+        self.assertIn("perStrokeTrajectoryAudit", page)
+        self.assertIn("function arcLengthPrefix(points,fraction)", page)
+        self.assertIn("if(clamped>=1)return points.slice()", page)
+        self.assertNotIn("truthCount=Math.max", page)
+        self.assertNotIn("ctx.setLineDash([5,4])", page)
         self.assertEqual(page.count('d="M0 0L1 1"'), 2)
         self.assertEqual(page.count('href="#pdf-glyph"'), 1)
         self.assertEqual(page.count('href="#pdf-glyph-outline"'), 1)

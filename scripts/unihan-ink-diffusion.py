@@ -946,6 +946,142 @@ def diffusion_arrivals(
     return arrival, events, float(offset)
 
 
+def vector_angle_error(left: np.ndarray, right: np.ndarray) -> float:
+    left_norm = float(np.linalg.norm(left))
+    right_norm = float(np.linalg.norm(right))
+    if left_norm < 1e-6 or right_norm < 1e-6:
+        return 0.0
+    cosine = float(np.clip(np.dot(left, right) / (left_norm * right_norm), -1.0, 1.0))
+    return float(math.degrees(math.acos(cosine)))
+
+
+def turn_landmarks(points: np.ndarray) -> list[float]:
+    """Return stable fractions of visually meaningful bends in a directed arc."""
+    sampled = resample(points, 72)
+    if len(sampled) < 9:
+        return []
+    # Suppress one-pixel skeleton stair-steps without erasing real corners.
+    padded = np.pad(sampled, ((3, 3), (0, 0)), mode="edge")
+    sampled = np.vstack([padded[index : index + 7].mean(axis=0) for index in range(len(sampled))])
+    cumulative = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(sampled, axis=0), axis=1))]
+    total = float(cumulative[-1])
+    if total < 1e-6:
+        return []
+    candidates = []
+    window = 3
+    for index in range(window, len(sampled) - window):
+        incoming = sampled[index] - sampled[index - window]
+        outgoing = sampled[index + window] - sampled[index]
+        angle = vector_angle_error(incoming, outgoing)
+        if angle >= 24.0:
+            candidates.append((angle, index))
+    selected = []
+    for angle, index in sorted(candidates, reverse=True):
+        if any(abs(index - other) < 7 for _other_angle, other in selected):
+            continue
+        selected.append((angle, index))
+    return sorted(round(float(cumulative[index] / total), 4) for _angle, index in selected)
+
+
+def critical_node_trace(points: np.ndarray, graph: SkeletonGraph, radius: float = 4.0) -> list[dict]:
+    """Describe critical skeleton nodes visited by a directed trajectory."""
+    junctions = [
+        (index, point)
+        for index, point in enumerate(graph.critical)
+        if int(graph.crossing[point]) >= 3
+    ]
+    if not junctions or len(points) < 2:
+        return []
+    sampled = resample(points, 180)
+    critical_ids = [index for index, _point in junctions]
+    critical_xy = np.asarray([(x, y) for _index, (y, x) in junctions], dtype=float)
+    tree = cKDTree(critical_xy)
+    distances, indices = tree.query(sampled)
+    cumulative = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(sampled, axis=0), axis=1))]
+    total = max(1e-6, float(cumulative[-1]))
+    trace = []
+    previous = None
+    for sample_index, (distance, critical_index) in enumerate(zip(distances, indices)):
+        if float(distance) > radius or int(critical_index) == previous:
+            continue
+        node_id = critical_ids[int(critical_index)]
+        previous = int(critical_index)
+        point = critical_xy[critical_index]
+        trace.append(
+            {
+                "node": int(node_id),
+                "point": [round(float(point[0]), 2), round(float(point[1]), 2)],
+                "fraction": round(float(cumulative[sample_index] / total), 4),
+            }
+        )
+    return trace
+
+
+def landmark_alignment_error(left: list[float], right: list[float]) -> float | None:
+    if not left and not right:
+        return 0.0
+    if not left or not right:
+        return None
+    count = min(len(left), len(right))
+    left_sample = np.interp(np.linspace(0, len(left) - 1, count), np.arange(len(left)), left)
+    right_sample = np.interp(np.linspace(0, len(right) - 1, count), np.arange(len(right)), right)
+    return float(np.mean(np.abs(left_sample - right_sample)))
+
+
+def directed_sequence_dtw(
+    predicted: np.ndarray,
+    expected: np.ndarray,
+    samples: int = 96,
+) -> dict:
+    """Align two pen trajectories by logical order, not wall-clock time.
+
+    DTW may locally wait or advance on either curve, so sampling rate and
+    drawing speed are irrelevant.  Its steps remain monotone, which preserves
+    pen-down -> turns/contacts -> pen-up ordering and cannot reverse a stroke.
+    """
+    left = resample(predicted, samples)
+    right = resample(expected, samples)
+    pair_cost = np.linalg.norm(left[:, None, :] - right[None, :, :], axis=2)
+    total = np.full((samples + 1, samples + 1), np.inf, dtype=float)
+    total[0, 0] = 0.0
+    predecessor = np.zeros((samples, samples), dtype=np.uint8)
+    for left_index in range(samples):
+        for right_index in range(samples):
+            choices = (
+                total[left_index, right_index],
+                total[left_index, right_index + 1],
+                total[left_index + 1, right_index],
+            )
+            step = int(np.argmin(choices))
+            total[left_index + 1, right_index + 1] = pair_cost[left_index, right_index] + choices[step]
+            predecessor[left_index, right_index] = step
+    left_index = right_index = samples - 1
+    path = []
+    while left_index >= 0 and right_index >= 0:
+        path.append((left_index, right_index))
+        step = int(predecessor[left_index, right_index])
+        if step == 0:
+            left_index -= 1
+            right_index -= 1
+        elif step == 1:
+            left_index -= 1
+        else:
+            right_index -= 1
+    path.reverse()
+    distances = np.asarray([pair_cost[left_index, right_index] for left_index, right_index in path])
+    mapping = []
+    for left_index in range(samples):
+        matches = [right_index for current_left, right_index in path if current_left == left_index]
+        mapping.append(float(np.mean(matches)) / (samples - 1) if matches else left_index / (samples - 1))
+    display_indices = np.linspace(0, samples - 1, 33).round().astype(int)
+    return {
+        "mean": float(distances.mean()),
+        "p95": float(np.percentile(distances, 95)),
+        "maximum": float(distances.max(initial=0.0)),
+        "logicProgressMap": [round(mapping[index], 4) for index in display_indices],
+    }
+
+
 def evaluate_truth(
     annotation_path: Path,
     codepoint: int,
@@ -955,6 +1091,7 @@ def evaluate_truth(
     routes: list[RouteCandidate],
     target: np.ndarray,
     owner: np.ndarray,
+    graph: SkeletonGraph,
     canvas: int,
 ) -> tuple[dict, list[list[list[float]]]]:
     truth, normalized, _corrections = TRANSFER.load_human_annotations(
@@ -966,26 +1103,91 @@ def evaluate_truth(
         canvas=canvas,
     )
     start_errors = []
+    end_errors = []
     chamfers = []
+    sequence_errors = []
+    sequence_p95 = []
+    sequence_progress_maps = []
+    start_angles = []
+    end_angles = []
+    length_ratios = []
+    turn_reports = []
+    topology_reports = []
     for predicted, expected in zip(routes, truth):
         start_errors.append(float(np.linalg.norm(predicted.points[0] - expected["points"][0])))
+        end_errors.append(float(np.linalg.norm(predicted.points[-1] - expected["points"][-1])))
         predicted_dense = resample(predicted.points, 160)
         expected_dense = resample(expected["points"], 160)
         left = cKDTree(predicted_dense).query(expected_dense)[0].mean()
         right = cKDTree(expected_dense).query(predicted_dense)[0].mean()
         chamfers.append(float((left + right) / 2))
+        sequence_alignment = directed_sequence_dtw(predicted.points, expected["points"])
+        sequence_errors.append(sequence_alignment["mean"])
+        sequence_p95.append(sequence_alignment["p95"])
+        sequence_progress_maps.append(sequence_alignment["logicProgressMap"])
+        tangent_window = 10
+        start_angles.append(
+            vector_angle_error(
+                predicted_dense[tangent_window] - predicted_dense[0],
+                expected_dense[tangent_window] - expected_dense[0],
+            )
+        )
+        end_angles.append(
+            vector_angle_error(
+                predicted_dense[-1] - predicted_dense[-1 - tangent_window],
+                expected_dense[-1] - expected_dense[-1 - tangent_window],
+            )
+        )
+        predicted_length = float(np.linalg.norm(np.diff(predicted_dense, axis=0), axis=1).sum())
+        expected_length = float(np.linalg.norm(np.diff(expected_dense, axis=0), axis=1).sum())
+        length_ratios.append(predicted_length / max(1e-6, expected_length))
+        predicted_turns = turn_landmarks(predicted.points)
+        expected_turns = turn_landmarks(expected["points"])
+        turn_reports.append(
+            {
+                "predictedFractions": predicted_turns,
+                "truthFractions": expected_turns,
+                "countDelta": len(predicted_turns) - len(expected_turns),
+                "meanFractionError": (
+                    None
+                    if (error := landmark_alignment_error(predicted_turns, expected_turns)) is None
+                    else round(error, 4)
+                ),
+            }
+        )
+        predicted_nodes = critical_node_trace(predicted.points, graph)
+        expected_nodes = critical_node_trace(expected["points"], graph)
+        predicted_ids = [item["node"] for item in predicted_nodes]
+        expected_ids = [item["node"] for item in expected_nodes]
+        common = len(set(predicted_ids) & set(expected_ids))
+        precision = common / len(set(predicted_ids)) if predicted_ids else (1.0 if not expected_ids else 0.0)
+        recall = common / len(set(expected_ids)) if expected_ids else (1.0 if not predicted_ids else 0.0)
+        topology_reports.append(
+            {
+                "predicted": predicted_nodes,
+                "truth": expected_nodes,
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "exactDirectedSequence": predicted_ids == expected_ids,
+            }
+        )
     truth_lines = [item["points"] for item in truth]
     truth_masks, _ambiguous, _metrics = TRANSFER.partition_human_truth(
         target, truth_lines, truth, normalized["annotations"], canvas
     )
     component_ids = sorted({int(item["componentId"]) for item in truth})
     stroke_scores = []
+    stroke_precision = []
+    stroke_recall = []
     for index, truth_mask in enumerate(truth_masks):
         predicted_mask = owner == index
         intersection = int((truth_mask & predicted_mask).sum())
         union = int((truth_mask | predicted_mask).sum())
         stroke_scores.append(intersection / union if union else 1.0)
+        stroke_precision.append(intersection / int(predicted_mask.sum()) if predicted_mask.any() else 0.0)
+        stroke_recall.append(intersection / int(truth_mask.sum()) if truth_mask.any() else 0.0)
     component_scores = {}
+    component_ranges = {}
     for component_id in component_ids:
         truth_mask = np.zeros_like(target)
         predicted_mask = np.zeros_like(target)
@@ -996,17 +1198,90 @@ def evaluate_truth(
         intersection = int((truth_mask & predicted_mask).sum())
         union = int((truth_mask | predicted_mask).sum())
         component_scores[str(component_id)] = round(intersection / union, 6) if union else 1.0
+        component_ranges[str(component_id)] = {
+            "precision": round(intersection / int(predicted_mask.sum()), 6) if predicted_mask.any() else 0.0,
+            "recall": round(intersection / int(truth_mask.sum()), 6) if truth_mask.any() else 0.0,
+            "leakagePercent": round(
+                (int(predicted_mask.sum()) - intersection) / max(1, int(predicted_mask.sum())) * 100,
+                4,
+            ),
+            "missedPercent": round(
+                (int(truth_mask.sum()) - intersection) / max(1, int(truth_mask.sum())) * 100,
+                4,
+            ),
+        }
+    per_stroke = []
+    for index, item in enumerate(truth):
+        issues = []
+        if start_errors[index] / canvas > 0.035:
+            issues.append("wrong-start")
+        if end_errors[index] / canvas > 0.05:
+            issues.append("wrong-end")
+        if sequence_errors[index] / canvas > 0.045:
+            issues.append("wrong-directed-path")
+        if stroke_recall[index] < 0.78:
+            issues.append("premature-or-incomplete-coverage")
+        if stroke_precision[index] < 0.78:
+            issues.append("stroke-boundary-leakage")
+        if start_angles[index] > 42.0:
+            issues.append("wrong-start-direction")
+        turn = turn_reports[index]
+        if turn["countDelta"] != 0 or (
+            turn["meanFractionError"] is not None and turn["meanFractionError"] > 0.13
+        ):
+            issues.append("wrong-turn-landmarks")
+        if not topology_reports[index]["exactDirectedSequence"]:
+            issues.append("wrong-topology-node-sequence")
+        per_stroke.append(
+            {
+                "stroke": index + 1,
+                "feature": item.get("feature"),
+                "componentId": int(item["componentId"]),
+                "startErrorPercent": round(start_errors[index] / canvas * 100, 4),
+                "endErrorPercent": round(end_errors[index] / canvas * 100, 4),
+                "predictedStart": [round(float(value), 2) for value in routes[index].points[0]],
+                "truthStart": [round(float(value), 2) for value in item["points"][0]],
+                "predictedEnd": [round(float(value), 2) for value in routes[index].points[-1]],
+                "truthEnd": [round(float(value), 2) for value in item["points"][-1]],
+                "directedSequenceDtwMeanPercent": round(sequence_errors[index] / canvas * 100, 4),
+                "directedSequenceDtwP95Percent": round(sequence_p95[index] / canvas * 100, 4),
+                "logicProgressMap": sequence_progress_maps[index],
+                "startTangentErrorDegrees": round(start_angles[index], 2),
+                "endTangentErrorDegrees": round(end_angles[index], 2),
+                "lengthRatio": round(length_ratios[index], 4),
+                "inkPrecision": round(stroke_precision[index], 6),
+                "inkRecall": round(stroke_recall[index], 6),
+                "iou": round(stroke_scores[index], 6),
+                "turns": turn_reports[index],
+                "topology": topology_reports[index],
+                "issues": issues,
+            }
+        )
+    issue_counts: dict[str, int] = {}
+    for report in per_stroke:
+        for issue in report["issues"]:
+            issue_counts[issue] = issue_counts.get(issue, 0) + 1
     return (
         {
             "truthReadAfterPrediction": True,
             "meanStartErrorPercent": round(float(np.mean(start_errors)) / canvas * 100, 4),
             "perStrokeStartErrorPercent": [round(value / canvas * 100, 4) for value in start_errors],
+            "meanEndErrorPercent": round(float(np.mean(end_errors)) / canvas * 100, 4),
+            "perStrokeEndErrorPercent": [round(value / canvas * 100, 4) for value in end_errors],
             "meanCenterlineChamferPercent": round(float(np.mean(chamfers)) / canvas * 100, 4),
             "perStrokeCenterlineChamferPercent": [round(value / canvas * 100, 4) for value in chamfers],
+            "meanDirectedSequenceDtwPercent": round(float(np.mean(sequence_errors)) / canvas * 100, 4),
+            "trajectoryTimeSemantics": "monotone logical order; local drawing speed is ignored",
+            "meanStartTangentErrorDegrees": round(float(np.mean(start_angles)), 2),
             "perStrokeIoU": [round(value, 6) for value in stroke_scores],
+            "perStrokeInkPrecision": [round(value, 6) for value in stroke_precision],
+            "perStrokeInkRecall": [round(value, 6) for value in stroke_recall],
             "strokeMacroIoU": round(float(np.mean(stroke_scores)), 6),
             "componentIoU": component_scores,
+            "componentRangeAudit": component_ranges,
             "componentMacroIoU": round(float(np.mean(list(component_scores.values()))), 6),
+            "issueCounts": issue_counts,
+            "perStrokeTrajectoryAudit": per_stroke,
         },
         [[(points / canvas * 100).round(3).tolist() for points in truth_lines]][0],
     )
@@ -1190,7 +1465,7 @@ def build_html(
 <header><h1>U+{record['unicode']:04X} {html.escape(chr(record['unicode']))} · {html.escape(record['source'])} 源 · glyph {glyph_id}</h1><p>主前沿只沿 PDF 骨架有向前进；横向墨迹波只负责填满真实轮廓。candidate 坐标未用于生成 PDF 色块。</p><p>{html.escape(decision_html)}</p><p>{html.escape(evaluation_html)}</p></header>
 <main>
 <section><h2>Candidate：只读符号化假说</h2><div class="body"><svg viewBox="0 0 100 100">{candidate_svgs}</svg><div class="warning">这里的坐标、大小和占据空间不可信；只读取笔顺、方向、转折、接触关系和叶部件 ID。</div><div class="stroke-list" id="stroke-list"></div></div></section>
-<section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-pdf-fill" type="checkbox" checked>PDF 原生实体</label><label><input id="show-pdf-outline" type="checkbox" checked>PDF 原生轮廓</label><label>轮廓透明度 <input id="outline-opacity" type="range" min="10" max="100" value="58"></label><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox">人工真值中心线（仅验收）</label><span class="badge">红圈＝当前主前沿</span><span class="badge">白圈＝候选起点</span></div><svg class="pdf-definitions" aria-hidden="true"><defs>{glyph['definitions']}</defs></svg><div class="stage"><svg id="pdf-native-fill" viewBox="0 0 100 100" aria-label="原生 PDF 实体背景"><g class="pdf-fill-use pdf-source-fit">{original_use}</g></svg><canvas id="ink-diffusion-canvas" width="{canvas}" height="{canvas}"></canvas><svg id="pdf-native-outline" viewBox="0 0 100 100" aria-label="原生 PDF 顶层轮廓"><defs>{outline_glyph['definitions']}</defs><g class="pdf-outline-use pdf-source-fit">{outline_use}</g></svg></div></div></section>
+<section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-pdf-fill" type="checkbox" checked>PDF 原生实体</label><label><input id="show-pdf-outline" type="checkbox" checked>PDF 原生轮廓</label><label>轮廓透明度 <input id="outline-opacity" type="range" min="10" max="100" value="58"></label><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox" checked>人工真值笔尖轨迹（仅验收）</label><span class="badge">红点＝模型笔尖</span><span class="badge">青点＝人工笔尖（单调逻辑对齐，非等时）</span><span class="badge">白圈＝候选起点</span></div><svg class="pdf-definitions" aria-hidden="true"><defs>{glyph['definitions']}</defs></svg><div class="stage"><svg id="pdf-native-fill" viewBox="0 0 100 100" aria-label="原生 PDF 实体背景"><g class="pdf-fill-use pdf-source-fit">{original_use}</g></svg><canvas id="ink-diffusion-canvas" width="{canvas}" height="{canvas}"></canvas><svg id="pdf-native-outline" viewBox="0 0 100 100" aria-label="原生 PDF 顶层轮廓"><defs>{outline_glyph['definitions']}</defs><g class="pdf-outline-use pdf-source-fit">{outline_use}</g></svg></div></div></section>
 <section><h2>当前定格与路口裁决</h2><div class="body"><div id="state" class="good"></div><h3>起点候选（前八）</h3><pre id="options"></pre><h3>全局离散解</h3><pre>{html.escape(json.dumps(decision, ensure_ascii=False, indent=2))}</pre></div></section>
 </main>
 <script>
@@ -1199,12 +1474,14 @@ const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.sli
 function fitPdfSource(el){{const b=el.getBBox();if(!(b.width>0&&b.height>0))return;const s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
 document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource);
 function stageTime(){{return Number(slider.value)/1000*D.maximumTime}}
+function logicTruthFraction(audit,fraction){{const map=audit?.logicProgressMap;if(!map?.length)return fraction;const position=Math.max(0,Math.min(map.length-1,fraction*(map.length-1))),left=Math.floor(position),right=Math.min(map.length-1,left+1),mix=position-left;return map[left]*(1-mix)+map[right]*mix}}
+function arcLengthPrefix(points,fraction){{if(!points.length)return[];const clamped=Math.max(0,Math.min(1,fraction));if(clamped<=0)return[points[0]];if(clamped>=1)return points.slice();const lengths=[0];for(let i=1;i<points.length;i++)lengths.push(lengths.at(-1)+Math.hypot(points[i][0]-points[i-1][0],points[i][1]-points[i-1][1]));const total=lengths.at(-1);if(total<=1e-9)return[points[0],points.at(-1)];const target=clamped*total,prefix=[points[0]];for(let i=1;i<points.length;i++){{if(lengths[i]<target-1e-9){{prefix.push(points[i]);continue}}const segment=lengths[i]-lengths[i-1],mix=segment<=1e-9?1:(target-lengths[i-1])/segment;prefix.push([points[i-1][0]+(points[i][0]-points[i-1][0])*mix,points[i-1][1]+(points[i][1]-points[i-1][1])*mix]);break}}return prefix}}
 function render(){{const t=stageTime(),img=ctx.createImageData(D.size,D.size);document.querySelector('#pdf-native-fill').style.display=document.querySelector('#show-pdf-fill').checked?'block':'none';document.querySelector('#pdf-native-outline').style.display=document.querySelector('#show-pdf-outline').checked?'block':'none';document.querySelector('.pdf-outline-use').style.opacity=Number(document.querySelector('#outline-opacity').value)/100;if(document.querySelector('#show-skeleton').checked)for(const [x,y] of D.skeleton){{const i=(y*D.size+x)*4;img.data[i]=100;img.data[i+1]=116;img.data[i+2]=139;img.data[i+3]=105}}
 for(const [x,y,label,at] of D.pixels){{if(at>t)continue;const i=(y*D.size+x)*4,[r,g,b]=colors[label];img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=220}}ctx.putImageData(img,0,0);
 if(document.querySelector('#show-routes').checked){{ctx.lineWidth=1.2;for(let i=0;i<D.routes.length;i++){{const route=D.routes[i],event=D.events[i];if(t<event.startTime)continue;const fraction=Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime));const count=Math.max(1,Math.floor(route.length*fraction));ctx.strokeStyle=D.strokes[i].color;ctx.beginPath();for(let j=0;j<count;j++){{const [x,y]=route[j];j?ctx.lineTo(x,y):ctx.moveTo(x,y)}}ctx.stroke();ctx.fillStyle='white';ctx.strokeStyle='#0f172a';ctx.beginPath();ctx.arc(route[0][0],route[0][1],3,0,Math.PI*2);ctx.fill();ctx.stroke();if(fraction<1){{const p=route[Math.min(route.length-1,count-1)];ctx.fillStyle='#ef4444';ctx.beginPath();ctx.arc(p[0],p[1],3.7,0,Math.PI*2);ctx.fill()}}}}
 }}
-if(document.querySelector('#show-truth').checked&&D.truth.length){{ctx.strokeStyle='#06b6d4';ctx.setLineDash([5,4]);ctx.lineWidth=1.5;for(const route of D.truth){{ctx.beginPath();route.forEach(([x,y],i)=>i?ctx.lineTo(x/100*D.size,y/100*D.size):ctx.moveTo(x/100*D.size,y/100*D.size));ctx.stroke()}}ctx.setLineDash([])}}
-const event=D.events.find(e=>t>=e.startTime&&t<=e.endTime)||D.events.find(e=>t<e.startTime)||D.events.at(-1);activeStroke=Math.max(0,event.stroke-1);document.querySelectorAll('.stroke').forEach((e,i)=>e.classList.toggle('active',i===activeStroke));const s=D.strokes[activeStroke];document.querySelector('#state').innerHTML=`<b>第 ${{s.stroke}} 笔 · ${{s.feature}} · 部件 ${{s.componentId}}</b><br>主前沿：${{t<event.startTime?'等待落笔':t>=event.endTime?'已收笔':'沿唯一合法主路扩散'}}<br>停止条件：${{event.stopReason}}`;document.querySelector('#options').textContent=JSON.stringify(D.options[activeStroke],null,2);clock.textContent=`${{t.toFixed(1)}} / ${{D.maximumTime.toFixed(1)}}`;}}
+if(document.querySelector('#show-truth').checked&&D.truth.length){{for(let i=0;i<D.truth.length;i++){{const event=D.events[i];if(t<event.startTime)continue;const active=t<=event.endTime,modelFraction=active?Math.max(0,Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime))):1,audit=D.evaluation?.perStrokeTrajectoryAudit?.[i],truthFraction=active?logicTruthFraction(audit,modelFraction):1,truth=D.truth[i].map(([x,y])=>[x/100*D.size,y/100*D.size]),prefix=arcLengthPrefix(truth,truthFraction),truthTip=prefix.at(-1);ctx.strokeStyle='#06b6d4';ctx.lineWidth=2.3;ctx.setLineDash([]);ctx.beginPath();prefix.forEach(([x,y],index)=>index?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke();if(active){{const model=D.routes[i],modelCount=Math.max(1,Math.floor(model.length*modelFraction)),modelTip=model[Math.min(model.length-1,modelCount-1)];ctx.strokeStyle='rgba(15,23,42,.6)';ctx.lineWidth=1;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(modelTip[0],modelTip[1]);ctx.lineTo(truthTip[0],truthTip[1]);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#06b6d4';ctx.beginPath();ctx.arc(truthTip[0],truthTip[1],3.7,0,Math.PI*2);ctx.fill()}}}}}}
+const event=D.events.find(e=>t>=e.startTime&&t<=e.endTime)||D.events.find(e=>t<e.startTime)||D.events.at(-1);activeStroke=Math.max(0,event.stroke-1);document.querySelectorAll('.stroke').forEach((e,i)=>e.classList.toggle('active',i===activeStroke));const s=D.strokes[activeStroke],audit=D.evaluation?.perStrokeTrajectoryAudit?.[activeStroke],auditText=audit?`<br>有向序列 DTW ${{audit.directedSequenceDtwMeanPercent.toFixed(2)}}% · 起点 ${{audit.startErrorPercent.toFixed(2)}}% · 终点 ${{audit.endErrorPercent.toFixed(2)}}%<br>覆盖 P/R ${{(audit.inkPrecision*100).toFixed(1)}}% / ${{(audit.inkRecall*100).toFixed(1)}}% · ${{audit.issues.length?audit.issues.join('、'):'未触发轨迹告警'}}`:'';document.querySelector('#state').innerHTML=`<b>第 ${{s.stroke}} 笔 · ${{s.feature}} · 部件 ${{s.componentId}}</b><br>主前沿：${{t<event.startTime?'等待落笔':t>=event.endTime?'已收笔':'沿唯一合法主路扩散'}}<br>停止条件：${{event.stopReason}}${{auditText}}`;document.querySelector('#options').textContent=JSON.stringify({{routeOptions:D.options[activeStroke],trajectoryAudit:audit}},null,2);clock.textContent=`${{t.toFixed(1)}} / ${{D.maximumTime.toFixed(1)}}`;}}
 for(const [i,s] of D.strokes.entries()){{const e=document.createElement('div');e.className='stroke';e.style.setProperty('--c',s.color);e.innerHTML=`第 ${{i+1}} 笔 · ${{s.feature}}<br>叶部件 ${{s.componentId}} #${{s.occurrence}}`;e.onclick=()=>{{slider.value=Math.round(D.events[i].startTime/D.maximumTime*1000);render()}};document.querySelector('#stroke-list').append(e)}}
 slider.oninput=render;document.querySelectorAll('input[type=checkbox]').forEach(e=>e.onchange=render);document.querySelector('#outline-opacity').oninput=render;document.querySelector('#play').onclick=()=>{{playing=!playing;document.querySelector('#play').textContent=playing?'暂停':'播放';last=performance.now();requestAnimationFrame(tick)}};function tick(now){{if(!playing)return;const next=Math.min(1000,Number(slider.value)+(now-last)/D.maximumTime*160);last=now;slider.value=next;render();if(next>=1000){{playing=false;document.querySelector('#play').textContent='播放'}}else requestAnimationFrame(tick)}}render();
 </script></html>'''
@@ -1223,6 +1500,7 @@ def main():
     parser.add_argument("--ordinal-weight", type=float, default=0.12)
     parser.add_argument("--coverage-weight", type=float, default=12.0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--audit-output", type=Path)
     args = parser.parse_args()
 
     codepoint = int(args.unicode.removeprefix("U+").removeprefix("u+"), 16)
@@ -1271,6 +1549,7 @@ def main():
             routes,
             target,
             owner,
+            graph,
             args.canvas,
         )
     decision.update(
@@ -1305,16 +1584,22 @@ def main():
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, "utf-8")
-    print(
-        json.dumps(
-            {
-                "output": str(args.output),
-                "decision": decision,
-                "evaluation": evaluation,
-            },
-            ensure_ascii=False,
-            indent=2,
+    audit = {
+        "unicode": f"U+{codepoint:04X}",
+        "character": chr(codepoint),
+        "source": args.source,
+        "glyphId": args.glyph_id,
+        "output": str(args.output),
+        "decision": decision,
+        "evaluation": evaluation,
+    }
+    if args.audit_output:
+        args.audit_output.parent.mkdir(parents=True, exist_ok=True)
+        args.audit_output.write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), "utf-8"
         )
+    print(
+        json.dumps(audit, ensure_ascii=False, indent=2)
     )
 
 

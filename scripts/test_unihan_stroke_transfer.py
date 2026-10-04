@@ -16,6 +16,23 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StrokeTransferTest(unittest.TestCase):
+    def test_disconnected_grass_leaf_uses_verified_horizontal_first_order(self):
+        strokes = [
+            {"componentId": 486, "occurrence": 0, "feature": "竖", "token": "left-v"},
+            {"componentId": 486, "occurrence": 0, "feature": "横", "token": "left-h"},
+            {"componentId": 486, "occurrence": 0, "feature": "竖", "token": "right-v"},
+            {"componentId": 486, "occurrence": 0, "feature": "横", "token": "right-h"},
+            {"componentId": 9, "occurrence": 0, "feature": "点", "token": "next"},
+        ]
+
+        corrected = MODULE.apply_verified_leaf_stroke_orders(strokes)
+
+        self.assertEqual(
+            [stroke["token"] for stroke in corrected],
+            ["left-h", "left-v", "right-v", "right-h", "next"],
+        )
+        self.assertEqual([stroke["strokeIndex"] for stroke in corrected], list(range(5)))
+
     def test_merge_intersecting_annotations_trims_first_stroke_at_shared_turn(self):
         annotations = [
             {
@@ -420,6 +437,46 @@ class StrokeTransferTest(unittest.TestCase):
         )
         self.assertEqual([item["componentId"] for item in strokes], [1128, 1128])
         np.testing.assert_allclose(strokes[0]["points"], [[20, 40], [60, 80]])
+
+    def test_legacy_annotation_order_follows_verified_candidate_permutation(self):
+        candidate = [
+            {
+                "componentId": 486,
+                "familyKey": "228/486",
+                "color": "#c2410c",
+                "hierarchy": [{"id": 486}],
+                "occurrence": 0,
+                "feature": feature,
+            }
+            for feature in ("横", "竖", "竖", "横")
+        ]
+        document = {
+            "metadata": {
+                "unicode": "U+64CE",
+                "source": "T",
+                "candidateGlyphId": 900000,
+                "candidateStrokeOrder": ["竖", "横", "竖", "横"],
+            },
+            "annotations": [
+                {"type": "line", "label": "486", "points": [[10, 10 + index], [20, 10 + index]]}
+                for index in range(4)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "annotations.json"
+            path.write_text(json.dumps(document), "utf-8")
+            strokes, _normalized, corrections = MODULE.load_human_annotations(
+                path,
+                codepoint=0x64CE,
+                source="T",
+                glyph_id=900000,
+                candidate=candidate,
+                canvas=100,
+            )
+
+        self.assertEqual([stroke["points"][0][1] for stroke in strokes], [11, 10, 12, 13])
+        self.assertEqual(corrections[-1]["type"], "verified-stroke-order")
+        self.assertEqual(corrections[-1]["to"], [2, 1, 3, 4])
 
     def test_human_truth_partition_is_complete_and_preserves_component_groups(self):
         target = np.zeros((32, 32), dtype=bool)
