@@ -14,6 +14,20 @@ import numpy as np
 
 SECTORS = ("E", "SE", "S", "SW", "W", "NW", "N", "NE")
 KNOWN_SOURCE_CONVENTIONS = frozenset({"G", "H", "J", "K", "KP", "N", "T", "U", "UK", "V"})
+FEATURE_INITIAL_SECTORS = {
+    "横": "E",
+    "提": "NE",
+    "竖": "S",
+    "竖钩": "S",
+    "弯钩": "S",
+    "撇": "SW",
+    "平撇": "W",
+    "捺": "SE",
+    "点": "SE",
+    "横折": "E",
+    "横撇": "E",
+    "横钩": "E",
+}
 
 
 def _load_transfer():
@@ -97,7 +111,7 @@ def load_normative_catalog(path: Path | None) -> NormativeCatalog:
     return NormativeCatalog(entries=entries)
 
 
-def direction_sector(points: np.ndarray) -> str:
+def direction_sector(points: np.ndarray, fraction: float = 0.25) -> str:
     points = np.asarray(points, dtype=float)
     if len(points) < 2:
         return "unknown"
@@ -105,7 +119,7 @@ def direction_sector(points: np.ndarray) -> str:
     total = float(segment_lengths.sum())
     if total < 1e-6:
         return "unknown"
-    target = total * 0.25
+    target = total * min(1.0, max(0.01, float(fraction)))
     travelled = 0.0
     end = points[-1]
     for index, length in enumerate(segment_lengths):
@@ -224,6 +238,16 @@ def compile_stroke_expectations(
                 int(next_stroke["componentId"]),
                 int(next_stroke.get("occurrence", 0)),
             )
+        semantic_sector = FEATURE_INITIAL_SECTORS.get(feature)
+        if semantic_sector is not None:
+            evidence.append(
+                OrderEvidence(
+                    level=1,
+                    provenance=f"semantic stroke feature {feature}",
+                    rule="semantic-pen-down-direction",
+                    hard=True,
+                )
+            )
         output.append(
             StrokeExpectation(
                 stroke_index=index,
@@ -231,7 +255,10 @@ def compile_stroke_expectations(
                 occurrence=occurrence,
                 component_ordinal=ordinal,
                 feature=feature,
-                expected_sector=direction_sector(np.asarray(stroke["points"], dtype=float)),
+                expected_sector=(
+                    semantic_sector
+                    or direction_sector(np.asarray(stroke["points"], dtype=float))
+                ),
                 expected_turns=tuple(str(value) for value in stroke.get("expectedTurns", ())),
                 closes_component=next_key != key,
                 evidence=tuple(sorted(evidence, key=lambda item: item.level)),

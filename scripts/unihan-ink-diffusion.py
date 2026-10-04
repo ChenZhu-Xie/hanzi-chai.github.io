@@ -976,7 +976,8 @@ def apply_stroke_order_guard(
         compatible = []
         rejected = []
         for option in options:
-            observed = order.direction_sector(option.points)
+            option = trim_initial_medial_spur(option, expectation.expected_sector)
+            observed = order.direction_sector(option.points, fraction=0.08)
             if order.sector_compatible(expectation.expected_sector, observed):
                 evidence = {
                     **option.evidence,
@@ -1029,6 +1030,140 @@ def apply_stroke_order_guard(
             }
         )
     return guarded, audit
+
+
+def normalize_selected_pen_paths(
+    strokes: list[dict],
+    routes: list[RouteCandidate],
+    source: str,
+    codepoint: int,
+    normative_catalog=None,
+) -> list[RouteCandidate]:
+    """Normalize medial-axis artefacts only after global route selection.
+
+    Route selection must retain the classic candidates' complete coverage
+    evidence.  This pass changes only the directed pen centreline once the
+    whole-character solution is frozen.
+    """
+    expectations = RESIDUAL_DECODER.ORDER.compile_stroke_expectations(
+        strokes,
+        source,
+        codepoint,
+        normative_catalog,
+    )
+    return [
+        trim_selected_vertical_medial_spur(route, expectation.expected_sector)
+        for route, expectation in zip(routes, expectations)
+    ]
+
+
+def trim_initial_medial_spur(
+    option: RouteCandidate,
+    expected_sector: str,
+    maximum_fraction: float = 0.12,
+) -> RouteCandidate:
+    """Lightly normalize candidate caps before stroke-order comparison."""
+    points = np.asarray(option.points, dtype=float)
+    if len(points) < 3:
+        return option
+    order = RESIDUAL_DECODER.ORDER
+    if order.sector_compatible(
+        expected_sector,
+        order.direction_sector(points, fraction=0.06),
+    ):
+        return option
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(lengths)]
+    total = float(cumulative[-1])
+    if total <= 1e-6:
+        return option
+    chosen = None
+    for index in range(1, len(points) - 1):
+        if float(cumulative[index] / total) > maximum_fraction:
+            break
+        observed = order.direction_sector(points[index:], fraction=0.06)
+        if order.sector_compatible(expected_sector, observed):
+            chosen = index
+            break
+    if chosen is None:
+        return option
+    trimmed_points = points[chosen:]
+    trimmed_pixels = frozenset(
+        (int(round(float(x))), int(round(float(y)))) for x, y in trimmed_points
+    )
+    return RouteCandidate(
+        start_node=option.start_node,
+        end_node=option.end_node,
+        points=trimmed_points,
+        pixels=trimmed_pixels,
+        component=option.component,
+        score=option.score,
+        evidence={
+            **option.evidence,
+            "trimmedInitialMedialSpur": True,
+            "trimmedInitialMedialSpurPixels": chosen,
+            "trimmedInitialMedialSpurFraction": round(float(cumulative[chosen] / total), 5),
+        },
+    )
+
+
+def trim_selected_vertical_medial_spur(
+    option: RouteCandidate,
+    expected_sector: str,
+    maximum_fraction: float = 0.12,
+) -> RouteCandidate:
+    """Remove a vertical stroke's cap after the global route is selected.
+
+    The removed skeleton remains target ink and will regain the stroke's colour
+    during width restoration.  Only the artificial centreline detour is
+    removed, so an endpoint serif cannot masquerade as the first turn of a
+    vertical hook or other directed stroke.
+    """
+    # A vertical pen-down has an unambiguous local tangent, so a short
+    # horizontal/diagonal cap is medial-axis noise.  Curved or rising strokes
+    # may legitimately enter through an adjacent sector; do not normalize
+    # those until their stroke-specific grammar can prove the same invariant.
+    if expected_sector != "S":
+        return option
+    points = np.asarray(option.points, dtype=float)
+    if len(points) < 3:
+        return option
+    order = RESIDUAL_DECODER.ORDER
+    if order.direction_sector(points[:2], fraction=1.0) == expected_sector:
+        return option
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(lengths)]
+    total = float(cumulative[-1])
+    if total <= 1e-6:
+        return option
+    chosen = None
+    for index in range(1, len(points) - 1):
+        if float(cumulative[index] / total) > maximum_fraction:
+            break
+        observed = order.direction_sector(
+            points[index : min(len(points), index + 2)],
+            fraction=1.0,
+        )
+        if observed == expected_sector:
+            chosen = index
+            break
+    if chosen is None:
+        return option
+    trimmed_points = points[chosen:]
+    return RouteCandidate(
+        start_node=option.start_node,
+        end_node=option.end_node,
+        points=trimmed_points,
+        pixels=option.pixels,
+        component=option.component,
+        score=option.score,
+        evidence={
+            **option.evidence,
+            "trimmedInitialMedialSpur": True,
+            "trimmedInitialMedialSpurPixels": chosen,
+            "trimmedInitialMedialSpurFraction": round(float(cumulative[chosen] / total), 5),
+        },
+    )
 
 
 def _candidate_endpoint_contacts(strokes: list[dict], threshold: float = 3.0) -> list[tuple[bool, bool]]:
@@ -1477,7 +1612,58 @@ def vector_angle_error(left: np.ndarray, right: np.ndarray) -> float:
     return float(math.degrees(math.acos(cosine)))
 
 
-def turn_landmarks(points: np.ndarray) -> list[float]:
+def logical_junction_zones(graph: SkeletonGraph, radius: float = 4.0) -> list[dict]:
+    """Fold nearby skeleton junction pixels into one physical contact zone."""
+    junctions = [
+        (index, point)
+        for index, point in enumerate(graph.critical)
+        if int(graph.crossing[point]) >= 3
+    ]
+    if not junctions:
+        return []
+    raw_xy = np.asarray([(x, y) for _index, (y, x) in junctions], dtype=float)
+    parent = list(range(len(junctions)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    zone_limit = radius * 2.5
+    for left in range(len(junctions)):
+        for right in range(left):
+            if float(np.linalg.norm(raw_xy[left] - raw_xy[right])) < zone_limit:
+                union(left, right)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(junctions)):
+        groups.setdefault(find(index), []).append(index)
+    zones = []
+    for members in groups.values():
+        node_ids = sorted(int(junctions[index][0]) for index in members)
+        point = raw_xy[members].mean(axis=0)
+        extent = max(float(np.linalg.norm(raw_xy[index] - point)) for index in members)
+        zones.append(
+            {
+                "node": node_ids[0],
+                "nodes": node_ids,
+                "point": point,
+                "suppressionRadius": extent + radius * 0.5,
+            }
+        )
+    return zones
+
+
+def turn_landmarks(
+    points: np.ndarray,
+    graph: SkeletonGraph | None = None,
+    junction_radius: float = 4.0,
+) -> list[float]:
     """Return stable fractions of visually meaningful bends in a directed arc."""
     sampled = resample(points, 72)
     if len(sampled) < 9:
@@ -1498,7 +1684,20 @@ def turn_landmarks(points: np.ndarray) -> list[float]:
         if angle >= 24.0:
             candidates.append((angle, index))
     selected = []
+    compound_zones = []
+    if graph is not None:
+        compound_zones = [
+            zone
+            for zone in logical_junction_zones(graph, junction_radius)
+            if len(zone["nodes"]) > 1
+        ]
     for angle, index in sorted(candidates, reverse=True):
+        if any(
+            float(np.linalg.norm(sampled[index] - zone["point"]))
+            <= float(zone["suppressionRadius"])
+            for zone in compound_zones
+        ):
+            continue
         if any(abs(index - other) < 7 for _other_angle, other in selected):
             continue
         selected.append((angle, index))
@@ -1507,16 +1706,12 @@ def turn_landmarks(points: np.ndarray) -> list[float]:
 
 def critical_node_trace(points: np.ndarray, graph: SkeletonGraph, radius: float = 4.0) -> list[dict]:
     """Describe critical skeleton nodes visited by a directed trajectory."""
-    junctions = [
-        (index, point)
-        for index, point in enumerate(graph.critical)
-        if int(graph.crossing[point]) >= 3
-    ]
-    if not junctions or len(points) < 2:
+    zones = logical_junction_zones(graph, radius)
+    if not zones or len(points) < 2:
         return []
+
     sampled = resample(points, 180)
-    critical_ids = [index for index, _point in junctions]
-    critical_xy = np.asarray([(x, y) for _index, (y, x) in junctions], dtype=float)
+    critical_xy = np.asarray([zone["point"] for zone in zones], dtype=float)
     tree = cKDTree(critical_xy)
     distances, indices = tree.query(sampled)
     cumulative = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(sampled, axis=0), axis=1))]
@@ -1526,12 +1721,13 @@ def critical_node_trace(points: np.ndarray, graph: SkeletonGraph, radius: float 
     for sample_index, (distance, critical_index) in enumerate(zip(distances, indices)):
         if float(distance) > radius or int(critical_index) == previous:
             continue
-        node_id = critical_ids[int(critical_index)]
+        zone = zones[int(critical_index)]
         previous = int(critical_index)
         point = critical_xy[critical_index]
         trace.append(
             {
-                "node": int(node_id),
+                "node": int(zone["node"]),
+                "nodes": list(zone["nodes"]),
                 "point": [round(float(point[0]), 2), round(float(point[1]), 2)],
                 "fraction": round(float(cumulative[sample_index] / total), 4),
             }
@@ -1663,8 +1859,8 @@ def evaluate_truth(
         predicted_length = float(np.linalg.norm(np.diff(predicted_dense, axis=0), axis=1).sum())
         expected_length = float(np.linalg.norm(np.diff(expected_dense, axis=0), axis=1).sum())
         length_ratios.append(predicted_length / max(1e-6, expected_length))
-        predicted_turns = turn_landmarks(predicted.points)
-        expected_turns = turn_landmarks(expected["points"])
+        predicted_turns = turn_landmarks(predicted.points, graph=graph)
+        expected_turns = turn_landmarks(expected["points"], graph=graph)
         turn_reports.append(
             {
                 "predictedFractions": predicted_turns,
@@ -2296,6 +2492,14 @@ def main():
             int(skeleton.sum()),
             coverage_weight=args.coverage_weight,
         )
+        if args.decoder == "hybrid":
+            routes = normalize_selected_pen_paths(
+                candidate,
+                routes,
+                source=args.source,
+                codepoint=codepoint,
+                normative_catalog=normative_catalog,
+            )
         owner, _owner_distance = geodesic_owners(target, graph, routes)
         decision["decoder"] = args.decoder
         if order_guard_audit is not None:

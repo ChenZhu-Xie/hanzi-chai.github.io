@@ -168,6 +168,35 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(audit[0]["rejectedJunctionStarts"], 1)
         self.assertFalse(audit[0]["fallbackToClassicCandidates"])
 
+    def test_short_medial_axis_cap_is_trimmed_from_vertical_hook_pen_path(self):
+        points = np.asarray([[5.0, 0.0], [0.0, 0.0], [0.0, 50.0], [-3.0, 53.0]])
+        option = MODULE.RouteCandidate(
+            0,
+            1,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            1,
+            0.1,
+            {},
+        )
+        trimmed = MODULE.trim_selected_vertical_medial_spur(option, "S")
+        self.assertEqual(trimmed.points[0].tolist(), [0.0, 0.0])
+        self.assertEqual(trimmed.points[-1].tolist(), [-3.0, 53.0])
+        self.assertEqual(trimmed.pixels, option.pixels)
+        self.assertTrue(trimmed.evidence["trimmedInitialMedialSpur"])
+
+    def test_close_t_junction_pair_is_one_logical_contact_zone(self):
+        skeleton = np.zeros((22, 25), dtype=bool)
+        skeleton[1:21, 12] = True
+        skeleton[6, 12:23] = True
+        skeleton[14, 2:13] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        route = np.asarray([[2.0, 14.0], [12.0, 14.0], [12.0, 6.0], [22.0, 6.0]])
+        trace = MODULE.critical_node_trace(route, graph, radius=4.0)
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(len(trace[0]["nodes"]), 2)
+        self.assertEqual(MODULE.turn_landmarks(route, graph=graph), [])
+
     def test_residual_decision_payload_exposes_new_safety_metrics(self):
         self.assertTrue(hasattr(MODULE, "residual_decision_payload"))
         unexplained = np.zeros((5, 5), dtype=bool)

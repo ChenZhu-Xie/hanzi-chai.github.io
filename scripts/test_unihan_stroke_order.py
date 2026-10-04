@@ -93,6 +93,18 @@ class StrokeOrderTests(unittest.TestCase):
         points = np.asarray([[0.0, 0.0], [6.0, 0.0], [6.0, 20.0]])
         self.assertEqual(ORDER.direction_sector(points), "E")
 
+    def test_stroke_feature_supplies_semantic_pen_down_direction(self):
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "提",
+                "points": np.asarray([[0.0, 0.0], [8.0, 0.0], [16.0, -8.0]]),
+            }
+        ]
+        expectation = ORDER.compile_stroke_expectations(strokes, "G", 0x6418)[0]
+        self.assertEqual(expectation.expected_sector, "NE")
+
     def test_after_subtracting_first_horizontal_next_horizontal_is_lower_one(self):
         skeleton, graph, directed, ledger, expectations = self.old_head_fixture()
         upper = np.zeros_like(skeleton)
