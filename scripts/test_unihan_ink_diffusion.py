@@ -185,6 +185,32 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(trimmed.pixels, option.pixels)
         self.assertTrue(trimmed.evidence["trimmedInitialMedialSpur"])
 
+    def test_hook_pen_path_uses_longest_terminal_branch_not_short_ink_spur(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[1:11, 10] = True
+        skeleton[10, 2:11] = True
+        skeleton[10:14, 10] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        points = np.asarray([[10.0, y] for y in range(1, 14)])
+        option = MODULE.RouteCandidate(
+            0,
+            1,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            1,
+            0.1,
+            {},
+        )
+        normalized = MODULE.normalize_hook_terminal_branch(option, graph, "竖钩")
+        self.assertEqual(normalized.points[0].tolist(), [10.0, 1.0])
+        self.assertEqual(normalized.points[-1].tolist(), [2.0, 10.0])
+        self.assertEqual(normalized.pixels, option.pixels)
+        self.assertTrue(normalized.evidence["normalizedTerminalHookBranch"])
+        self.assertGreater(
+            normalized.evidence["normalizedTerminalHookReplacementLength"],
+            normalized.evidence["normalizedTerminalHookOriginalLength"],
+        )
+
     def test_close_t_junction_pair_is_one_logical_contact_zone(self):
         skeleton = np.zeros((22, 25), dtype=bool)
         skeleton[1:21, 12] = True

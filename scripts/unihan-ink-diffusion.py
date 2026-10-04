@@ -1035,6 +1035,7 @@ def apply_stroke_order_guard(
 def normalize_selected_pen_paths(
     strokes: list[dict],
     routes: list[RouteCandidate],
+    graph: SkeletonGraph,
     source: str,
     codepoint: int,
     normative_catalog=None,
@@ -1051,10 +1052,121 @@ def normalize_selected_pen_paths(
         codepoint,
         normative_catalog,
     )
-    return [
-        trim_selected_vertical_medial_spur(route, expectation.expected_sector)
-        for route, expectation in zip(routes, expectations)
+    normalized = []
+    for stroke, route, expectation in zip(strokes, routes, expectations):
+        route = trim_selected_vertical_medial_spur(route, expectation.expected_sector)
+        route = normalize_hook_terminal_branch(route, graph, str(stroke.get("feature", "")))
+        normalized.append(route)
+    return normalized
+
+
+def normalize_hook_terminal_branch(
+    option: RouteCandidate,
+    graph: SkeletonGraph,
+    feature: str,
+    minimum_gain: float = 1.25,
+) -> RouteCandidate:
+    """Prefer the longest unexplored terminal branch of a selected hook.
+
+    Medial-axis extraction can split a calligraphic hook into a short pen-rest
+    spur and a longer stroke body.  Starting at the final junction, this pass
+    blocks the already consumed trunk and explores only the remaining maze.
+    It changes the directed centreline, never the owned ink pixels.
+    """
+    if "钩" not in feature or len(option.points) < 4:
+        return option
+    trace = critical_node_trace(option.points, graph)
+    if not trace:
+        return option
+    zone = trace[-1]
+    points = np.asarray(option.points, dtype=float)
+    zone_point = np.asarray(zone["point"], dtype=float)
+    anchor_position = int(np.argmin(np.linalg.norm(points - zone_point, axis=1)))
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(lengths)]
+    total = float(cumulative[-1])
+    if total <= 1e-6 or float(cumulative[anchor_position] / total) < 0.65:
+        return option
+
+    route_nodes = [
+        graph.point_index.get((int(round(float(y))), int(round(float(x)))))
+        for x, y in points
     ]
+    anchor = route_nodes[anchor_position]
+    if anchor is None:
+        return option
+    blocked = {node for node in route_nodes[:anchor_position] if node is not None}
+    adjacency = graph_adjacency(graph.matrix)
+    distance = [math.inf] * len(adjacency)
+    predecessor = [-1] * len(adjacency)
+    distance[anchor] = 0.0
+    queue = [(0.0, anchor)]
+    while queue:
+        current, node = heapq.heappop(queue)
+        if current != distance[node]:
+            continue
+        for other, weight in adjacency[node]:
+            if other in blocked:
+                continue
+            proposed = current + weight
+            if proposed >= distance[other]:
+                continue
+            distance[other] = proposed
+            predecessor[other] = node
+            heapq.heappush(queue, (proposed, other))
+
+    endpoints = []
+    component = option.component
+    for point in np.argwhere(graph.crossing == 1):
+        y, x = map(int, point)
+        node = graph.point_index.get((y, x))
+        if (
+            node is not None
+            and node not in blocked
+            and int(graph.components[y, x]) == component
+            and math.isfinite(distance[node])
+        ):
+            endpoints.append(node)
+    if not endpoints:
+        return option
+    endpoint = max(endpoints, key=lambda node: distance[node])
+    original_length = float(total - cumulative[anchor_position])
+    replacement_length = float(distance[endpoint])
+    if replacement_length <= max(2.0, original_length * minimum_gain):
+        return option
+
+    indices = [endpoint]
+    while indices[-1] != anchor:
+        parent = predecessor[indices[-1]]
+        if parent < 0 or len(indices) > len(graph.points):
+            return option
+        indices.append(parent)
+    indices.reverse()
+    replacement = graph.points[np.asarray(indices)][:, ::-1].astype(float)
+    normalized_points = np.vstack([points[:anchor_position], replacement])
+    return RouteCandidate(
+        start_node=option.start_node,
+        end_node=option.end_node,
+        points=normalized_points,
+        pixels=option.pixels,
+        component=option.component,
+        score=option.score,
+        evidence={
+            **option.evidence,
+            "normalizedTerminalHookBranch": True,
+            "normalizedTerminalHookAnchor": [
+                round(float(value), 2) for value in replacement[0]
+            ],
+            "normalizedTerminalHookOriginalEnd": [
+                round(float(value), 2) for value in points[-1]
+            ],
+            "normalizedTerminalHookReplacementEnd": [
+                round(float(value), 2) for value in replacement[-1]
+            ],
+            "normalizedTerminalHookOriginalLength": round(original_length, 5),
+            "normalizedTerminalHookReplacementLength": round(replacement_length, 5),
+        },
+    )
 
 
 def trim_initial_medial_spur(
@@ -2496,6 +2608,7 @@ def main():
             routes = normalize_selected_pen_paths(
                 candidate,
                 routes,
+                graph,
                 source=args.source,
                 codepoint=codepoint,
                 normative_catalog=normative_catalog,
