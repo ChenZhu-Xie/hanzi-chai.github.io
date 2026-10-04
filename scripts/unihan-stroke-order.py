@@ -196,6 +196,13 @@ def compile_stroke_expectations(
                 ),
             )
         )
+        next_key = None
+        if index + 1 < len(strokes):
+            next_stroke = strokes[index + 1]
+            next_key = (
+                int(next_stroke["componentId"]),
+                int(next_stroke.get("occurrence", 0)),
+            )
         output.append(
             StrokeExpectation(
                 stroke_index=index,
@@ -204,8 +211,8 @@ def compile_stroke_expectations(
                 component_ordinal=ordinal,
                 feature=feature,
                 expected_sector=_direction_sector(np.asarray(stroke["points"], dtype=float)),
-                expected_turns=(),
-                closes_component=index == members[-1],
+                expected_turns=tuple(str(value) for value in stroke.get("expectedTurns", ())),
+                closes_component=next_key != key,
                 evidence=tuple(sorted(evidence, key=lambda item: item.level)),
             )
         )

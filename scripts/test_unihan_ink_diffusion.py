@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -14,6 +15,34 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_cli_exposes_legacy_and_residual_decoder_choices(self):
+        self.assertTrue(hasattr(MODULE, "build_argument_parser"))
+        parser = MODULE.build_argument_parser()
+        decoder = next(action for action in parser._actions if action.dest == "decoder")
+        self.assertEqual(tuple(decoder.choices), ("legacy", "residual"))
+        self.assertEqual(decoder.default, "legacy")
+
+    def test_residual_decision_payload_exposes_new_safety_metrics(self):
+        self.assertTrue(hasattr(MODULE, "residual_decision_payload"))
+        unexplained = np.zeros((5, 5), dtype=bool)
+        unexplained[0, 0] = True
+        leak = np.zeros((5, 5), dtype=bool)
+        result = SimpleNamespace(
+            status="needs-review",
+            review_reasons=("source-order-unavailable",),
+            best_score=1.25,
+            runner_up_margin=0.5,
+            steps=({"stroke": 1},),
+            ledger=SimpleNamespace(unexplained=unexplained),
+            regions=(SimpleNamespace(forbidden_leak_mask=leak),),
+        )
+        payload = MODULE.residual_decision_payload(result, np.ones((5, 5), dtype=bool))
+        self.assertEqual(payload["decoder"], "residual")
+        self.assertEqual(payload["forbiddenBranchLeakagePixels"], 0)
+        self.assertEqual(payload["residualUnexplainedInkPixels"], 1)
+        self.assertAlmostEqual(payload["residualUnexplainedInkRatio"], 0.04)
+        self.assertEqual(payload["reviewReasons"], ["source-order-unavailable"])
+
     def test_ink_width_follows_skeleton_ownership_across_a_junction(self):
         skeleton = np.zeros((15, 15), dtype=bool)
         skeleton[7, 1:14] = True

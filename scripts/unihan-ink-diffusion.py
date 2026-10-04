@@ -15,6 +15,7 @@ import importlib.util
 import json
 import math
 import re
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ def load_module(filename: str, name: str):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -40,6 +42,9 @@ TRANSFER = load_module("unihan-stroke-transfer.py", "unihan_stroke_transfer_diff
 MATCHER = TRANSFER.MATCHER
 VECTOR = TRANSFER.VECTOR
 PDF = TRANSFER.PDF
+RESIDUAL_DECODER = load_module(
+    "unihan-residual-decoder.py", "unihan_residual_decoder_diffusion"
+)
 
 NEIGHBOURS = (
     (-1, 0),
@@ -1815,7 +1820,7 @@ slider.oninput=render;document.querySelectorAll('input[type=checkbox]').forEach(
 </script></html>'''
 
 
-def main():
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bbox-cache", type=Path, required=True)
     parser.add_argument("--pdf", type=Path, required=True)
@@ -1827,10 +1832,40 @@ def main():
     parser.add_argument("--canvas", type=int, default=256)
     parser.add_argument("--ordinal-weight", type=float, default=0.12)
     parser.add_argument("--coverage-weight", type=float, default=12.0)
+    parser.add_argument("--decoder", choices=("legacy", "residual"), default="legacy")
     parser.add_argument("--learned-rules", type=Path)
+    parser.add_argument("--stroke-order-catalog", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit-output", type=Path)
-    args = parser.parse_args()
+    return parser
+
+
+def residual_decision_payload(result, target: np.ndarray) -> dict:
+    leakage = sum(
+        int(region.forbidden_leak_mask.sum()) for region in result.regions
+    )
+    unexplained = int(result.ledger.unexplained.sum())
+    return {
+        "decoder": "residual",
+        "score": round(float(result.best_score), 6),
+        "status": result.status,
+        "reviewReasons": list(result.review_reasons),
+        "runnerUpMargin": (
+            None
+            if result.runner_up_margin is None
+            else round(float(result.runner_up_margin), 6)
+        ),
+        "steps": list(result.steps),
+        "forbiddenBranchLeakagePixels": leakage,
+        "residualUnexplainedInkPixels": unexplained,
+        "residualUnexplainedInkRatio": round(
+            unexplained / max(1, int(np.asarray(target, dtype=bool).sum())), 6
+        ),
+    }
+
+
+def main():
+    args = build_argument_parser().parse_args()
 
     codepoint = int(args.unicode.removeprefix("U+").removeprefix("u+"), 16)
     rows = json.loads(args.candidates.read_text("utf-8"))["rows"]
@@ -1867,13 +1902,32 @@ def main():
     )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
-    routes, decision = choose_routes(
-        candidate,
-        ranked,
-        int(skeleton.sum()),
-        coverage_weight=args.coverage_weight,
-    )
-    owner, _owner_distance = geodesic_owners(target, graph, routes)
+    if args.decoder == "residual":
+        normative_catalog = RESIDUAL_DECODER.ORDER.load_normative_catalog(
+            args.stroke_order_catalog
+        )
+        residual_result = RESIDUAL_DECODER.decode_residual_routes(
+            target,
+            graph,
+            candidate,
+            ranked,
+            source=args.source,
+            codepoint=codepoint,
+            learned_model=learned_model,
+            normative_catalog=normative_catalog,
+        )
+        routes = list(residual_result.routes)
+        owner = residual_result.ledger.visible_owner
+        decision = residual_decision_payload(residual_result, target)
+    else:
+        routes, decision = choose_routes(
+            candidate,
+            ranked,
+            int(skeleton.sum()),
+            coverage_weight=args.coverage_weight,
+        )
+        owner, _owner_distance = geodesic_owners(target, graph, routes)
+        decision["decoder"] = "legacy"
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
     # The prediction is now frozen. Only evaluation below may read target truth.
@@ -1894,7 +1948,11 @@ def main():
         )
     decision.update(
         {
-            "model": "directed-skeleton-front-plus-bounded-radial-wetting-v2",
+            "model": (
+                "sequential-directed-residual-ink-v1"
+                if args.decoder == "residual"
+                else "directed-skeleton-front-plus-bounded-radial-wetting-v2"
+            ),
             "candidateGeometryUsedForTargetMask": False,
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,
             "criticalNodeCount": len(graph.critical),
