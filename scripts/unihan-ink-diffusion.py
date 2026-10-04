@@ -14,6 +14,8 @@ import html
 import importlib.util
 import json
 import math
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -676,6 +678,74 @@ def color_for_stroke(stroke: dict) -> str:
     return str(stroke.get("color") or "#0ea5e9")
 
 
+def outline_glyph_copy(glyph: dict, suffix: str = "-outline") -> dict:
+    """Clone exact PDF paths under fresh IDs and make their contours visible."""
+    root = ET.fromstring(f"<root>{glyph['definitions']}</root>")
+    id_map = {
+        element.get("id"): f"{element.get('id')}{suffix}"
+        for element in root.iter()
+        if element.get("id")
+    }
+    for element in root.iter():
+        old_id = element.get("id")
+        if old_id in id_map:
+            element.set("id", id_map[old_id])
+        for key, value in list(element.attrib.items()):
+            local_key = key.rsplit("}", 1)[-1]
+            if local_key == "href" and value.startswith("#") and value[1:] in id_map:
+                element.set(key, f"#{id_map[value[1:]]}")
+            else:
+                element.set(
+                    key,
+                    re.sub(
+                        r"url\(#([^)]+)\)",
+                        lambda match: f"url(#{id_map.get(match.group(1), match.group(1))})",
+                        value,
+                    ),
+                )
+        if element.tag.rsplit("}", 1)[-1] == "path":
+            for attribute in ("fill", "stroke", "stroke-width", "stroke-linejoin"):
+                element.attrib.pop(attribute, None)
+            declarations = []
+            for declaration in element.get("style", "").split(";"):
+                key = declaration.partition(":")[0].strip()
+                if key and key not in {
+                    "fill",
+                    "stroke",
+                    "stroke-width",
+                    "stroke-linejoin",
+                    "vector-effect",
+                }:
+                    declarations.append(declaration.strip())
+            declarations.extend(
+                (
+                    "fill:none",
+                    "stroke:#0f172a",
+                    "stroke-width:.38",
+                    "stroke-linejoin:round",
+                    "vector-effect:non-scaling-stroke",
+                )
+            )
+            element.set("style", ";".join(declarations))
+    attributes = dict(glyph["useAttributes"])
+    reference = str(attributes["href"])
+    if reference.startswith("#") and reference[1:] in id_map:
+        attributes["href"] = f"#{id_map[reference[1:]]}"
+    return {
+        "definitions": "".join(ET.tostring(child, encoding="unicode") for child in root),
+        "useAttributes": attributes,
+    }
+
+
+def glyph_use_markup(glyph: dict) -> str:
+    attributes = glyph["useAttributes"]
+    return (
+        f'<use href="{html.escape(str(attributes["href"]), quote=True)}" '
+        f'x="{html.escape(str(attributes.get("x", 0)), quote=True)}" '
+        f'y="{html.escape(str(attributes.get("y", 0)), quote=True)}"/>'
+    )
+
+
 def svg_polyline(points: np.ndarray, color: str, width: float = 2.2) -> str:
     coordinates = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
     return f'<polyline points="{coordinates}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round"/>'
@@ -729,10 +799,9 @@ def build_html(
     candidate_svgs = "".join(
         svg_polyline(stroke["points"], color_for_stroke(stroke), 2.5) for stroke in strokes
     )
-    original_use = (
-        f'<use href="{glyph["useAttributes"]["href"]}" '
-        f'x="{glyph["useAttributes"].get("x", 0)}" y="{glyph["useAttributes"].get("y", 0)}"/>'
-    )
+    original_use = glyph_use_markup(glyph)
+    outline_glyph = outline_glyph_copy(glyph)
+    outline_use = glyph_use_markup(outline_glyph)
     colors = [color_for_stroke(stroke) for stroke in strokes]
     metadata = [
         {
@@ -772,26 +841,28 @@ def build_html(
     )
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>U+{record['unicode']:04X} 有向墨迹扩散</title>
 <style>
-*{{box-sizing:border-box}}body{{margin:0;background:#eef2f7;color:#172033;font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}}header{{background:#0f172a;color:white;padding:14px 20px}}h1{{font-size:20px;margin:0 0 5px}}header p{{margin:3px 0;color:#cbd5e1}}main{{padding:14px;display:grid;grid-template-columns:minmax(260px,.7fr) minmax(430px,1.25fr) minmax(300px,.85fr);gap:12px}}section{{background:white;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}}h2{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.body{{padding:10px}}svg{{display:block;width:100%;height:auto}}.stage{{position:relative;aspect-ratio:1;background:white}}.stage svg,.stage canvas{{position:absolute;inset:0;width:100%;height:100%}}.source{{fill:#111827;opacity:.22}}canvas{{image-rendering:auto}}.controls{{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-bottom:8px}}button{{padding:5px 10px;border:1px solid #94a3b8;border-radius:6px;background:white;cursor:pointer}}input[type=range]{{width:100%}}.stroke-list{{display:grid;gap:6px}}.stroke{{padding:7px;border:1px solid #cbd5e1;border-left:7px solid var(--c);border-radius:6px;cursor:pointer}}.stroke.active{{outline:3px solid #38bdf8}}pre{{white-space:pre-wrap;max-height:310px;overflow:auto;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px}}.legend{{display:flex;gap:8px;flex-wrap:wrap;font-size:12px}}.badge{{padding:3px 7px;border-radius:999px;background:#e2e8f0}}.warning{{background:#fef3c7;border:1px solid #f59e0b;padding:8px;border-radius:6px}}.good{{background:#dcfce7;border:1px solid #4ade80;padding:8px;border-radius:6px}}label{{display:inline-flex;gap:5px;align-items:center}}@media(max-width:1150px){{main{{grid-template-columns:1fr}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:#eef2f7;color:#172033;font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}}header{{background:#0f172a;color:white;padding:14px 20px}}h1{{font-size:20px;margin:0 0 5px}}header p{{margin:3px 0;color:#cbd5e1}}main{{padding:14px;display:grid;grid-template-columns:minmax(260px,.7fr) minmax(430px,1.25fr) minmax(300px,.85fr);gap:12px}}section{{background:white;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}}h2{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.body{{padding:10px}}svg{{display:block;width:100%;height:auto}}.pdf-definitions{{position:absolute;width:0;height:0;overflow:hidden}}.stage{{position:relative;aspect-ratio:1;background:white}}.stage svg,.stage canvas{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}#pdf-native-fill{{z-index:1}}#ink-diffusion-canvas{{z-index:2;image-rendering:auto}}#pdf-native-outline{{z-index:3}}.pdf-fill-use{{fill:#334155;opacity:.16}}.pdf-outline-use{{fill:none;stroke:#0f172a;stroke-width:.38;stroke-linejoin:round;vector-effect:non-scaling-stroke;opacity:.58}}.controls{{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-bottom:8px}}button{{padding:5px 10px;border:1px solid #94a3b8;border-radius:6px;background:white;cursor:pointer}}input[type=range]{{width:100%}}#outline-opacity{{width:80px}}.stroke-list{{display:grid;gap:6px}}.stroke{{padding:7px;border:1px solid #cbd5e1;border-left:7px solid var(--c);border-radius:6px;cursor:pointer}}.stroke.active{{outline:3px solid #38bdf8}}pre{{white-space:pre-wrap;max-height:310px;overflow:auto;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px}}.legend{{display:flex;gap:8px;flex-wrap:wrap;font-size:12px}}.badge{{padding:3px 7px;border-radius:999px;background:#e2e8f0}}.warning{{background:#fef3c7;border:1px solid #f59e0b;padding:8px;border-radius:6px}}.good{{background:#dcfce7;border:1px solid #4ade80;padding:8px;border-radius:6px}}label{{display:inline-flex;gap:5px;align-items:center}}@media(max-width:1150px){{main{{grid-template-columns:1fr}}}}
 </style>
 <header><h1>U+{record['unicode']:04X} {html.escape(chr(record['unicode']))} · {html.escape(record['source'])} 源 · glyph {glyph_id}</h1><p>主前沿只沿 PDF 骨架有向前进；横向墨迹波只负责填满真实轮廓。candidate 坐标未用于生成 PDF 色块。</p><p>{html.escape(evaluation_html)}</p></header>
 <main>
 <section><h2>Candidate：只读符号化假说</h2><div class="body"><svg viewBox="0 0 100 100">{candidate_svgs}</svg><div class="warning">这里的坐标、大小和占据空间不可信；只读取笔顺、方向、转折、接触关系和叶部件 ID。</div><div class="stroke-list" id="stroke-list"></div></div></section>
-<section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox">人工真值中心线（仅验收）</label><span class="badge">红圈＝当前主前沿</span><span class="badge">白圈＝候选起点</span></div><div class="stage"><svg viewBox="0 0 100 100"><defs>{glyph['definitions']}</defs><g class="source">{original_use}</g></svg><canvas id="canvas" width="{canvas}" height="{canvas}"></canvas></div></div></section>
+<section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-pdf-fill" type="checkbox" checked>PDF 原生实体</label><label><input id="show-pdf-outline" type="checkbox" checked>PDF 原生轮廓</label><label>轮廓透明度 <input id="outline-opacity" type="range" min="10" max="100" value="58"></label><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox">人工真值中心线（仅验收）</label><span class="badge">红圈＝当前主前沿</span><span class="badge">白圈＝候选起点</span></div><svg class="pdf-definitions" aria-hidden="true"><defs>{glyph['definitions']}</defs></svg><div class="stage"><svg id="pdf-native-fill" viewBox="0 0 100 100" aria-label="原生 PDF 实体背景"><g class="pdf-fill-use pdf-source-fit">{original_use}</g></svg><canvas id="ink-diffusion-canvas" width="{canvas}" height="{canvas}"></canvas><svg id="pdf-native-outline" viewBox="0 0 100 100" aria-label="原生 PDF 顶层轮廓"><defs>{outline_glyph['definitions']}</defs><g class="pdf-outline-use pdf-source-fit">{outline_use}</g></svg></div></div></section>
 <section><h2>当前定格与路口裁决</h2><div class="body"><div id="state" class="good"></div><h3>起点候选（前八）</h3><pre id="options"></pre><h3>全局离散解</h3><pre>{html.escape(json.dumps(decision, ensure_ascii=False, indent=2))}</pre></div></section>
 </main>
 <script>
-const D={payload}; const canvas=document.querySelector('#canvas'),ctx=canvas.getContext('2d'); const slider=document.querySelector('#time'); const clock=document.querySelector('#clock'); const requestedTime=new URLSearchParams(location.search).get('time'); if(requestedTime!==null)slider.value=Math.max(0,Math.min(1000,Number(requestedTime))); let playing=false,activeStroke=0,last=performance.now();
+const D={payload}; const canvas=document.querySelector('#ink-diffusion-canvas'),ctx=canvas.getContext('2d'); const slider=document.querySelector('#time'); const clock=document.querySelector('#clock'); const requestedTime=new URLSearchParams(location.search).get('time'); if(requestedTime!==null)slider.value=Math.max(0,Math.min(1000,Number(requestedTime))); let playing=false,activeStroke=0,last=performance.now();
 const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)]; const colors=D.strokes.map(s=>hex(s.color));
+function fitPdfSource(el){{const b=el.getBBox();if(!(b.width>0&&b.height>0))return;const s=Math.min(84/b.width,84/b.height),tx=50-s*(b.x+b.width/2),ty=50-s*(b.y+b.height/2);el.setAttribute('transform',`matrix(${{s}} 0 0 ${{s}} ${{tx}} ${{ty}})`);}}
+document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource);
 function stageTime(){{return Number(slider.value)/1000*D.maximumTime}}
-function render(){{const t=stageTime(),img=ctx.createImageData(D.size,D.size); if(document.querySelector('#show-skeleton').checked)for(const [x,y] of D.skeleton){{const i=(y*D.size+x)*4;img.data[i]=100;img.data[i+1]=116;img.data[i+2]=139;img.data[i+3]=105}}
+function render(){{const t=stageTime(),img=ctx.createImageData(D.size,D.size);document.querySelector('#pdf-native-fill').style.display=document.querySelector('#show-pdf-fill').checked?'block':'none';document.querySelector('#pdf-native-outline').style.display=document.querySelector('#show-pdf-outline').checked?'block':'none';document.querySelector('.pdf-outline-use').style.opacity=Number(document.querySelector('#outline-opacity').value)/100;if(document.querySelector('#show-skeleton').checked)for(const [x,y] of D.skeleton){{const i=(y*D.size+x)*4;img.data[i]=100;img.data[i+1]=116;img.data[i+2]=139;img.data[i+3]=105}}
 for(const [x,y,label,at] of D.pixels){{if(at>t)continue;const i=(y*D.size+x)*4,[r,g,b]=colors[label];img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=220}}ctx.putImageData(img,0,0);
 if(document.querySelector('#show-routes').checked){{ctx.lineWidth=1.2;for(let i=0;i<D.routes.length;i++){{const route=D.routes[i],event=D.events[i];if(t<event.startTime)continue;const fraction=Math.min(1,(t-event.startTime)/Math.max(1,event.end.time-event.startTime));const count=Math.max(1,Math.floor(route.length*fraction));ctx.strokeStyle=D.strokes[i].color;ctx.beginPath();for(let j=0;j<count;j++){{const [x,y]=route[j];j?ctx.lineTo(x,y):ctx.moveTo(x,y)}}ctx.stroke();ctx.fillStyle='white';ctx.strokeStyle='#0f172a';ctx.beginPath();ctx.arc(route[0][0],route[0][1],3,0,Math.PI*2);ctx.fill();ctx.stroke();if(fraction<1){{const p=route[Math.min(route.length-1,count-1)];ctx.fillStyle='#ef4444';ctx.beginPath();ctx.arc(p[0],p[1],3.7,0,Math.PI*2);ctx.fill()}}}}
 }}
 if(document.querySelector('#show-truth').checked&&D.truth.length){{ctx.strokeStyle='#06b6d4';ctx.setLineDash([5,4]);ctx.lineWidth=1.5;for(const route of D.truth){{ctx.beginPath();route.forEach(([x,y],i)=>i?ctx.lineTo(x/100*D.size,y/100*D.size):ctx.moveTo(x/100*D.size,y/100*D.size));ctx.stroke()}}ctx.setLineDash([])}}
 const event=D.events.find(e=>t>=e.startTime&&t<=e.endTime)||D.events.find(e=>t<e.startTime)||D.events.at(-1);activeStroke=Math.max(0,event.stroke-1);document.querySelectorAll('.stroke').forEach((e,i)=>e.classList.toggle('active',i===activeStroke));const s=D.strokes[activeStroke];document.querySelector('#state').innerHTML=`<b>第 ${{s.stroke}} 笔 · ${{s.feature}} · 部件 ${{s.componentId}}</b><br>主前沿：${{t<event.startTime?'等待落笔':t>=event.endTime?'已收笔':'沿唯一合法主路扩散'}}<br>停止条件：${{event.stopReason}}`;document.querySelector('#options').textContent=JSON.stringify(D.options[activeStroke],null,2);clock.textContent=`${{t.toFixed(1)}} / ${{D.maximumTime.toFixed(1)}}`;}}
 for(const [i,s] of D.strokes.entries()){{const e=document.createElement('div');e.className='stroke';e.style.setProperty('--c',s.color);e.innerHTML=`第 ${{i+1}} 笔 · ${{s.feature}}<br>叶部件 ${{s.componentId}} #${{s.occurrence}}`;e.onclick=()=>{{slider.value=Math.round(D.events[i].startTime/D.maximumTime*1000);render()}};document.querySelector('#stroke-list').append(e)}}
-slider.oninput=render;document.querySelectorAll('input[type=checkbox]').forEach(e=>e.onchange=render);document.querySelector('#play').onclick=()=>{{playing=!playing;document.querySelector('#play').textContent=playing?'暂停':'播放';last=performance.now();requestAnimationFrame(tick)}};function tick(now){{if(!playing)return;const next=Math.min(1000,Number(slider.value)+(now-last)/D.maximumTime*160);last=now;slider.value=next;render();if(next>=1000){{playing=false;document.querySelector('#play').textContent='播放'}}else requestAnimationFrame(tick)}}render();
+slider.oninput=render;document.querySelectorAll('input[type=checkbox]').forEach(e=>e.onchange=render);document.querySelector('#outline-opacity').oninput=render;document.querySelector('#play').onclick=()=>{{playing=!playing;document.querySelector('#play').textContent=playing?'暂停':'播放';last=performance.now();requestAnimationFrame(tick)}};function tick(now){{if(!playing)return;const next=Math.min(1000,Number(slider.value)+(now-last)/D.maximumTime*160);last=now;slider.value=next;render();if(next>=1000){{playing=false;document.querySelector('#play').textContent='播放'}}else requestAnimationFrame(tick)}}render();
 </script></html>'''
 
 

@@ -14,6 +14,64 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_html_keeps_native_pdf_fill_below_ink_and_outline_above_it(self):
+        points = np.asarray([[0.0, 0.0], [1.0, 1.0]])
+        route = MODULE.RouteCandidate(0, 1, points, frozenset({(0, 0), (1, 1)}), 1, 0.0, {})
+        page = MODULE.build_html(
+            record={"unicode": 0x65E8, "source": "T"},
+            glyph={
+                "definitions": '<path id="pdf-glyph" style="stroke:none" d="M0 0L1 1"/>',
+                "useAttributes": {"href": "#pdf-glyph", "x": 174.42, "y": 621.06},
+            },
+            glyph_id=127685,
+            strokes=[
+                {
+                    "points": points,
+                    "feature": "horizontal",
+                    "componentId": 1128,
+                    "occurrence": 0,
+                    "color": "#f59e0b",
+                }
+            ],
+            target=np.ones((2, 2), dtype=bool),
+            skeleton=np.eye(2, dtype=bool),
+            graph=None,
+            ranked=[[]],
+            routes=[route],
+            owner=np.zeros((2, 2), dtype=np.int16),
+            arrival=np.zeros((2, 2), dtype=float),
+            events=[
+                {
+                    "stroke": 1,
+                    "start": {"point": [0, 0], "time": 0},
+                    "end": {"point": [1, 1], "time": 1},
+                    "startTime": 0,
+                    "endTime": 1,
+                    "stopReason": "test",
+                }
+            ],
+            maximum_time=1.0,
+            decision={},
+            evaluation=None,
+            truth_lines=[],
+        )
+        self.assertIn('id="pdf-native-fill"', page)
+        self.assertIn('id="ink-diffusion-canvas"', page)
+        self.assertIn('id="pdf-native-outline"', page)
+        self.assertLess(page.index('id="pdf-native-fill"'), page.index('id="ink-diffusion-canvas"'))
+        self.assertLess(page.index('id="ink-diffusion-canvas"'), page.index('id="pdf-native-outline"'))
+        self.assertIn('id="show-pdf-fill"', page)
+        self.assertIn('id="show-pdf-outline"', page)
+        self.assertIn('id="outline-opacity"', page)
+        self.assertIn('class="pdf-fill-use pdf-source-fit"', page)
+        self.assertIn('class="pdf-outline-use pdf-source-fit"', page)
+        self.assertIn("document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource)", page)
+        self.assertEqual(page.count('d="M0 0L1 1"'), 2)
+        self.assertEqual(page.count('href="#pdf-glyph"'), 1)
+        self.assertEqual(page.count('href="#pdf-glyph-outline"'), 1)
+        outline = page[page.index('id="pdf-native-outline"') :]
+        self.assertIn("fill:none;stroke:#0f172a", outline)
+
     def test_crossing_number_distinguishes_path_and_t_junction(self):
         skeleton = np.zeros((9, 9), dtype=bool)
         skeleton[1:8, 4] = True
