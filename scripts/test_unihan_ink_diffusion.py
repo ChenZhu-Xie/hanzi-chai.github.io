@@ -168,6 +168,42 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(audit[0]["rejectedJunctionStarts"], 1)
         self.assertFalse(audit[0]["fallbackToClassicCandidates"])
 
+    def test_topology_guard_keeps_complete_pen_up_at_foreign_junction(self):
+        graph = SimpleNamespace(
+            points=np.asarray([[0, 0], [0, 10], [10, 10]], dtype=int),
+            crossing=np.asarray(
+                [[1] + [0] * 10]
+                + [[0] * 11 for _ in range(9)]
+                + [[0] * 10 + [4]],
+                dtype=np.uint8,
+            ),
+        )
+        points = np.asarray([[0.0, 0.0], [10.0, 10.0]])
+        complete = MODULE.RouteCandidate(
+            0,
+            1,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            1,
+            0.1,
+            {"prematureJunctionStop": False},
+        )
+        strokes = [
+            {
+                "componentId": 1,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 0.0], [10.0, 0.0]]),
+            }
+        ]
+        guarded, audit = MODULE.apply_stroke_topology_guard(
+            strokes, [[complete]], graph
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        np.testing.assert_array_equal(guarded[0][0].points, complete.points)
+        self.assertFalse(guarded[0][0].evidence["candidatePenUpTouchesSibling"])
+        self.assertEqual(audit[0]["keptCompleteJunctionEnds"], 1)
+        self.assertEqual(audit[0]["rejectedJunctionEnds"], 0)
+
     def test_short_medial_axis_cap_is_trimmed_from_vertical_hook_pen_path(self):
         points = np.asarray([[5.0, 0.0], [0.0, 0.0], [0.0, 50.0], [-3.0, 53.0]])
         option = MODULE.RouteCandidate(
@@ -265,6 +301,29 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(owner[7, 3], 0)
         self.assertEqual(owner[3, 7], 1)
         self.assertEqual(owner[11, 7], 1)
+
+    def test_unclaimed_branch_does_not_inherit_a_finished_strokes_colour(self):
+        skeleton = np.zeros((15, 15), dtype=bool)
+        skeleton[7, 1:14] = True
+        skeleton[2:8, 7] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        target = MODULE.cv2.dilate(
+            skeleton.astype(np.uint8), np.ones((3, 3), np.uint8)
+        ).astype(bool)
+        points = np.asarray([(x, 7) for x in range(1, 8)], dtype=float)
+        finished = MODULE.RouteCandidate(
+            0,
+            0,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            1,
+            0.0,
+            {},
+        )
+        owner, _distance = MODULE.geodesic_owners(target, graph, [finished])
+        self.assertEqual(owner[7, 3], 0)
+        self.assertEqual(owner[7, 13], -1)
+        self.assertEqual(owner[2, 7], -1)
 
     def test_stroke_rule_signature_binds_exact_leaf_and_ordinal(self):
         strokes = [

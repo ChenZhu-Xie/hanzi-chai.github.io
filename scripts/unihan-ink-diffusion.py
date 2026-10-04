@@ -1412,11 +1412,11 @@ def apply_stroke_topology_guard(
     """Keep free pen endpoints distinct from internal whole-glyph junctions.
 
     A junction is a possible *contact* along a stroke, not automatically a
-    pen-down or pen-up.  When the verified candidate starts/ends away from all
-    sibling strokes, a PDF route fragment beginning/ending at a junction is
-    topologically incomplete and cannot represent that stroke.  As with the
-    order guard, incomplete evidence may trigger an explicit fallback but may
-    never silently erase every classic candidate.
+    pen-down or pen-up.  A free pen-down at a junction is incomplete.  A free
+    pen-up at a junction, however, is a valid parallel universe when the
+    candidate-length grammar says the stroke is already complete: another leaf
+    may merely touch it there.  Only an explicitly premature junction stop is
+    removed before whole-character look-ahead.
     """
     endpoint_contacts = _candidate_endpoint_contacts(strokes)
     guarded: list[list[RouteCandidate]] = []
@@ -1426,11 +1426,17 @@ def apply_stroke_topology_guard(
         accepted = []
         rejected_starts = 0
         rejected_ends = 0
+        kept_complete_junction_ends = 0
         for option in options:
             start_role = point_topology_role(graph, option.points[0])
             end_role = point_topology_role(graph, option.points[-1])
             wrong_start = not start_is_contact and start_role == "junction"
-            wrong_end = not end_is_contact and end_role == "junction"
+            junction_end = not end_is_contact and end_role == "junction"
+            wrong_end = junction_end and bool(
+                option.evidence.get("prematureJunctionStop", False)
+            )
+            if junction_end and not wrong_end:
+                kept_complete_junction_ends += 1
             if wrong_start:
                 rejected_starts += 1
             if wrong_end:
@@ -1469,6 +1475,7 @@ def apply_stroke_topology_guard(
                 "acceptedCandidateCount": len(options) if fallback else len(accepted),
                 "rejectedJunctionStarts": rejected_starts,
                 "rejectedJunctionEnds": rejected_ends,
+                "keptCompleteJunctionEnds": kept_complete_junction_ends,
                 "fallbackToClassicCandidates": fallback,
             }
         )
@@ -1782,14 +1789,17 @@ def geodesic_owners(
     target: np.ndarray,
     graph: SkeletonGraph,
     routes: list[RouteCandidate],
+    maximum_restoration_steps: float = 8.0,
+    maximum_radial_width: float = 14.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Partition ink through a skeleton gate before restoring stroke width.
 
     A direct 2-D flood can leave the end of one stroke and run longitudinally
-    into a touching sibling component.  First assign every skeleton road to a
-    directed route by graph distance, then give each ink pixel to its nearest
-    already-owned road.  Thus radial wetting may recover width but cannot use
-    the filled outline as an unapproved turn at a T/cross junction.
+    into a touching sibling component.  Only a narrow skeleton halo repairs
+    medial-axis discretisation around the selected route.  A remote unclaimed
+    branch remains unexplained instead of inheriting the nearest stroke's
+    colour; a later route must explicitly claim it.  Ink width is then restored
+    radially from the owned skeleton roads.
     """
     skeleton_distance = np.full(len(graph.points), np.inf)
     skeleton_owner = np.full(len(graph.points), -1, dtype=np.int16)
@@ -1804,12 +1814,36 @@ def geodesic_owners(
                 skeleton_owner[index] = label
                 heapq.heappush(queue, (0.0, label, index))
     adjacency = graph_adjacency(graph.matrix)
+    route_nodes_by_label = [
+        {
+            index
+            for x, y in route.pixels
+            if (index := graph.point_index.get((int(y), int(x)))) is not None
+        }
+        for route in routes
+    ]
+    junction_points = np.argwhere(graph.crossing >= 3).astype(float)
+    near_junction = (
+        cKDTree(junction_points).query(graph.points.astype(float))[0] <= 2.0
+        if len(junction_points)
+        else np.zeros(len(graph.points), dtype=bool)
+    )
     while queue:
         current, label, index = heapq.heappop(queue)
         if current != skeleton_distance[index] or label != skeleton_owner[index]:
             continue
         for neighbour, step in adjacency[index]:
+            if (
+                bool(near_junction[index])
+                and neighbour not in route_nodes_by_label[label]
+            ):
+                # This is an unchosen universe at a real junction.  Preserve
+                # the road as unexplained for another/later stroke instead of
+                # letting the current colour turn into it.
+                continue
             proposed = current + step
+            if proposed > maximum_restoration_steps:
+                continue
             if proposed + 1e-9 < skeleton_distance[neighbour] or (
                 abs(proposed - skeleton_distance[neighbour]) <= 1e-9
                 and label < skeleton_owner[neighbour]
@@ -1821,12 +1855,25 @@ def geodesic_owners(
     owner = np.full(target.shape, -1, dtype=np.int16)
     distance = np.full(target.shape, np.inf)
     ink_points = np.argwhere(target)
-    if len(ink_points) and len(graph.points):
-        nearest_distance, nearest_index = cKDTree(
-            graph.points.astype(float)
+    owned_indices = np.flatnonzero(skeleton_owner >= 0)
+    if len(ink_points) and len(owned_indices):
+        nearest_distance, nearest_position = cKDTree(
+            graph.points[owned_indices].astype(float)
         ).query(ink_points.astype(float))
-        owner[ink_points[:, 0], ink_points[:, 1]] = skeleton_owner[nearest_index]
-        distance[ink_points[:, 0], ink_points[:, 1]] = nearest_distance
+        nearest_owned_all = owned_indices[np.asarray(nearest_position, dtype=int)]
+        local_half_width = cv2.distanceTransform(
+            target.astype(np.uint8), cv2.DIST_L2, 5
+        )
+        nearest_yx = graph.points[nearest_owned_all]
+        allowed_width = np.minimum(
+            maximum_radial_width,
+            local_half_width[nearest_yx[:, 0], nearest_yx[:, 1]] + 2.5,
+        )
+        valid = nearest_distance <= allowed_width
+        valid_ink = ink_points[valid]
+        nearest_owned = nearest_owned_all[valid]
+        owner[valid_ink[:, 0], valid_ink[:, 1]] = skeleton_owner[nearest_owned]
+        distance[valid_ink[:, 0], valid_ink[:, 1]] = nearest_distance[valid]
     return owner, distance
 
 
