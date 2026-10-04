@@ -122,6 +122,52 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(guarded, [[option]])
         self.assertTrue(audit[0]["fallbackToClassicCandidates"])
 
+    def test_topology_guard_keeps_complete_rising_stroke_not_junction_fragment(self):
+        graph = SimpleNamespace(
+            points=np.asarray([[10, 0], [5, 10], [0, 20]], dtype=int),
+            crossing=np.asarray(
+                [[1] + [0] * 20]
+                + [[0] * 21 for _ in range(4)]
+                + [[0] * 10 + [4] + [0] * 10]
+                + [[0] * 21 for _ in range(4)]
+                + [[1] + [0] * 20],
+                dtype=np.uint8,
+            ),
+        )
+
+        def option(points, score):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(
+                0, 1, points, frozenset((int(x), int(y)) for x, y in points), 1, score, {}
+            )
+
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "提",
+                "points": np.asarray([[0.0, 10.0], [10.0, 5.0], [20.0, 0.0]]),
+            },
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "竖钩",
+                "points": np.asarray([[10.0, -5.0], [10.0, 15.0]]),
+            },
+        ]
+        fragment = option([[10, 5], [20, 0]], 0.1)
+        complete = option([[0, 10], [10, 5], [20, 0]], 0.2)
+        vertical = option([[10, 0], [10, 10]], 0.1)
+        guarded, audit = MODULE.apply_stroke_topology_guard(
+            strokes,
+            [[fragment, complete], [vertical]],
+            graph,
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        np.testing.assert_array_equal(guarded[0][0].points, complete.points)
+        self.assertEqual(audit[0]["rejectedJunctionStarts"], 1)
+        self.assertFalse(audit[0]["fallbackToClassicCandidates"])
+
     def test_residual_decision_payload_exposes_new_safety_metrics(self):
         self.assertTrue(hasattr(MODULE, "residual_decision_payload"))
         unexplained = np.zeros((5, 5), dtype=bool)

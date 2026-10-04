@@ -1031,6 +1031,95 @@ def apply_stroke_order_guard(
     return guarded, audit
 
 
+def _candidate_endpoint_contacts(strokes: list[dict], threshold: float = 3.0) -> list[tuple[bool, bool]]:
+    """Whether each candidate pen-down/up intentionally touches another stroke."""
+    sampled = [resample(np.asarray(stroke["points"], dtype=float), 80) for stroke in strokes]
+    output = []
+    for index, stroke in enumerate(strokes):
+        points = np.asarray(stroke["points"], dtype=float)
+        roles = []
+        for endpoint in (points[0], points[-1]):
+            touches = any(
+                float(np.linalg.norm(other - endpoint, axis=1).min()) <= threshold
+                for other_index, other in enumerate(sampled)
+                if other_index != index
+            )
+            roles.append(touches)
+        output.append((roles[0], roles[1]))
+    return output
+
+
+def apply_stroke_topology_guard(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    graph: SkeletonGraph,
+) -> tuple[list[list[RouteCandidate]], list[dict]]:
+    """Keep free pen endpoints distinct from internal whole-glyph junctions.
+
+    A junction is a possible *contact* along a stroke, not automatically a
+    pen-down or pen-up.  When the verified candidate starts/ends away from all
+    sibling strokes, a PDF route fragment beginning/ending at a junction is
+    topologically incomplete and cannot represent that stroke.  As with the
+    order guard, incomplete evidence may trigger an explicit fallback but may
+    never silently erase every classic candidate.
+    """
+    endpoint_contacts = _candidate_endpoint_contacts(strokes)
+    guarded: list[list[RouteCandidate]] = []
+    audit = []
+    for index, options in enumerate(ranked):
+        start_is_contact, end_is_contact = endpoint_contacts[index]
+        accepted = []
+        rejected_starts = 0
+        rejected_ends = 0
+        for option in options:
+            start_role = point_topology_role(graph, option.points[0])
+            end_role = point_topology_role(graph, option.points[-1])
+            wrong_start = not start_is_contact and start_role == "junction"
+            wrong_end = not end_is_contact and end_role == "junction"
+            if wrong_start:
+                rejected_starts += 1
+            if wrong_end:
+                rejected_ends += 1
+            if wrong_start or wrong_end:
+                continue
+            evidence = {
+                **option.evidence,
+                "candidatePenDownTouchesSibling": start_is_contact,
+                "candidatePenUpTouchesSibling": end_is_contact,
+                "routePenDownRole": start_role,
+                "routePenUpRole": end_role,
+                "completeStrokeTopology": True,
+            }
+            accepted.append(
+                RouteCandidate(
+                    start_node=option.start_node,
+                    end_node=option.end_node,
+                    points=option.points,
+                    pixels=option.pixels,
+                    component=option.component,
+                    score=option.score,
+                    evidence=evidence,
+                )
+            )
+        fallback = bool(options) and not accepted
+        guarded.append(list(options) if fallback else accepted)
+        audit.append(
+            {
+                "stroke": index + 1,
+                "componentId": int(strokes[index]["componentId"]),
+                "feature": str(strokes[index].get("feature") or "未知"),
+                "candidatePenDownTouchesSibling": start_is_contact,
+                "candidatePenUpTouchesSibling": end_is_contact,
+                "classicCandidateCount": len(options),
+                "acceptedCandidateCount": len(options) if fallback else len(accepted),
+                "rejectedJunctionStarts": rejected_starts,
+                "rejectedJunctionEnds": rejected_ends,
+                "fallbackToClassicCandidates": fallback,
+            }
+        )
+    return guarded, audit
+
+
 def observed_contact(first: RouteCandidate, second: RouteCandidate) -> bool:
     if first.pixels & second.pixels:
         return True
@@ -2168,6 +2257,7 @@ def main():
         args.stroke_order_catalog
     )
     order_guard_audit = None
+    topology_guard_audit = None
     if args.decoder == "hybrid":
         ranked, order_guard_audit = apply_stroke_order_guard(
             candidate,
@@ -2175,6 +2265,11 @@ def main():
             source=args.source,
             codepoint=codepoint,
             normative_catalog=normative_catalog,
+        )
+        ranked, topology_guard_audit = apply_stroke_topology_guard(
+            candidate,
+            ranked,
+            graph,
         )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
@@ -2205,6 +2300,8 @@ def main():
         decision["decoder"] = args.decoder
         if order_guard_audit is not None:
             decision["strokeOrderGuard"] = order_guard_audit
+        if topology_guard_audit is not None:
+            decision["strokeTopologyGuard"] = topology_guard_audit
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
     # The prediction is now frozen. Only evaluation below may read target truth.
