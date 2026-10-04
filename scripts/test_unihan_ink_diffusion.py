@@ -14,6 +14,162 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_total_turn_ignores_one_pixel_skeleton_stair_steps(self):
+        noisy_vertical = np.asarray(
+            [[5.0 + (index % 2), float(index)] for index in range(30)]
+        )
+        right_angle = np.asarray([[0.0, 0.0], [0.0, 20.0], [20.0, 20.0]])
+        self.assertLess(MODULE.total_turn(noisy_vertical), 0.2)
+        self.assertAlmostEqual(MODULE.total_turn(right_angle), np.pi / 2, delta=0.08)
+
+    def test_more_leaf_components_can_share_their_nearest_pdf_ink_island(self):
+        skeleton = np.zeros((12, 12), dtype=bool)
+        skeleton[1:11, 1] = True
+        skeleton[1:11, 10] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {"componentId": 10, "occurrence": 0, "points": np.asarray([[0.0, 1.0], [0.0, 4.0]])},
+            {"componentId": 20, "occurrence": 0, "points": np.asarray([[9.0, 1.0], [9.0, 4.0]])},
+            {"componentId": 30, "occurrence": 0, "points": np.asarray([[9.0, 6.0], [9.0, 9.0]])},
+        ]
+        mapping = MODULE.component_mapping(strokes, graph)
+        self.assertNotEqual(mapping[(10, 0)], mapping[(20, 0)])
+        self.assertEqual(mapping[(20, 0)], mapping[(30, 0)])
+
+    def test_structural_columns_anchor_first_and_last_leaf_but_leave_middle_open(self):
+        skeleton = np.zeros((12, 12), dtype=bool)
+        skeleton[1:11, 1] = True
+        skeleton[1:5, 10] = True
+        skeleton[7:11, 10] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {"componentId": 10, "occurrence": 0, "points": np.asarray([[0.0, 1.0], [0.0, 10.0]])},
+            {"componentId": 20, "occurrence": 0, "points": np.asarray([[10.0, 1.0], [10.0, 3.0]])},
+            {"componentId": 30, "occurrence": 0, "points": np.asarray([[10.0, 4.0], [10.0, 6.0]])},
+            {"componentId": 40, "occurrence": 0, "points": np.asarray([[10.0, 8.0], [10.0, 10.0]])},
+        ]
+        options = MODULE.component_label_options(strokes, graph)
+        target_centres = {
+            label: np.argwhere(graph.components == label)[:, ::-1].mean(axis=0)
+            for label in set(graph.components[graph.components > 0].tolist())
+        }
+        left = min(target_centres, key=lambda label: target_centres[label][0])
+        right = sorted(
+            (label for label in target_centres if label != left),
+            key=lambda label: target_centres[label][1],
+        )
+        self.assertEqual(options[(10, 0)], {left})
+        self.assertEqual(options[(20, 0)], {right[0]})
+        self.assertEqual(options[(30, 0)], set(right))
+        self.assertEqual(options[(40, 0)], {right[1]})
+
+    def test_forward_continuation_detects_a_stroke_stopped_mid_road(self):
+        skeleton = np.zeros((11, 11), dtype=bool)
+        skeleton[1:10, 5] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        truncated = np.asarray([[5.0, 1.0], [5.0, 5.0]])
+        complete = np.asarray([[5.0, 1.0], [5.0, 9.0]])
+        self.assertTrue(MODULE.has_forward_continuation(graph, truncated))
+        self.assertFalse(MODULE.has_forward_continuation(graph, complete))
+
+    def test_absolute_skeleton_coverage_can_outweigh_a_short_local_match(self):
+        stroke = {"points": np.asarray([[0.0, 0.0], [10.0, 0.0]])}
+        short = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 0.0], [1.0, 0.0]]), frozenset({(0, 0), (1, 0)}), 1, 0.0, {}
+        )
+        long = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [8.0, 0.0]]),
+            frozenset((x, 0) for x in range(9)),
+            1,
+            0.5,
+            {},
+        )
+        routes, decision = MODULE.choose_routes(
+            [stroke], [[short, long]], total_skeleton_pixels=10
+        )
+        self.assertIs(routes[0], long)
+        self.assertEqual(decision["unexplainedSkeletonPixels"], 1)
+        self.assertEqual(decision["status"], "safe-candidate")
+
+    def test_large_unexplained_skeleton_forces_review(self):
+        stroke = {"points": np.asarray([[0.0, 0.0], [1.0, 0.0]])}
+        route = MODULE.RouteCandidate(
+            0, 1, stroke["points"], frozenset({(0, 0), (1, 0)}), 1, 0.0, {}
+        )
+        _routes, decision = MODULE.choose_routes(
+            [stroke], [[route]], total_skeleton_pixels=10
+        )
+        self.assertEqual(decision["status"], "needs-review")
+        self.assertIn("large-unexplained-skeleton", decision["reviewReasons"])
+
+    def test_candidate_contact_is_weak_when_pdf_coverage_contradicts_it(self):
+        strokes = [
+            {"points": np.asarray([[0.0, 0.0], [4.0, 0.0]])},
+            {"points": np.asarray([[4.0, 0.0], [5.0, 0.0]])},
+        ]
+        first = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [4.0, 0.0]]),
+            frozenset((x, 0) for x in range(5)),
+            1,
+            0.0,
+            {},
+        )
+        touching_but_short = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[4.0, 0.0], [5.0, 0.0]]),
+            frozenset({(4, 0), (5, 0)}),
+            1,
+            0.0,
+            {},
+        )
+        separate_but_complete = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 1.0], [8.0, 1.0]]),
+            frozenset((x, 1) for x in range(9)),
+            1,
+            0.5,
+            {},
+        )
+        routes, _decision = MODULE.choose_routes(
+            strokes,
+            [[first], [touching_but_short, separate_but_complete]],
+            total_skeleton_pixels=14,
+        )
+        self.assertIs(routes[1], separate_but_complete)
+
+    def test_direct_sibling_order_rejects_a_lower_leaf_above_its_predecessor(self):
+        upper = {
+            "componentId": 10,
+            "occurrence": 0,
+            "hierarchy": [{"id": 10}, {"id": 100, "label": "⿱"}],
+            "points": np.asarray([[0.0, 2.0], [1.0, 2.0]]),
+        }
+        lower = {
+            "componentId": 20,
+            "occurrence": 0,
+            "hierarchy": [{"id": 20}, {"id": 100, "label": "⿱"}],
+            "points": np.asarray([[0.0, 8.0], [1.0, 8.0]]),
+        }
+        fixed_upper = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 5.0], [1.0, 5.0]]), frozenset({(0, 5), (1, 5)}), 1, 0.0, {}
+        )
+        wrong_above = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 1.0], [1.0, 1.0]]), frozenset({(0, 1), (1, 1)}), 1, 0.0, {}
+        )
+        correct_below = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 9.0], [1.0, 9.0]]), frozenset({(0, 9), (1, 9)}), 1, 0.1, {}
+        )
+        routes, _decision = MODULE.choose_routes(
+            [upper, lower], [[fixed_upper], [wrong_above, correct_below]], 6
+        )
+        self.assertIs(routes[1], correct_below)
+
     def test_html_keeps_native_pdf_fill_below_ink_and_outline_above_it(self):
         points = np.asarray([[0.0, 0.0], [1.0, 1.0]])
         route = MODULE.RouteCandidate(0, 1, points, frozenset({(0, 0), (1, 1)}), 1, 0.0, {})

@@ -216,8 +216,21 @@ def direction_dtw(first: np.ndarray, second: np.ndarray) -> float:
 
 
 def total_turn(points: np.ndarray) -> float:
-    angles = np.unwrap(tangent_angles(points, 28))
-    return float(np.sum(np.abs(np.diff(angles))))
+    if len(points) < 3:
+        return 0.0
+    length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+    simplified = cv2.approxPolyDP(
+        np.asarray(points, dtype=np.float32).reshape(-1, 1, 2),
+        epsilon=max(1.5, length * 0.012),
+        closed=False,
+    ).reshape(-1, 2)
+    if len(simplified) < 3:
+        return 0.0
+    vectors = np.diff(simplified, axis=0)
+    angles = np.arctan2(vectors[:, 1], vectors[:, 0])
+    return float(
+        sum(angle_delta(float(left), float(right)) for left, right in zip(angles, angles[1:]))
+    )
 
 
 def polyline_distance(first: np.ndarray, second: np.ndarray) -> float:
@@ -369,57 +382,241 @@ def component_mapping(strokes: list[dict], graph: SkeletonGraph) -> dict[tuple[i
         candidate_groups.sort(key=lambda item: (item[1][1], item[1][0]))
         target_components.sort(key=lambda item: (item[1][1], item[1][0]))
         return {candidate[0]: target[0] for candidate, target in zip(candidate_groups, target_components)}
-    dominant = max(target_components, key=lambda item: np.sum(graph.components == item[0]))[0]
-    return {key: dominant for key in groups}
+
+    # PDF ink islands and semantic leaf components are not one-to-one: several
+    # touching leaves may form one island, while a disconnected dot may split a
+    # single leaf.  Never collapse every leaf onto the largest island.  Match
+    # only their coarse glyph-global centroids, allowing many leaves to share
+    # the same target island; no candidate outline or scale is transferred.
+    candidate_centres = np.vstack([centre for _key, centre in candidate_groups])
+    target_centres = np.vstack([centre for _label, centre in target_components])
+    candidate_min = np.vstack([stroke["points"] for stroke in strokes]).min(axis=0)
+    candidate_max = np.vstack([stroke["points"] for stroke in strokes]).max(axis=0)
+    target_min = graph.points[:, ::-1].min(axis=0)
+    target_max = graph.points[:, ::-1].max(axis=0)
+    candidate_centres = (candidate_centres - candidate_min) / np.maximum(
+        candidate_max - candidate_min, 1.0
+    )
+    target_centres = (target_centres - target_min) / np.maximum(
+        target_max - target_min, 1.0
+    )
+    return {
+        key: target_components[
+            int(np.argmin(np.linalg.norm(target_centres - centre, axis=1)))
+        ][0]
+        for (key, _raw_centre), centre in zip(candidate_groups, candidate_centres)
+    }
+
+
+def component_label_options(
+    strokes: list[dict], graph: SkeletonGraph
+) -> dict[tuple[int, int], set[int]]:
+    """Return coarse structural islands allowed for each semantic leaf.
+
+    When leaf and PDF-island counts differ, exact geometry is unsafe.  We keep
+    only column membership plus the first/last leaf order inside a column.
+    Middle leaves may choose either adjacent island during route search.
+    """
+    groups: dict[tuple[int, int], list[np.ndarray]] = {}
+    for stroke in strokes:
+        key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
+        groups.setdefault(key, []).append(stroke["points"])
+    labels = sorted(set(graph.components[graph.components > 0].tolist()))
+    if len(groups) == len(labels):
+        mapping = component_mapping(strokes, graph)
+        return {key: {label} for key, label in mapping.items()}
+
+    candidate_points = np.vstack([stroke["points"] for stroke in strokes])
+    candidate_min, candidate_max = candidate_points.min(axis=0), candidate_points.max(axis=0)
+    target_points = graph.points[:, ::-1].astype(float)
+    target_min, target_max = target_points.min(axis=0), target_points.max(axis=0)
+    candidate_centres = {
+        key: normalized_point(np.vstack(members).mean(axis=0), (candidate_min, candidate_max))
+        for key, members in groups.items()
+    }
+    target_centres = {
+        label: normalized_point(
+            np.argwhere(graph.components == label)[:, ::-1].mean(axis=0),
+            (target_min, target_max),
+        )
+        for label in labels
+    }
+    options = {}
+    for key, centre in candidate_centres.items():
+        horizontal = {label: abs(float(point[0] - centre[0])) for label, point in target_centres.items()}
+        nearest = min(horizontal.values())
+        options[key] = {
+            label for label, distance in horizontal.items() if distance <= nearest + 0.18
+        }
+
+    columns: dict[tuple[int, ...], list[tuple[int, int]]] = {}
+    for key, allowed in options.items():
+        columns.setdefault(tuple(sorted(allowed)), []).append(key)
+    for allowed_tuple, keys in columns.items():
+        if len(allowed_tuple) <= 1 or len(keys) <= 1:
+            continue
+        ordered_keys = sorted(keys, key=lambda key: candidate_centres[key][1])
+        ordered_labels = sorted(allowed_tuple, key=lambda label: target_centres[label][1])
+        options[ordered_keys[0]] = {ordered_labels[0]}
+        options[ordered_keys[-1]] = {ordered_labels[-1]}
+    return options
+
+
+def has_forward_continuation(
+    graph: SkeletonGraph,
+    points: np.ndarray,
+    minimum_cosine: float = 0.5,
+    adjacency: list[list[tuple[int, float]]] | None = None,
+) -> bool:
+    """Whether a route stops while its current road visibly continues.
+
+    This is deliberately a local topological test rather than a length prior.
+    A legitimate pen-up at a skeleton endpoint is accepted; at any other node,
+    an unconsumed neighbour aligned with the incoming tangent means that the
+    route has stopped in the middle of a continuous stroke.
+    """
+    if len(points) < 2:
+        return False
+    end_xy = np.asarray(points[-1], dtype=float)
+    end_yx = tuple(np.rint(end_xy[::-1]).astype(int))
+    end_index = graph.point_index.get(end_yx)
+    if end_index is None:
+        distances = np.linalg.norm(graph.points[:, ::-1] - end_xy, axis=1)
+        end_index = int(np.argmin(distances))
+        if distances[end_index] > 2.0:
+            return False
+        end_yx = tuple(map(int, graph.points[end_index]))
+    if int(graph.crossing[end_yx]) == 1:
+        return False
+
+    # Use a several-pixel tail rather than the final pixel so one-pixel
+    # skeleton stair-steps do not change the inferred pen direction.
+    tail = np.asarray(points[-1], dtype=float)
+    anchor = np.asarray(points[0], dtype=float)
+    walked = 0.0
+    for index in range(len(points) - 2, -1, -1):
+        walked += float(np.linalg.norm(points[index + 1] - points[index]))
+        anchor = np.asarray(points[index], dtype=float)
+        if walked >= 8.0:
+            break
+    incoming = tail - anchor
+    norm = float(np.linalg.norm(incoming))
+    if norm <= 1e-9:
+        return False
+    incoming /= norm
+
+    route_pixels = {
+        (int(round(point[0])), int(round(point[1]))) for point in points
+    }
+    adjacency = adjacency or graph_adjacency(graph.matrix)
+    for neighbour, _weight in adjacency[end_index]:
+        neighbour_xy = graph.points[neighbour][::-1].astype(float)
+        pixel = (int(neighbour_xy[0]), int(neighbour_xy[1]))
+        if pixel in route_pixels:
+            continue
+        outgoing = neighbour_xy - tail
+        outgoing_norm = float(np.linalg.norm(outgoing))
+        if outgoing_norm <= 1e-9:
+            continue
+        if float(np.dot(incoming, outgoing / outgoing_norm)) >= minimum_cosine:
+            return True
+    return False
 
 
 def rank_routes(
-    strokes: list[dict], graph: SkeletonGraph, raw_routes: list[dict]
+    strokes: list[dict],
+    graph: SkeletonGraph,
+    raw_routes: list[dict],
+    ordinal_weight: float = 0.12,
 ) -> list[list[RouteCandidate]]:
-    mapping = component_mapping(strokes, graph)
-    candidate_bounds: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
-    target_bounds: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    for stroke in strokes:
-        key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
-        members = [
-            item["points"]
-            for item in strokes
-            if (int(item["componentId"]), int(item.get("occurrence", 0))) == key
-        ]
-        points = np.vstack(members)
-        candidate_bounds[key] = (points.min(axis=0), points.max(axis=0))
-    for label in set(mapping.values()):
-        points = np.argwhere(graph.components == label)[:, ::-1].astype(float)
-        target_bounds[label] = (points.min(axis=0), points.max(axis=0))
+    allowed_components = component_label_options(strokes, graph)
+    all_candidate_points = np.vstack([stroke["points"] for stroke in strokes])
+    candidate_glyph_bounds = (
+        all_candidate_points.min(axis=0),
+        all_candidate_points.max(axis=0),
+    )
+    target_glyph_points = graph.points[:, ::-1].astype(float)
+    target_glyph_bounds = (
+        target_glyph_points.min(axis=0),
+        target_glyph_points.max(axis=0),
+    )
+    candidate_diagonal = float(
+        np.linalg.norm(candidate_glyph_bounds[1] - candidate_glyph_bounds[0])
+    )
+    target_diagonal = float(
+        np.linalg.norm(target_glyph_bounds[1] - target_glyph_bounds[0])
+    )
 
+    candidate_contacts = stroke_contact_matrix(strokes)
+    candidate_end_is_contact = []
+    for index, stroke in enumerate(strokes):
+        constrained = False
+        for other_index, other in enumerate(strokes):
+            if index == other_index or not candidate_contacts[index, other_index]:
+                continue
+            current_fraction, _other_fraction, _distance = contact_signature(
+                stroke["points"], other["points"]
+            )
+            if current_fraction >= 0.84:
+                constrained = True
+                break
+        candidate_end_is_contact.append(constrained)
+
+    adjacency = graph_adjacency(graph.matrix)
     ranked = []
-    for stroke in strokes:
+    for stroke_index, stroke in enumerate(strokes):
         key = (int(stroke["componentId"]), int(stroke.get("occurrence", 0)))
-        component = mapping[key]
         expected_turn = total_turn(stroke["points"])
-        expected_start = normalized_point(stroke["points"][0], candidate_bounds[key])
+        expected_length_fraction = float(
+            np.linalg.norm(np.diff(stroke["points"], axis=0), axis=1).sum()
+            / max(1.0, candidate_diagonal)
+        )
+        # Coarse glyph-global order is meaningful (top before bottom, left
+        # before right); a component-relative coordinate is not.  In a fully
+        # connected PDF skeleton the latter would incorrectly stretch every
+        # leaf component over the whole character.
+        expected_start = normalized_point(stroke["points"][0], candidate_glyph_bounds)
         options = []
         for route in raw_routes:
-            if route["component"] != component:
+            if route["component"] not in allowed_components[key]:
                 continue
             direction = direction_dtw(stroke["points"], route["points"])
             turn = abs(total_turn(route["points"]) - expected_turn) / math.pi
-            route_start = normalized_point(route["points"][0], target_bounds[component])
+            route_start = normalized_point(route["points"][0], target_glyph_bounds)
             ordinal = float(np.linalg.norm(route_start - expected_start))
-            # Direction/turn grammar dominates. Ordinal position is a weak tie breaker.
-            score = 5.0 * direction + 0.8 * turn + 0.12 * ordinal
+            route_length_fraction = float(route["length"] / max(1.0, target_diagonal))
+            premature_stop = (
+                not candidate_end_is_contact[stroke_index]
+                and has_forward_continuation(
+                    graph, route["points"], adjacency=adjacency
+                )
+                and route_length_fraction < expected_length_fraction * 0.62
+            )
+            # Direction/turn grammar dominates. Ordinal position is a weak tie
+            # breaker. A free pen-up cannot truncate a visibly continuing road.
+            premature_stop_cost = 1.6 if premature_stop else 0.0
+            score = (
+                5.0 * direction
+                + 0.8 * turn
+                + ordinal_weight * ordinal
+                + premature_stop_cost
+            )
             options.append(
                 RouteCandidate(
                     start_node=route["startNode"],
                     end_node=route["endNode"],
                     points=route["points"],
                     pixels=route["pixels"],
-                    component=component,
+                    component=int(route["component"]),
                     score=score,
                     evidence={
                         "directionGrammar": round(direction, 5),
                         "turnGrammar": round(turn, 5),
                         "ordinalTieBreak": round(ordinal, 5),
+                        "prematureJunctionStop": premature_stop,
+                        "prematureStopCost": premature_stop_cost,
+                        "candidateLengthFraction": round(expected_length_fraction, 5),
+                        "routeLengthFraction": round(route_length_fraction, 5),
                     },
                 )
             )
@@ -443,8 +640,61 @@ def observed_contact(first: RouteCandidate, second: RouteCandidate) -> bool:
     return polyline_distance(first.points, second.points) <= 2.2
 
 
-def choose_routes(strokes: list[dict], ranked: list[list[RouteCandidate]]) -> tuple[list[RouteCandidate], dict]:
+def choose_routes(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    total_skeleton_pixels: int,
+    coverage_weight: float = 12.0,
+) -> tuple[list[RouteCandidate], dict]:
     expected_contact = stroke_contact_matrix(strokes)
+    parent = list(range(len(strokes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    group_keys = [
+        (int(stroke.get("componentId", -1)), int(stroke.get("occurrence", 0)))
+        for stroke in strokes
+    ]
+    group_members: dict[tuple[int, int], list[int]] = {}
+    for index, key in enumerate(group_keys):
+        group_members.setdefault(key, []).append(index)
+    group_centres = {
+        key: np.vstack([strokes[index]["points"] for index in indices]).mean(axis=0)
+        for key, indices in group_members.items()
+    }
+    sibling_buckets: dict[tuple[int, str], list[tuple[int, int]]] = {}
+    for key, indices in group_members.items():
+        hierarchy = strokes[indices[0]].get("hierarchy") or []
+        if len(hierarchy) < 2:
+            continue
+        parent_info = hierarchy[1]
+        operator = str(parent_info.get("label", ""))
+        if operator not in {"⿰", "⿱", "⿲", "⿳"}:
+            continue
+        sibling_buckets.setdefault((int(parent_info["id"]), operator), []).append(key)
+    sibling_predecessor: dict[int, tuple[tuple[int, int], int]] = {}
+    for (_parent, operator), keys in sibling_buckets.items():
+        axis = 0 if operator in {"⿰", "⿲"} else 1
+        keys.sort(key=lambda key: group_centres[key][axis])
+        for previous_key, current_key in zip(keys, keys[1:]):
+            sibling_predecessor[group_members[current_key][0]] = previous_key, axis
+    route_bounds = np.vstack(
+        [point for options in ranked for option in options for point in option.points]
+    )
+    route_spans = np.maximum(route_bounds.max(axis=0) - route_bounds.min(axis=0), 1.0)
+    for left in range(len(strokes)):
+        for right in range(left):
+            if group_keys[left] == group_keys[right] and expected_contact[left, right]:
+                union(left, right)
     expected_signatures = {}
     for current in range(len(strokes)):
         for previous in range(current):
@@ -452,7 +702,58 @@ def choose_routes(strokes: list[dict], ranked: list[list[RouteCandidate]]) -> tu
                 expected_signatures[current, previous] = contact_signature(
                     strokes[current]["points"], strokes[previous]["points"]
                 )[:2]
-    beam = [{"score": 0.0, "routes": [], "occupied": frozenset(), "steps": []}]
+    relation_cache: dict[tuple[int, int, int, int], tuple[float, float, list[str]]] = {}
+    for current_index, current_options in enumerate(ranked):
+        for previous_index in range(current_index):
+            expected = bool(expected_contact[current_index, previous_index])
+            for current_rank, current_option in enumerate(current_options):
+                for previous_rank, previous_option in enumerate(ranked[previous_index]):
+                    relation_cost = 0.0
+                    contact_role_cost = 0.0
+                    notes = []
+                    observed = observed_contact(current_option, previous_option)
+                    if expected and not observed:
+                        relation_cost += 0.25
+                        notes.append(f"missing-contact-{previous_index + 1}")
+                    elif observed and not expected:
+                        relation_cost += 0.15
+                        notes.append(f"extra-contact-{previous_index + 1}")
+                    elif expected and observed:
+                        expected_current, expected_previous = expected_signatures[
+                            current_index, previous_index
+                        ]
+                        observed_current, observed_previous, _ = contact_signature(
+                            current_option.points, previous_option.points
+                        )
+                        mismatch = abs(observed_current - expected_current) + abs(
+                            observed_previous - expected_previous
+                        )
+                        contact_role_cost += 0.35 * mismatch
+                        if mismatch > 0.16:
+                            notes.append(
+                                f"contact-role-{previous_index + 1}:"
+                                f"{observed_current:.2f}/{observed_previous:.2f}"
+                                f"!={expected_current:.2f}/{expected_previous:.2f}"
+                            )
+                    if (
+                        find(current_index) == find(previous_index)
+                        and current_option.component != previous_option.component
+                    ):
+                        relation_cost += 2.0
+                        notes.append(f"same-leaf-split-island-{previous_index + 1}")
+                    relation_cache[
+                        current_index, current_rank, previous_index, previous_rank
+                    ] = relation_cost, contact_role_cost, notes
+
+    beam = [
+        {
+            "score": 0.0,
+            "routes": [],
+            "routeRanks": [],
+            "occupied": frozenset(),
+            "steps": [],
+        }
+    ]
     for index, options in enumerate(ranked):
         next_beam = []
         for state in beam:
@@ -462,38 +763,49 @@ def choose_routes(strokes: list[dict], ranked: list[list[RouteCandidate]]) -> tu
                 relation_cost = 0.0
                 contact_role_cost = 0.0
                 relation_notes = []
-                for previous_index, previous in enumerate(state["routes"]):
-                    expected = bool(expected_contact[index, previous_index])
-                    observed = observed_contact(option, previous)
-                    if expected and not observed:
-                        relation_cost += 2.8
-                        relation_notes.append(f"missing-contact-{previous_index + 1}")
-                    elif observed and not expected:
-                        relation_cost += 1.1
-                        relation_notes.append(f"extra-contact-{previous_index + 1}")
-                    elif expected and observed:
-                        expected_current, expected_previous = expected_signatures[index, previous_index]
-                        observed_current, observed_previous, _ = contact_signature(
-                            option.points, previous.points
-                        )
-                        mismatch = abs(observed_current - expected_current) + abs(
-                            observed_previous - expected_previous
-                        )
-                        contact_role_cost += 5.0 * mismatch
-                        if mismatch > 0.16:
+                for previous_index, previous_rank in enumerate(state["routeRanks"]):
+                    relation, role, notes = relation_cache[
+                        index, option_rank, previous_index, previous_rank
+                    ]
+                    relation_cost += relation
+                    contact_role_cost += role
+                    relation_notes.extend(notes)
+                structural_order_cost = 0.0
+                predecessor = sibling_predecessor.get(index)
+                if predecessor is not None:
+                    predecessor_key, axis = predecessor
+                    previous_centres = [
+                        float(np.mean(route.points[:, axis]))
+                        for previous_index, route in enumerate(state["routes"])
+                        if group_keys[previous_index] == predecessor_key
+                    ]
+                    if previous_centres:
+                        previous_centre = float(np.mean(previous_centres))
+                        current_centre = float(np.mean(option.points[:, axis]))
+                        violation = (
+                            previous_centre - current_centre
+                        ) / float(route_spans[axis])
+                        if violation > 0.03:
+                            structural_order_cost = 2.0 + 4.0 * violation
                             relation_notes.append(
-                                f"contact-role-{previous_index + 1}:"
-                                f"{observed_current:.2f}/{observed_previous:.2f}"
-                                f"!={expected_current:.2f}/{expected_previous:.2f}"
+                                f"sibling-order-{predecessor_key[0]}:{violation:.2f}"
                             )
-                expected_shared = 5 * sum(expected_contact[index, :index])
-                reuse_cost = max(0, shared - expected_shared) / max(8, len(option.pixels)) * 7.0
-                new_coverage = len(option.pixels - state["occupied"]) / max(1, len(option.pixels))
-                score += relation_cost + contact_role_cost + reuse_cost - 0.45 * new_coverage
+                reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
+                new_pixels = len(option.pixels - state["occupied"])
+                new_coverage = new_pixels / max(1, len(option.pixels))
+                coverage_reward = coverage_weight * new_pixels / max(1, total_skeleton_pixels)
+                score += (
+                    relation_cost
+                    + contact_role_cost
+                    + structural_order_cost
+                    + reuse_cost
+                    - coverage_reward
+                )
                 next_beam.append(
                     {
                         "score": score,
                         "routes": state["routes"] + [option],
+                        "routeRanks": state["routeRanks"] + [option_rank],
                         "occupied": state["occupied"] | option.pixels,
                         "steps": state["steps"]
                         + [
@@ -503,8 +815,11 @@ def choose_routes(strokes: list[dict], ranked: list[list[RouteCandidate]]) -> tu
                                 "baseScore": round(option.score, 5),
                                 "relationCost": round(relation_cost, 5),
                                 "contactRoleCost": round(contact_role_cost, 5),
+                                "structuralOrderCost": round(structural_order_cost, 5),
                                 "reuseCost": round(reuse_cost, 5),
                                 "newCoverage": round(new_coverage, 5),
+                                "newSkeletonPixels": new_pixels,
+                                "coverageReward": round(coverage_reward, 5),
                                 "notes": relation_notes,
                             }
                         ],
@@ -513,11 +828,26 @@ def choose_routes(strokes: list[dict], ranked: list[list[RouteCandidate]]) -> tu
         next_beam.sort(key=lambda item: item["score"])
         beam = next_beam[:350]
     best = beam[0]
+    runner_up_margin = beam[1]["score"] - best["score"] if len(beam) > 1 else None
+    unexplained_pixels = max(0, int(total_skeleton_pixels - len(best["occupied"])))
+    unexplained_ratio = unexplained_pixels / max(1, total_skeleton_pixels)
+    review_reasons = []
+    if unexplained_ratio >= 0.15:
+        review_reasons.append("large-unexplained-skeleton")
+    if runner_up_margin is not None and runner_up_margin < 0.005:
+        review_reasons.append("near-tied-global-solutions")
+    if any(step["localRank"] >= 24 for step in best["steps"]):
+        review_reasons.append("candidate-stroke-grammar-mismatch")
     return best["routes"], {
         "score": round(best["score"], 6),
         "beamWidth": 350,
+        "coverageWeight": coverage_weight,
+        "unexplainedSkeletonPixels": unexplained_pixels,
+        "unexplainedSkeletonRatio": round(unexplained_ratio, 6),
+        "status": "needs-review" if review_reasons else "safe-candidate",
+        "reviewReasons": review_reasons,
         "steps": best["steps"],
-        "runnerUpMargin": round(beam[1]["score"] - best["score"], 6) if len(beam) > 1 else None,
+        "runnerUpMargin": round(runner_up_margin, 6) if runner_up_margin is not None else None,
     }
 
 
@@ -649,6 +979,12 @@ def evaluate_truth(
         target, truth_lines, truth, normalized["annotations"], canvas
     )
     component_ids = sorted({int(item["componentId"]) for item in truth})
+    stroke_scores = []
+    for index, truth_mask in enumerate(truth_masks):
+        predicted_mask = owner == index
+        intersection = int((truth_mask & predicted_mask).sum())
+        union = int((truth_mask | predicted_mask).sum())
+        stroke_scores.append(intersection / union if union else 1.0)
     component_scores = {}
     for component_id in component_ids:
         truth_mask = np.zeros_like(target)
@@ -667,6 +1003,8 @@ def evaluate_truth(
             "perStrokeStartErrorPercent": [round(value / canvas * 100, 4) for value in start_errors],
             "meanCenterlineChamferPercent": round(float(np.mean(chamfers)) / canvas * 100, 4),
             "perStrokeCenterlineChamferPercent": [round(value / canvas * 100, 4) for value in chamfers],
+            "perStrokeIoU": [round(value, 6) for value in stroke_scores],
+            "strokeMacroIoU": round(float(np.mean(stroke_scores)), 6),
             "componentIoU": component_scores,
             "componentMacroIoU": round(float(np.mean(list(component_scores.values()))), 6),
         },
@@ -836,14 +1174,20 @@ def build_html(
         else (
             f"真值在预测冻结后才读取：起点平均误差 {evaluation['meanStartErrorPercent']:.2f}% · "
             f"中心线 Chamfer {evaluation['meanCenterlineChamferPercent']:.2f}% · "
+            f"逐笔 Macro IoU {evaluation['strokeMacroIoU'] * 100:.1f}% · "
             f"部件 Macro IoU {evaluation['componentMacroIoU'] * 100:.1f}%"
         )
+    )
+    decision_html = (
+        "自动候选可进入后续验收"
+        if decision.get("status") == "safe-candidate"
+        else "必须人工复核：" + ", ".join(decision.get("reviewReasons", []))
     )
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>U+{record['unicode']:04X} 有向墨迹扩散</title>
 <style>
 *{{box-sizing:border-box}}body{{margin:0;background:#eef2f7;color:#172033;font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}}header{{background:#0f172a;color:white;padding:14px 20px}}h1{{font-size:20px;margin:0 0 5px}}header p{{margin:3px 0;color:#cbd5e1}}main{{padding:14px;display:grid;grid-template-columns:minmax(260px,.7fr) minmax(430px,1.25fr) minmax(300px,.85fr);gap:12px}}section{{background:white;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}}h2{{font-size:14px;margin:0;padding:9px 11px;background:#f1f5f9}}.body{{padding:10px}}svg{{display:block;width:100%;height:auto}}.pdf-definitions{{position:absolute;width:0;height:0;overflow:hidden}}.stage{{position:relative;aspect-ratio:1;background:white}}.stage svg,.stage canvas{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}#pdf-native-fill{{z-index:1}}#ink-diffusion-canvas{{z-index:2;image-rendering:auto}}#pdf-native-outline{{z-index:3}}.pdf-fill-use{{fill:#334155;opacity:.16}}.pdf-outline-use{{fill:none;stroke:#0f172a;stroke-width:.38;stroke-linejoin:round;vector-effect:non-scaling-stroke;opacity:.58}}.controls{{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-bottom:8px}}button{{padding:5px 10px;border:1px solid #94a3b8;border-radius:6px;background:white;cursor:pointer}}input[type=range]{{width:100%}}#outline-opacity{{width:80px}}.stroke-list{{display:grid;gap:6px}}.stroke{{padding:7px;border:1px solid #cbd5e1;border-left:7px solid var(--c);border-radius:6px;cursor:pointer}}.stroke.active{{outline:3px solid #38bdf8}}pre{{white-space:pre-wrap;max-height:310px;overflow:auto;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px}}.legend{{display:flex;gap:8px;flex-wrap:wrap;font-size:12px}}.badge{{padding:3px 7px;border-radius:999px;background:#e2e8f0}}.warning{{background:#fef3c7;border:1px solid #f59e0b;padding:8px;border-radius:6px}}.good{{background:#dcfce7;border:1px solid #4ade80;padding:8px;border-radius:6px}}label{{display:inline-flex;gap:5px;align-items:center}}@media(max-width:1150px){{main{{grid-template-columns:1fr}}}}
 </style>
-<header><h1>U+{record['unicode']:04X} {html.escape(chr(record['unicode']))} · {html.escape(record['source'])} 源 · glyph {glyph_id}</h1><p>主前沿只沿 PDF 骨架有向前进；横向墨迹波只负责填满真实轮廓。candidate 坐标未用于生成 PDF 色块。</p><p>{html.escape(evaluation_html)}</p></header>
+<header><h1>U+{record['unicode']:04X} {html.escape(chr(record['unicode']))} · {html.escape(record['source'])} 源 · glyph {glyph_id}</h1><p>主前沿只沿 PDF 骨架有向前进；横向墨迹波只负责填满真实轮廓。candidate 坐标未用于生成 PDF 色块。</p><p>{html.escape(decision_html)}</p><p>{html.escape(evaluation_html)}</p></header>
 <main>
 <section><h2>Candidate：只读符号化假说</h2><div class="body"><svg viewBox="0 0 100 100">{candidate_svgs}</svg><div class="warning">这里的坐标、大小和占据空间不可信；只读取笔顺、方向、转折、接触关系和叶部件 ID。</div><div class="stroke-list" id="stroke-list"></div></div></section>
 <section><h2>PDF 墨迹域上的有向扩散</h2><div class="body"><div class="controls"><button id="play">播放</button><input id="time" type="range" min="0" max="1000" value="0"><output id="clock"></output></div><div class="legend"><label><input id="show-pdf-fill" type="checkbox" checked>PDF 原生实体</label><label><input id="show-pdf-outline" type="checkbox" checked>PDF 原生轮廓</label><label>轮廓透明度 <input id="outline-opacity" type="range" min="10" max="100" value="58"></label><label><input id="show-skeleton" type="checkbox" checked>骨架路网</label><label><input id="show-routes" type="checkbox" checked>已选主路</label><label><input id="show-truth" type="checkbox">人工真值中心线（仅验收）</label><span class="badge">红圈＝当前主前沿</span><span class="badge">白圈＝候选起点</span></div><svg class="pdf-definitions" aria-hidden="true"><defs>{glyph['definitions']}</defs></svg><div class="stage"><svg id="pdf-native-fill" viewBox="0 0 100 100" aria-label="原生 PDF 实体背景"><g class="pdf-fill-use pdf-source-fit">{original_use}</g></svg><canvas id="ink-diffusion-canvas" width="{canvas}" height="{canvas}"></canvas><svg id="pdf-native-outline" viewBox="0 0 100 100" aria-label="原生 PDF 顶层轮廓"><defs>{outline_glyph['definitions']}</defs><g class="pdf-outline-use pdf-source-fit">{outline_use}</g></svg></div></div></section>
@@ -876,6 +1220,8 @@ def main():
     parser.add_argument("--glyph-id", type=int, required=True)
     parser.add_argument("--annotations", type=Path)
     parser.add_argument("--canvas", type=int, default=256)
+    parser.add_argument("--ordinal-weight", type=float, default=0.12)
+    parser.add_argument("--coverage-weight", type=float, default=12.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -898,10 +1244,17 @@ def main():
     skeleton = TRANSFER.skeletonize(target)
     graph = build_skeleton_graph(skeleton)
     raw_routes = all_routes(graph)
-    ranked = rank_routes(candidate, graph, raw_routes)
+    ranked = rank_routes(
+        candidate, graph, raw_routes, ordinal_weight=args.ordinal_weight
+    )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")
-    routes, decision = choose_routes(candidate, ranked)
+    routes, decision = choose_routes(
+        candidate,
+        ranked,
+        int(skeleton.sum()),
+        coverage_weight=args.coverage_weight,
+    )
     owner, _owner_distance = geodesic_owners(target, routes)
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
@@ -922,9 +1275,9 @@ def main():
         )
     decision.update(
         {
-            "model": "directed-skeleton-front-plus-bounded-radial-wetting-v1",
+            "model": "directed-skeleton-front-plus-bounded-radial-wetting-v2",
             "candidateGeometryUsedForTargetMask": False,
-            "candidateOrdinalTieBreakWeight": 0.12,
+            "candidateOrdinalTieBreakWeight": args.ordinal_weight,
             "criticalNodeCount": len(graph.critical),
             "routeHypothesisCount": len(raw_routes),
             "unexplainedSkeletonPixels": int(
