@@ -33,11 +33,65 @@ INK = load_module("unihan-ink-diffusion.py", "unihan_ink_rule_training_diffusion
 TRANSFER = INK.TRANSFER
 MATCHER = INK.MATCHER
 PDF = INK.PDF
+DIRECTED = INK.RESIDUAL_DECODER.DIRECTED
 
 
 def normalized(point: np.ndarray, bounds: tuple[np.ndarray, np.ndarray]) -> list[float]:
     value = INK.normalized_point(point, bounds)
     return [round(float(value[0]), 4), round(float(value[1]), 4)]
+
+
+def source_rule_key(example: dict) -> str:
+    """Keep writing conventions isolated even when leaf IDs happen to match."""
+    return f"{str(example['source']).upper()}|{example['key']}"
+
+
+def build_rule_model(examples: list[dict]) -> dict:
+    """Build a source-aware rule model from constraint-clean observations.
+
+    A hard-constraint failure means that the observation still needs review;
+    it is not evidence that a rejected branch is a useful negative example.
+    """
+    accepted = [item for item in examples if not item.get("constraintViolations")]
+    rejected = [item for item in examples if item.get("constraintViolations")]
+    by_signature: dict[str, list[dict]] = defaultdict(list)
+    for example in accepted:
+        by_signature[source_rule_key(example)].append(example)
+    return {
+        "schemaVersion": 2,
+        "model": "source-aware-exact-leaf-directed-half-edge-rules",
+        "minimumSupportForScoring": 2,
+        "caseCount": len({example["case"] for example in accepted}),
+        "examples": accepted,
+        "examplesBySignature": dict(by_signature),
+        "rejectedConstraintExampleCount": len(rejected),
+        "reviewCases": [
+            {
+                "case": item["case"],
+                "reasons": list(item.get("constraintViolations", ())),
+            }
+            for item in rejected
+        ],
+    }
+
+
+def route_half_edge_evidence(directed, route_edge_ids: tuple[int, ...]) -> tuple[list[int], list[int]]:
+    chosen = []
+    forbidden = []
+    for incoming_id, outgoing_id in zip(route_edge_ids, route_edge_ids[1:]):
+        incoming = directed.edges[incoming_id]
+        outgoing = directed.edges[outgoing_id]
+        if incoming.end_gate != outgoing.start_gate or incoming.road_id == outgoing.road_id:
+            continue
+        chosen.append(outgoing_id)
+        gate = directed.gates[incoming.end_gate]
+        forbidden.extend(
+            edge_id
+            for edge_id in gate.outgoing
+            if directed.edges[edge_id].road_id != incoming.road_id
+            and edge_id != outgoing_id
+        )
+    return list(dict.fromkeys(chosen)), list(dict.fromkeys(forbidden))
 
 
 def learn_example(
@@ -76,6 +130,7 @@ def learn_example(
     ) < 224
     target = TRANSFER.normalize_target(source_mask, canvas)
     graph = INK.build_skeleton_graph(TRANSFER.skeletonize(target))
+    directed = DIRECTED.build_directed_skeleton(graph)
     signatures = INK.stroke_rule_signatures(candidate)
 
     glyph_points = np.vstack([stroke["points"] for stroke in truth])
@@ -101,6 +156,10 @@ def learn_example(
             else None
         )
         junctions = INK.junction_decision_details(points, graph)
+        route_edge_ids = DIRECTED.trace_route_edges(directed, graph, points)
+        chosen_half_edges, forbidden_half_edges = route_half_edge_evidence(
+            directed, route_edge_ids
+        )
         examples.append(
             {
                 "case": case,
@@ -128,6 +187,10 @@ def learn_example(
                 },
                 "junctionTurnSequence": [item["chosen"] for item in junctions],
                 "junctions": junctions,
+                "routeHalfEdges": list(route_edge_ids),
+                "chosenHalfEdges": chosen_half_edges,
+                "forbiddenHalfEdges": forbidden_half_edges,
+                "constraintViolations": [],
             }
         )
         previous.append(points)
@@ -223,17 +286,8 @@ def main() -> None:
                 annotation, rows, records, page_cache, args.pdf, args.canvas
             )
         )
-    by_signature: dict[str, list[dict]] = defaultdict(list)
-    for example in examples:
-        by_signature[example["key"]].append(example)
-    model = {
-        "schemaVersion": 1,
-        "model": "exact-leaf-directed-start-and-junction-rules",
-        "minimumSupportForScoring": 2,
-        "caseCount": len({example["case"] for example in examples}),
-        "examples": examples,
-        "examplesBySignature": dict(by_signature),
-    }
+    model = build_rule_model(examples)
+    by_signature = model["examplesBySignature"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(model, ensure_ascii=False, indent=2), "utf-8")
     args.report.parent.mkdir(parents=True, exist_ok=True)

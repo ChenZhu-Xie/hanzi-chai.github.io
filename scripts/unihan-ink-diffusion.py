@@ -646,12 +646,20 @@ def learned_rule_for_stroke(
     model: dict | None,
     signature: dict,
     excluded_case: str | None,
+    source: str | None = None,
 ) -> dict | None:
     if not model:
         return None
+    schema_version = int(model.get("schemaVersion", 1))
+    if schema_version >= 2:
+        if not source:
+            return None
+        lookup_key = f"{source.upper()}|{signature['key']}"
+    else:
+        lookup_key = signature["key"]
     examples = [
         example
-        for example in model.get("examplesBySignature", {}).get(signature["key"], [])
+        for example in model.get("examplesBySignature", {}).get(lookup_key, [])
         if example.get("case") != excluded_case
         and example.get("contextKey") == signature.get("contextKey")
     ]
@@ -814,6 +822,7 @@ def rank_routes(
     ordinal_weight: float = 0.12,
     learned_model: dict | None = None,
     excluded_training_case: str | None = None,
+    source: str | None = None,
 ) -> list[list[RouteCandidate]]:
     allowed_components = component_label_options(strokes, graph)
     all_candidate_points = np.vstack([stroke["points"] for stroke in strokes])
@@ -864,7 +873,10 @@ def rank_routes(
         # leaf component over the whole character.
         expected_start = normalized_point(stroke["points"][0], candidate_glyph_bounds)
         learned_rule = learned_rule_for_stroke(
-            learned_model, signatures[stroke_index], excluded_training_case
+            learned_model,
+            signatures[stroke_index],
+            excluded_training_case,
+            source=source,
         )
         options = []
         for route in raw_routes:
@@ -1899,6 +1911,7 @@ def main():
         ordinal_weight=args.ordinal_weight,
         learned_model=learned_model,
         excluded_training_case=excluded_training_case,
+        source=args.source,
     )
     if any(not options for options in ranked):
         raise RuntimeError("at least one candidate stroke has no feasible PDF route")

@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import sys
 import tempfile
@@ -16,6 +17,51 @@ SPEC.loader.exec_module(MODULE)
 
 
 class HumanTruthLeaveOneOutTest(unittest.TestCase):
+    def test_residual_prediction_interface_cannot_receive_heldout_truth(self):
+        self.assertTrue(hasattr(MODULE, "predict_residual_fold"))
+        parameters = inspect.signature(MODULE.predict_residual_fold).parameters
+        self.assertNotIn("truth", parameters)
+        self.assertNotIn("annotation", parameters)
+        self.assertNotIn("expected_glyph_id", parameters)
+
+    def test_loocv_reports_forbidden_branch_leakage_and_residual_ink(self):
+        self.assertTrue(hasattr(MODULE, "summarize_residual_folds"))
+        summary = MODULE.summarize_residual_folds(
+            [
+                {
+                    "candidateCorrect": True,
+                    "penDownError": 2.0,
+                    "directedDtw": 0.2,
+                    "strokeIoU": [0.8, 1.0],
+                    "componentIoU": [0.9],
+                    "forbiddenBranchLeakagePixels": 0,
+                    "residualUnexplainedInkPixels": 3,
+                    "status": "safe",
+                    "hardViolations": [],
+                },
+                {
+                    "candidateCorrect": False,
+                    "penDownError": 4.0,
+                    "directedDtw": 0.4,
+                    "strokeIoU": [0.4],
+                    "componentIoU": [0.5],
+                    "forbiddenBranchLeakagePixels": 7,
+                    "residualUnexplainedInkPixels": 11,
+                    # Even a mistakenly optimistic caller cannot make a hard
+                    # violation safe in the aggregate report.
+                    "status": "safe",
+                    "hardViolations": ["forbidden-junction-exit"],
+                },
+            ]
+        )
+        self.assertEqual(summary["candidateCorrect"], 1)
+        self.assertEqual(summary["safe"], 1)
+        self.assertEqual(summary["needsReview"], 1)
+        self.assertEqual(summary["forbiddenBranchLeakagePixels"], 7)
+        self.assertEqual(summary["residualUnexplainedInkPixels"], 14)
+        self.assertEqual(summary["hardViolations"], {"forbidden-junction-exit": 1})
+        self.assertAlmostEqual(summary["strokeIoUMean"], (0.8 + 1.0 + 0.4) / 3)
+
     def case(self, key, vector):
         return MODULE.FeatureCase(
             key=key,

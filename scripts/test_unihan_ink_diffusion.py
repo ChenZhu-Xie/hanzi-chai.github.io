@@ -146,6 +146,39 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(duplicate_cost, 0.0)
         self.assertFalse(duplicate_evidence["learnedScoringEnabled"])
 
+    def test_schema_two_learned_rules_never_mix_source_conventions(self):
+        signature = {
+            "key": "220|1|3|横",
+            "contextKey": "220:0",
+        }
+
+        def training_case(case, sector):
+            return {
+                "case": case,
+                "contextKey": "220:0",
+                "start": {
+                    "topologyRole": "endpoint",
+                    "directionSector": sector,
+                    "componentNormalized": [0, 0],
+                    "glyphNormalized": [0, 0],
+                },
+                "junctionTurnSequence": [],
+                "junctions": [],
+            }
+
+        model = {
+            "schemaVersion": 2,
+            "examplesBySignature": {
+                "G|220|1|3|横": [training_case("U+1111-G", "E")],
+                "T|220|1|3|横": [training_case("U+2222-T", "S")],
+            },
+        }
+        g_rule = MODULE.learned_rule_for_stroke(model, signature, None, source="G")
+        t_rule = MODULE.learned_rule_for_stroke(model, signature, None, source="T")
+        self.assertEqual(g_rule["startSector"], "E")
+        self.assertEqual(t_rule["startSector"], "S")
+        self.assertIsNone(MODULE.learned_rule_for_stroke(model, signature, None))
+
     def test_turn_landmarks_distinguish_straight_from_right_angle(self):
         straight = np.asarray([[0.0, 0.0], [30.0, 0.0]])
         corner = np.asarray([[0.0, 0.0], [15.0, 0.0], [15.0, 15.0]])

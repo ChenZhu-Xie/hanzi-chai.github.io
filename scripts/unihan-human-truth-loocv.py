@@ -9,6 +9,7 @@ opened only after its prediction has been frozen.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import re
@@ -240,6 +241,85 @@ def summarize(folds: list[dict], prediction_field: str) -> dict:
         "attempted": len(attempted),
         "correct": correct,
         "accuracy": round(correct / len(attempted), 6) if attempted else None,
+    }
+
+
+def predict_residual_fold(
+    decoder,
+    *,
+    target,
+    graph,
+    strokes,
+    ranked_routes,
+    source: str,
+    codepoint: int,
+    learned_model: dict | None = None,
+    normative_catalog=None,
+):
+    """Freeze one residual prediction without accepting any held-out truth.
+
+    The decoder is injected so the evaluation boundary stays independently
+    testable and cannot accidentally grow an annotation/answer dependency.
+    """
+    return decoder(
+        target,
+        graph,
+        strokes,
+        ranked_routes,
+        source=source,
+        codepoint=codepoint,
+        learned_model=learned_model,
+        normative_catalog=normative_catalog,
+    )
+
+
+def summarize_residual_folds(folds: list[dict]) -> dict:
+    def values(name: str) -> list[float]:
+        output = []
+        for fold in folds:
+            value = fold.get(name)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                output.extend(float(item) for item in value)
+            else:
+                output.append(float(value))
+        return output
+
+    def mean(name: str) -> float | None:
+        samples = values(name)
+        return sum(samples) / len(samples) if samples else None
+
+    violations = Counter(
+        violation
+        for fold in folds
+        for violation in fold.get("hardViolations", ())
+    )
+    safe_count = sum(
+        fold.get("status") == "safe" and not fold.get("hardViolations")
+        for fold in folds
+    )
+    return {
+        "total": len(folds),
+        "candidateCorrect": sum(bool(fold.get("candidateCorrect")) for fold in folds),
+        "candidateAccuracy": (
+            round(sum(bool(fold.get("candidateCorrect")) for fold in folds) / len(folds), 6)
+            if folds
+            else None
+        ),
+        "penDownErrorMean": mean("penDownError"),
+        "directedDtwMean": mean("directedDtw"),
+        "strokeIoUMean": mean("strokeIoU"),
+        "componentIoUMean": mean("componentIoU"),
+        "forbiddenBranchLeakagePixels": sum(
+            int(fold.get("forbiddenBranchLeakagePixels", 0)) for fold in folds
+        ),
+        "residualUnexplainedInkPixels": sum(
+            int(fold.get("residualUnexplainedInkPixels", 0)) for fold in folds
+        ),
+        "safe": safe_count,
+        "needsReview": len(folds) - safe_count,
+        "hardViolations": dict(sorted(violations.items())),
     }
 
 

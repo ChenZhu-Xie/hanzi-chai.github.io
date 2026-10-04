@@ -114,3 +114,32 @@ closed occurrence may not be re-entered. The objective should combine:
 Automatic acceptance remains prohibited when an exact component has no
 verified template, a new sibling/component is implicated, sequence grammar is
 violated, or the best/runner-up margin is too small.
+
+## Residual decoder and leakage boundary
+
+The residual decoder makes each stroke decision against the ink that remains
+after earlier strokes. It converts the skeleton to directed half-edges, treats
+each junction cluster as a gate, permits reuse only in a small contact zone,
+and permanently consumes the selected road outside that zone. A route that
+leaves its allowed half-edge, re-enters a closed component occurrence, reverses
+at a gate, or leaks into an unselected branch is rejected before learned costs
+are considered.
+
+Learned rules use schema version 2. Their key is
+`source | exact leaf ID | leaf stroke ordinal | leaf stroke count | feature`,
+so a G observation cannot silently train a T, J, or other source convention.
+Each observation retains the selected route half-edges and the alternative
+half-edges explicitly rejected at its junctions. An observation with a hard
+constraint violation is listed as a review case and is not converted into a
+negative training example. After excluding the current target, at least two
+independent supporting cases are still required before a learned prior changes
+a route score.
+
+The residual leave-one-out boundary accepts only the target measurements,
+candidate strokes, source/code point, rule model, and normative catalog. It has
+no annotation or expected-answer parameter. The held-out truth may be opened
+only after that prediction is frozen. Its report aggregates candidate
+correctness, pen-down error, directed DTW, stroke/component IoU, forbidden
+branch leakage, residual unexplained ink, safe/review counts, and named hard
+violations. Any hard violation forces `needs-review`, irrespective of the
+average score or a caller-provided optimistic status.
