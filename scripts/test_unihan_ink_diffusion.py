@@ -113,6 +113,14 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             MODULE.grass_diagonal_recovery_needed(strokes, wrong),
             [(486, 0)],
         )
+        bent = list(correct)
+        # The first horizontal still wins centroid order, but wrongly turns
+        # down into the following vertical road.
+        bent[0] = route([[0, -10], [10, -10], [10, 0]])
+        self.assertEqual(
+            MODULE.grass_diagonal_recovery_needed(strokes, bent),
+            [(486, 0)],
+        )
 
     def test_first_leaf_stroke_prefers_the_earliest_compatible_diagonal_front(self):
         strokes = [
@@ -870,7 +878,7 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertTrue(MODULE.has_forward_continuation(graph, truncated))
         self.assertFalse(MODULE.has_forward_continuation(graph, complete))
 
-    def test_residual_ranking_does_not_use_candidate_position_as_component_gate(self):
+    def test_component_island_is_a_soft_prior_and_never_deletes_recovery_roads(self):
         skeleton = np.zeros((9, 12), dtype=bool)
         skeleton[2, 1:10] = True
         skeleton[6, 1:10] = True
@@ -897,7 +905,45 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         finally:
             MODULE.component_label_options = original
         self.assertGreater(len(legacy[0]), 0)
-        self.assertGreater(len(residual[0]), len(legacy[0]))
+        self.assertTrue(any(option.component == kept_component for option in legacy[0]))
+        self.assertTrue(any(option.component != kept_component for option in legacy[0]))
+        self.assertTrue(
+            any(
+                option.evidence["componentLabelRecoveryCost"] > 0
+                for option in legacy[0]
+            )
+        )
+        self.assertTrue(
+            all(
+                option.evidence["componentLabelRecoveryCost"] == 0
+                for option in residual[0]
+            )
+        )
+
+    def test_route_compaction_deduplicates_paths_and_keeps_island_diversity(self):
+        path = np.asarray([[0.0, 0.0], [10.0, 0.0]])
+        best = MODULE.RouteCandidate(
+            0, 1, path, frozenset({(0, 0), (10, 0)}), 1, 0.0, {}
+        )
+        duplicate = MODULE.RouteCandidate(
+            2, 3, path.copy(), frozenset({(0, 0), (10, 0)}), 1, 1.0, {}
+        )
+        other_island = MODULE.RouteCandidate(
+            4,
+            5,
+            np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            frozenset({(0, 5), (10, 5)}),
+            2,
+            5.0,
+            {},
+        )
+        compacted = MODULE.compact_route_hypotheses(
+            [[best, duplicate, other_island]],
+            global_limit=1,
+            per_component_limit=1,
+            total_limit=2,
+        )[0]
+        self.assertEqual(compacted, [best, other_island])
 
     def test_absolute_skeleton_coverage_can_outweigh_a_short_local_match(self):
         stroke = {"points": np.asarray([[0.0, 0.0], [10.0, 0.0]])}
@@ -1208,6 +1254,374 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             [upper, lower], [[fixed_upper], [wrong_above, correct_below]], 6
         )
         self.assertIs(routes[1], correct_below)
+
+    def test_left_right_root_forces_first_leaf_onto_left_scan_front(self):
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 220, "label": "末级部件"},
+                    {"id": 900001, "label": "⿰"},
+                ],
+                "points": np.asarray([[5.0, 5.0], [20.0, 5.0]]),
+            }
+        ]
+        wrong_right = MODULE.RouteCandidate(
+            0, 1, np.asarray([[72.0, 5.0], [88.0, 5.0]]),
+            frozenset({(72, 5), (80, 5), (88, 5)}), 1, -5.0, {},
+        )
+        correct_left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[4.0, 7.0], [22.0, 7.0]]),
+            frozenset({(4, 7), (13, 7), (22, 7)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes, [[wrong_right, correct_left]], total_skeleton_pixels=6
+        )
+        self.assertIs(routes[0], correct_left)
+        self.assertEqual(decision["rootStructureScan"]["operator"], "⿰")
+        self.assertEqual(decision["rootStructureScan"]["vector"], [1.0, 0.0])
+
+    def test_upper_right_enclosure_uses_negative_diagonal_scan_front(self):
+        strokes = [
+            {
+                "componentId": 132,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": [
+                    {"id": 132, "label": "末级部件"},
+                    {"id": 700001, "label": "⿹"},
+                ],
+                "points": np.asarray([[80.0, 5.0], [60.0, 35.0]]),
+            }
+        ]
+        wrong_lower_left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[8.0, 70.0], [30.0, 90.0]]),
+            frozenset({(8, 70), (20, 80), (30, 90)}), 1, -5.0, {},
+        )
+        correct_upper_right = MODULE.RouteCandidate(
+            0, 1, np.asarray([[92.0, 8.0], [70.0, 32.0]]),
+            frozenset({(92, 8), (80, 20), (70, 32)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes, [[wrong_lower_left, correct_upper_right]], total_skeleton_pixels=6
+        )
+        self.assertIs(routes[0], correct_upper_right)
+        self.assertEqual(decision["rootStructureScan"]["operator"], "⿹")
+        self.assertEqual(decision["rootStructureScan"]["vector"], [-1.0, 1.0])
+
+    def test_nested_upper_right_enclosure_scans_outer_leaf_before_inner_leaf(self):
+        def hierarchy(component, immediate_parent):
+            return [
+                {"id": component, "label": "末级部件"},
+                {"id": immediate_parent, "label": "⿹"},
+                {"id": 900002, "label": "⿰"},
+            ]
+
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 220, "label": "末级部件"},
+                    {"id": 900002, "label": "⿰"},
+                ],
+                "points": np.asarray([[0.0, 10.0], [15.0, 10.0]]),
+            },
+            {
+                "componentId": 132,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": hierarchy(132, 4274),
+                "points": np.asarray([[80.0, 5.0], [60.0, 35.0]]),
+            },
+            {
+                "componentId": 282,
+                "occurrence": 0,
+                "feature": "竖",
+                "hierarchy": hierarchy(282, 4274),
+                "points": np.asarray([[55.0, 35.0], [55.0, 70.0]]),
+            },
+        ]
+        left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[2.0, 12.0], [16.0, 12.0]]),
+            frozenset({(2, 12), (9, 12), (16, 12)}), 1, 0.0, {},
+        )
+        wrong_outer = MODULE.RouteCandidate(
+            0, 1, np.asarray([[30.0, 70.0], [45.0, 88.0]]),
+            frozenset({(30, 70), (38, 79), (45, 88)}), 1, -5.0, {},
+        )
+        correct_outer = MODULE.RouteCandidate(
+            0, 1, np.asarray([[92.0, 8.0], [70.0, 32.0]]),
+            frozenset({(92, 8), (80, 20), (70, 32)}), 1, 0.0, {},
+        )
+        inner = MODULE.RouteCandidate(
+            0, 1, np.asarray([[55.0, 38.0], [55.0, 72.0]]),
+            frozenset({(55, 38), (55, 55), (55, 72)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[left], [wrong_outer, correct_outer], [inner]],
+            total_skeleton_pixels=12,
+        )
+        self.assertIs(routes[1], correct_outer)
+        nested = decision["steps"][1]["recursiveStructureScan"]
+        self.assertTrue(nested["enabled"])
+        self.assertEqual(nested["parentId"], 4274)
+        self.assertEqual(nested["operator"], "⿹")
+
+    def test_nested_vertical_structure_rejects_lower_child_above_upper_child(self):
+        strokes = [
+            {
+                "componentId": 486,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 486, "label": "末级部件"},
+                    {"id": 25376, "label": "⿱"},
+                    {"id": 900003, "label": "⿰"},
+                ],
+                "points": np.asarray([[40.0, 10.0], [70.0, 10.0]]),
+            },
+            {
+                "componentId": 132,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": [
+                    {"id": 132, "label": "末级部件"},
+                    {"id": 4274, "label": "⿹"},
+                    {"id": 25376, "label": "⿱"},
+                    {"id": 900003, "label": "⿰"},
+                ],
+                "points": np.asarray([[60.0, 50.0], [45.0, 75.0]]),
+            },
+        ]
+        upper = MODULE.RouteCandidate(
+            0, 1, np.asarray([[40.0, 20.0], [70.0, 20.0]]),
+            frozenset({(40, 20), (55, 20), (70, 20)}), 1, 0.0, {},
+        )
+        wrong_above = MODULE.RouteCandidate(
+            0, 1, np.asarray([[62.0, 8.0], [48.0, 28.0]]),
+            frozenset({(62, 8), (55, 18), (48, 28)}), 1, -5.0, {},
+        )
+        correct_below = MODULE.RouteCandidate(
+            0, 1, np.asarray([[62.0, 50.0], [48.0, 75.0]]),
+            frozenset({(62, 50), (55, 62), (48, 75)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes, [[upper], [wrong_above, correct_below]], total_skeleton_pixels=9
+        )
+        self.assertIs(routes[1], correct_below)
+        constraint = decision["steps"][1]["recursiveSiblingOrder"]
+        self.assertTrue(constraint["enabled"])
+        self.assertEqual(constraint["parentId"], 25376)
+        self.assertEqual(constraint["operator"], "⿱")
+
+    def test_nested_vertical_structure_keeps_lower_child_horizontally_aligned(self):
+        strokes = [
+            {
+                "componentId": 486,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 486, "label": "末级部件"},
+                    {"id": 25376, "label": "⿱"},
+                    {"id": 900003, "label": "⿰"},
+                ],
+                "points": np.asarray([[40.0, 10.0], [70.0, 10.0]]),
+            },
+            {
+                "componentId": 132,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": [
+                    {"id": 132, "label": "末级部件"},
+                    {"id": 25376, "label": "⿱"},
+                    {"id": 900003, "label": "⿰"},
+                ],
+                "points": np.asarray([[60.0, 50.0], [45.0, 75.0]]),
+            },
+        ]
+        upper = MODULE.RouteCandidate(
+            0, 1, np.asarray([[40.0, 20.0], [70.0, 20.0]]),
+            frozenset({(40, 20), (55, 20), (70, 20)}), 1, 0.0, {},
+        )
+        wrong_below_but_sideways = MODULE.RouteCandidate(
+            0, 1, np.asarray([[82.0, 50.0], [96.0, 75.0]]),
+            frozenset({(82, 50), (89, 62), (96, 75)}), 1, -50.0, {},
+        )
+        correct_below = MODULE.RouteCandidate(
+            0, 1, np.asarray([[62.0, 50.0], [48.0, 75.0]]),
+            frozenset({(62, 50), (55, 62), (48, 75)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[upper], [wrong_below_but_sideways, correct_below]],
+            total_skeleton_pixels=9,
+        )
+        self.assertIs(routes[1], correct_below)
+        constraint = decision["steps"][1]["recursiveSiblingOrder"]
+        self.assertGreater(constraint["crossAxisOverlap"], 0.02)
+        self.assertFalse(constraint["hardCrossAxisMisalignment"])
+
+    def test_same_leaf_strokes_cannot_retrace_half_of_an_existing_trunk(self):
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "竖钩",
+                "points": np.asarray([[5.0, 0.0], [5.0, 10.0]]),
+            },
+        ]
+        horizontal = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            frozenset((x, 5) for x in range(11)), 1, 0.0, {},
+        )
+        retraces_half = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 5.0], [5.0, 5.0], [5.0, 10.0]]),
+            frozenset(
+                [(x, 5) for x in range(6)] + [(5, y) for y in range(6, 11)]
+            ),
+            1,
+            -50.0,
+            {},
+        )
+        distinct_vertical = MODULE.RouteCandidate(
+            0, 1, np.asarray([[5.0, 0.0], [5.0, 10.0]]),
+            frozenset((5, y) for y in range(11)), 1, 0.0, {},
+        )
+        routes, _decision = MODULE.choose_routes(
+            strokes,
+            [[horizontal], [retraces_half, distinct_vertical]],
+            total_skeleton_pixels=21,
+        )
+        self.assertIs(routes[1], distinct_vertical)
+
+    def test_root_left_right_scope_propagates_to_every_leaf_in_right_subtree(self):
+        def right_hierarchy(component):
+            return [
+                {"id": component, "label": "末级部件"},
+                {"id": 700010, "label": "⿱"},
+                {"id": 900010, "label": "⿰"},
+            ]
+
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 220, "label": "末级部件"},
+                    {"id": 900010, "label": "⿰"},
+                ],
+                "points": np.asarray([[0.0, 5.0], [15.0, 5.0]]),
+            },
+            {
+                "componentId": 486,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": right_hierarchy(486),
+                "points": np.asarray([[55.0, 5.0], [75.0, 5.0]]),
+            },
+            {
+                "componentId": 132,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": right_hierarchy(132),
+                "points": np.asarray([[65.0, 40.0], [55.0, 70.0]]),
+            },
+        ]
+        left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[2.0, 5.0], [18.0, 5.0]]),
+            frozenset({(2, 5), (10, 5), (18, 5)}), 1, 0.0, {},
+        )
+        right_upper = MODULE.RouteCandidate(
+            0, 1, np.asarray([[55.0, 8.0], [78.0, 8.0]]),
+            frozenset({(55, 8), (66, 8), (78, 8)}), 1, 0.0, {},
+        )
+        leaks_back_left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[18.0, 35.0], [5.0, 70.0]]),
+            frozenset({(18, 35), (12, 52), (5, 70)}), 1, -50.0, {},
+        )
+        stays_right = MODULE.RouteCandidate(
+            0, 1, np.asarray([[68.0, 35.0], [55.0, 70.0]]),
+            frozenset({(68, 35), (62, 52), (55, 70)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[left], [right_upper], [leaks_back_left, stays_right]],
+            total_skeleton_pixels=12,
+        )
+        self.assertIs(routes[2], stays_right)
+        constraints = decision["steps"][2]["recursiveSiblingOrder"]["constraints"]
+        self.assertTrue(any(item["parentId"] == 900010 for item in constraints))
+
+    def test_future_structural_sibling_keeps_an_earlier_universe_alive(self):
+        strokes = [
+            {
+                "componentId": 1,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 1, "label": "末级部件"},
+                    {"id": 900020, "label": "⿰"},
+                ],
+                "points": np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 2,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 2, "label": "末级部件"},
+                    {"id": 700019, "label": "⿹"},
+                    {"id": 700020, "label": "⿰"},
+                    {"id": 900020, "label": "⿰"},
+                ],
+                "points": np.asarray([[40.0, 5.0], [55.0, 5.0]]),
+            },
+            {
+                "componentId": 3,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 3, "label": "末级部件"},
+                    {"id": 700020, "label": "⿰"},
+                    {"id": 900020, "label": "⿰"},
+                ],
+                "points": np.asarray([[75.0, 5.0], [90.0, 5.0]]),
+            },
+        ]
+        root_left = MODULE.RouteCandidate(
+            0, 1, np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            frozenset({(0, 5), (5, 5), (10, 5)}), 1, 0.0, {},
+        )
+        steals_future_space = MODULE.RouteCandidate(
+            0, 1, np.asarray([[78.0, 5.0], [94.0, 5.0]]),
+            frozenset({(78, 5), (86, 5), (94, 5)}), 1, -50.0, {},
+        )
+        leaves_future_space = MODULE.RouteCandidate(
+            0, 1, np.asarray([[38.0, 5.0], [54.0, 5.0]]),
+            frozenset({(38, 5), (46, 5), (54, 5)}), 1, 0.0, {},
+        )
+        future_right = MODULE.RouteCandidate(
+            0, 1, np.asarray([[76.0, 5.0], [92.0, 5.0]]),
+            frozenset({(76, 5), (84, 5), (92, 5)}), 1, 0.0, {},
+        )
+        routes, _decision = MODULE.choose_routes(
+            strokes,
+            [[root_left], [steals_future_space, leaves_future_space], [future_right]],
+            total_skeleton_pixels=12,
+        )
+        self.assertIs(routes[1], leaves_future_space)
 
     def test_html_keeps_native_pdf_fill_below_ink_and_outline_above_it(self):
         points = np.asarray([[0.0, 0.0], [1.0, 1.0]])

@@ -1212,7 +1212,6 @@ def rank_routes(
                 + ordinal_weight * ordinal
                 + premature_stop_cost
                 + learned_cost
-                + component_recovery_cost
             )
             candidate = RouteCandidate(
                     start_node=route["startNode"],
@@ -1249,6 +1248,17 @@ def rank_routes(
         if not options:
             options = component_recovery_options
             component_recovery_options = []
+        elif component_recovery_options:
+            # Connected PDF islands are a useful *weak* registration prior,
+            # but they are not semantic components.  Touching leaves can form
+            # one island and a single leaf can be split by source typography.
+            # Keep recovery roads in the search with their explicit penalty
+            # instead of deleting them.  Recursive IDS scope and whole-glyph
+            # feasibility can then overrule a misleading island assignment
+            # (U+64CF-H), while clean islands still stabilize ambiguous local
+            # routes (U+64CE-T).
+            options.extend(component_recovery_options)
+            options.sort(key=lambda item: item.score)
         if not options:
             ranked.append([])
             continue
@@ -1279,6 +1289,32 @@ def rank_routes(
             if id(item) not in retained_ids:
                 retained.append(item)
                 retained_ids.add(id(item))
+        # Preserve one complete long road per connected PDF island before
+        # local score truncation.  Otherwise a calligraphic stroke split by a
+        # junction can leave only cheap suffixes in the global search (the
+        # lower 八 right stroke in U+6424-J).
+        for component in sorted({item.component for item in options}):
+            members = [
+                item
+                for item in options
+                if item.component == component
+                and semantic_direction_compatible(
+                    str(stroke.get("feature") or ""),
+                    expected_sector,
+                    item.points,
+                )
+            ]
+            if not members:
+                continue
+            longest = max(
+                members,
+                key=lambda item: float(
+                    np.linalg.norm(np.diff(item.points, axis=0), axis=1).sum()
+                ),
+            )
+            if id(longest) not in retained_ids:
+                retained.append(longest)
+                retained_ids.add(id(longest))
         recovered = []
         recovered_paths: set[tuple[tuple[int, int], ...]] = set()
         for item in component_recovery_options:
@@ -1765,6 +1801,74 @@ def apply_stroke_topology_guard(
     return guarded, audit
 
 
+def compact_route_hypotheses(
+    ranked: list[list[RouteCandidate]],
+    global_limit: int = 24,
+    per_component_limit: int = 2,
+    total_limit: int = 40,
+) -> list[list[RouteCandidate]]:
+    """Remove duplicate roads while retaining cross-island escape routes.
+
+    PDF skeleton enumeration frequently emits the same directed polyline from
+    several endpoint descriptions.  Keeping all copies multiplies beam and
+    future-feasibility work without adding a new universe.  We retain the
+    globally best roads plus a small quota for every connected ink island, so
+    the U+64CF cross-island correction remains representable.
+    """
+    compacted = []
+    for options in ranked:
+        unique = []
+        seen = set()
+        for option in sorted(options, key=lambda item: item.score):
+            key = tuple(
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in option.points
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(option)
+        selected = list(unique[:global_limit])
+        selected_ids = {id(option) for option in selected}
+        component_counts: dict[int, int] = {}
+        for option in selected:
+            component_counts[option.component] = (
+                component_counts.get(option.component, 0) + 1
+            )
+        # A locally cheap route may be only the tail of the true stroke.  Keep
+        # the longest grammar-compatible road from every PDF island so
+        # compaction cannot manufacture a premature pen-down/pen-up (the
+        # lower 八 in U+6424-J).
+        for component in sorted({option.component for option in unique}):
+            if len(selected) >= total_limit:
+                break
+            members = [option for option in unique if option.component == component]
+            longest = max(
+                members,
+                key=lambda option: float(
+                    np.linalg.norm(np.diff(option.points, axis=0), axis=1).sum()
+                ),
+            )
+            if id(longest) in selected_ids:
+                continue
+            selected.append(longest)
+            selected_ids.add(id(longest))
+            component_counts[component] = component_counts.get(component, 0) + 1
+        for option in unique[global_limit:]:
+            if len(selected) >= total_limit:
+                break
+            if component_counts.get(option.component, 0) >= per_component_limit:
+                continue
+            selected.append(option)
+            selected_ids.add(id(option))
+            component_counts[option.component] = (
+                component_counts.get(option.component, 0) + 1
+            )
+        selected.sort(key=lambda item: item.score)
+        compacted.append(selected)
+    return compacted
+
+
 def observed_contact(first: RouteCandidate, second: RouteCandidate) -> bool:
     if first.pixels & second.pixels:
         return True
@@ -1938,9 +2042,37 @@ def grass_diagonal_recovery_needed(
             [strokes[index] for index in indices],
             [routes[index] for index in indices],
         )
-        if cost > 0:
+        has_spurious_turn = any(
+            total_turn(routes[index].points)
+            > total_turn(np.asarray(strokes[index]["points"], dtype=float)) + 0.55
+            for index in indices
+        )
+        if cost > 0 or has_spurious_turn:
             failed.append(key)
     return sorted(failed)
+
+
+def structure_scan_vector(operator: str) -> np.ndarray | None:
+    """Return the reading front implied by one IDS composition operator.
+
+    The vector is a projection normal: the smallest dot product is touched
+    first.  It deliberately carries only structural direction, never the
+    candidate's absolute coordinates or proportions.
+    """
+    vectors = {
+        "⿰": (1.0, 0.0),
+        "⿲": (1.0, 0.0),
+        "⿱": (0.0, 1.0),
+        "⿳": (0.0, 1.0),
+        "⿹": (-1.0, 1.0),  # upper-right -> lower-left
+        "⿸": (1.0, 1.0),   # upper-left -> lower-right
+        "⿺": (1.0, -1.0),  # lower-left -> upper-right
+        "⿵": (0.0, 1.0),
+        "⿶": (0.0, -1.0),
+        "⿷": (1.0, 0.0),
+    }
+    value = vectors.get(str(operator))
+    return None if value is None else np.asarray(value, dtype=float)
 
 
 def choose_routes(
@@ -1997,6 +2129,105 @@ def choose_routes(
         [point for options in ranked for option in options for point in option.points]
     )
     route_spans = np.maximum(route_bounds.max(axis=0) - route_bounds.min(axis=0), 1.0)
+    first_group_key = group_keys[0]
+    first_hierarchy = strokes[0].get("hierarchy") or []
+    root_operator = str(first_hierarchy[-1].get("label", "")) if first_hierarchy else ""
+    root_scan_vector = structure_scan_vector(root_operator)
+    if root_scan_vector is None:
+        root_scan_min = root_scan_span = None
+    else:
+        projections = route_bounds @ root_scan_vector
+        root_scan_min = float(projections.min())
+        root_scan_span = max(1.0, float(projections.max() - projections.min()))
+    nested_parent_groups: dict[tuple[int, str], list[tuple[int, int]]] = {}
+    for key, indices in group_members.items():
+        hierarchy = strokes[indices[0]].get("hierarchy") or []
+        for parent_item in hierarchy[1:-1]:
+            operator = str(parent_item.get("label", ""))
+            if structure_scan_vector(operator) is None:
+                continue
+            nested_parent_groups.setdefault(
+                (int(parent_item["id"]), operator), []
+            ).append(key)
+    recursive_scan_specs: dict[tuple[int, int], dict] = {}
+    for key, indices in group_members.items():
+        hierarchy = strokes[indices[0]].get("hierarchy") or []
+        if len(hierarchy) < 3:
+            continue
+        immediate_parent = hierarchy[1]
+        parent_id = int(immediate_parent["id"])
+        operator = str(immediate_parent.get("label", ""))
+        keys = nested_parent_groups.get((parent_id, operator), [])
+        if not keys or structure_scan_vector(operator) is None:
+            continue
+        # Candidate pen order is semantic evidence: the first leaf reached
+        # under this IDS parent is the child whose structural scan front must
+        # be found first in the PDF.  Candidate coordinates remain unused.
+        first_key = min(keys, key=lambda key: group_members[key][0])
+        if key != first_key:
+            continue
+        vector = structure_scan_vector(operator)
+        recursive_scan_specs[first_key] = {
+            "parentId": parent_id,
+            "operator": operator,
+            "vector": vector,
+            "span": max(
+                1.0,
+                float((route_bounds @ vector).max() - (route_bounds @ vector).min()),
+            ),
+        }
+    structural_children: dict[tuple[int, str], dict[tuple, list[tuple[int, int]]]] = {}
+    for key, indices in group_members.items():
+        hierarchy = strokes[indices[0]].get("hierarchy") or []
+        for position in range(1, len(hierarchy)):
+            parent_item = hierarchy[position]
+            operator = str(parent_item.get("label", ""))
+            if operator not in {"⿰", "⿲", "⿱", "⿳"}:
+                continue
+            child = hierarchy[position - 1]
+            token = (
+                ("leaf", key)
+                if position == 1
+                else (
+                    "node",
+                    int(child["id"]),
+                    str(child.get("familyKey", child["id"])),
+                )
+            )
+            bucket = structural_children.setdefault(
+                (int(parent_item["id"]), operator), {}
+            )
+            if key not in bucket.setdefault(token, []):
+                bucket[token].append(key)
+    recursive_sibling_specs: dict[tuple[int, int], list[dict]] = {}
+    for (parent_id, operator), children in structural_children.items():
+        ordered_tokens = sorted(
+            children,
+            key=lambda token: min(
+                group_members[key][0] for key in children[token]
+            ),
+        )
+        axis = 0 if operator in {"⿰", "⿲"} else 1
+        for child_index, token in enumerate(ordered_tokens[1:], start=1):
+            child_keys = children[token]
+            predecessor_keys = [
+                key
+                for previous_token in ordered_tokens[:child_index]
+                for key in children[previous_token]
+            ]
+            # Structural scope belongs to the whole child subtree, not only
+            # to its first leaf.  Every descendant must remain on the proper
+            # side of all preceding sibling subtrees.
+            for current_key in child_keys:
+                recursive_sibling_specs.setdefault(current_key, []).append(
+                    {
+                        "parentId": parent_id,
+                        "operator": operator,
+                        "axis": axis,
+                        "predecessorKeys": predecessor_keys,
+                        "childKeys": child_keys,
+                    }
+                )
     for left in range(len(strokes)):
         for right in range(left):
             if group_keys[left] == group_keys[right] and expected_contact[left, right]:
@@ -2015,17 +2246,32 @@ def choose_routes(
     for current_index, current_options in enumerate(ranked):
         for previous_index in range(current_index):
             expected = bool(expected_contact[current_index, previous_index])
+            same_leaf_pair = (
+                group_keys[current_index][0] >= 0
+                and group_keys[current_index] == group_keys[previous_index]
+            )
             for current_rank, current_option in enumerate(current_options):
                 for previous_rank, previous_option in enumerate(ranked[previous_index]):
                     relation_cost = 0.0
                     contact_role_cost = 0.0
                     relative_position_cost = 0.0
                     notes = []
+                    # Unrelated leaves do not need an O(polyline²) contact
+                    # comparison for every local-route pair.  Any harmful
+                    # overlap is already charged by occupied-pixel reuse and
+                    # bounded by recursive IDS scope.  Exact contact remains
+                    # mandatory within a leaf and where the candidate grammar
+                    # explicitly declares a cross-leaf contact.
+                    if not same_leaf_pair and not expected:
+                        relation_cache[
+                            current_index,
+                            current_rank,
+                            previous_index,
+                            previous_rank,
+                        ] = (0.0, 0.0, 0.0, [], False, False)
+                        continue
                     observed = observed_contact(current_option, previous_option)
-                    same_leaf = (
-                        group_keys[current_index][0] >= 0
-                        and group_keys[current_index] == group_keys[previous_index]
-                    )
+                    same_leaf = same_leaf_pair
                     hard_contact_violation = same_leaf and expected != observed
                     hard_relative_order_violation = False
                     if expected and not observed:
@@ -2134,6 +2380,7 @@ def choose_routes(
             "usedHardContactFallback": False,
             "usedHardGeometryFallback": False,
             "usedFutureFeasibilityFallback": False,
+            "usedHardStructureFallback": False,
         }
     ]
 
@@ -2159,6 +2406,36 @@ def choose_routes(
                     for previous_route in selected_routes
                 )
                 if illegal:
+                    continue
+                future_key = group_keys[future_index]
+                future_scope_valid = True
+                for spec in recursive_sibling_specs.get(future_key, []):
+                    predecessor_indices = [
+                        member_index
+                        for predecessor_key in spec["predecessorKeys"]
+                        for member_index in group_members[predecessor_key]
+                        if member_index < len(selected_routes)
+                    ]
+                    if not predecessor_indices:
+                        continue
+                    axis = spec["axis"]
+                    predecessor_points = np.vstack(
+                        [selected_routes[member_index].points for member_index in predecessor_indices]
+                    )
+                    predecessor_boundary = float(
+                        np.max(predecessor_points[:, axis])
+                    )
+                    future_front = float(np.min(future_option.points[:, axis]))
+                    separation = (
+                        future_front - predecessor_boundary
+                    ) / float(route_spans[axis])
+                    # Sibling boxes may overlap modestly (撇 often reaches
+                    # back under the preceding child), but a future child
+                    # cannot be swallowed deep inside the current subtree.
+                    if separation < -0.14:
+                        future_scope_valid = False
+                        break
+                if not future_scope_valid:
                     continue
                 has_legal_option = True
                 break
@@ -2195,7 +2472,16 @@ def choose_routes(
                 if compatible_fronts:
                     diagonal_front = min(compatible_fronts)
             for option_rank, option in enumerate(options):
-                score = state["score"] + option.score
+                # Coarse connected-island membership is deliberately applied
+                # only at whole-universe selection time.  Applying it during
+                # local ranking can prune a semantically correct road before
+                # recursive IDS and future-sibling evidence is available
+                # (U+64CF-H).  It remains a weak tie-breaker here.
+                score = (
+                    state["score"]
+                    + option.score
+                    + float(option.evidence.get("componentLabelRecoveryCost", 0.0))
+                )
                 shared = len(state["occupied"] & option.pixels)
                 relation_cost = 0.0
                 contact_role_cost = 0.0
@@ -2277,10 +2563,241 @@ def choose_routes(
                             "leaf-centroid-first-stroke:"
                             f"{leaf_centroid_evidence['preferredStroke']}"
                         )
+                root_structure_scan_cost = 0.0
+                hard_root_structure_violation = False
+                root_structure_scan_evidence = {
+                    "enabled": False,
+                    "reason": "not-first-root-child-completion",
+                }
+                if (
+                    root_scan_vector is not None
+                    and group_keys[index] == first_group_key
+                    and group_last_index[first_group_key] == index
+                ):
+                    member_indices = group_members[first_group_key]
+                    member_routes = [
+                        option if member_index == index else state["routes"][member_index]
+                        for member_index in member_indices
+                    ]
+                    member_points = np.vstack([route.points for route in member_routes])
+                    observed_front = float(
+                        np.min(member_points @ root_scan_vector)
+                    )
+                    normalized_gap = max(
+                        0.0,
+                        (observed_front - float(root_scan_min))
+                        / float(root_scan_span),
+                    )
+                    # The root's first child must live on the root scan front.
+                    # A small margin tolerates calligraphic caps and skeleton
+                    # pruning; landing in the opposite structural region is a
+                    # hard contradiction, not a weak optical preference.
+                    root_structure_scan_cost = 8.0 * normalized_gap
+                    hard_root_structure_violation = normalized_gap > 0.22
+                    root_structure_scan_evidence = {
+                        "enabled": True,
+                        "operator": root_operator,
+                        "vector": [float(value) for value in root_scan_vector],
+                        "globalFront": round(float(root_scan_min), 5),
+                        "observedFront": round(observed_front, 5),
+                        "normalizedGap": round(normalized_gap, 5),
+                        "hardViolation": hard_root_structure_violation,
+                    }
+                    if normalized_gap > 0.03:
+                        relation_notes.append(
+                            f"root-structure-scan-front:{normalized_gap:.2f}"
+                        )
+                recursive_structure_scan_cost = 0.0
+                hard_recursive_structure_violation = False
+                recursive_structure_scan_evidence = {
+                    "enabled": False,
+                    "reason": "not-first-child-of-recursive-structure",
+                }
+                recursive_spec = recursive_scan_specs.get(group_keys[index])
+                if (
+                    recursive_spec is not None
+                    and group_last_index[group_keys[index]] == index
+                ):
+                    recursive_structure_scan_evidence = {
+                        "enabled": False,
+                        "reason": "deferred-until-complete-leaf-universes",
+                        "parentId": recursive_spec["parentId"],
+                        "operator": recursive_spec["operator"],
+                        "vector": [float(value) for value in recursive_spec["vector"]],
+                    }
+                recursive_sibling_order_cost = 0.0
+                hard_recursive_sibling_violation = False
+                recursive_sibling_evidence = {
+                    "enabled": False,
+                    "reason": "not-first-leaf-of-later-structural-child",
+                }
+                sibling_specs = recursive_sibling_specs.get(group_keys[index], [])
+                if sibling_specs and group_last_index[group_keys[index]] == index:
+                    current_member_indices = group_members[group_keys[index]]
+                    current_routes = [
+                        option if member_index == index else state["routes"][member_index]
+                        for member_index in current_member_indices
+                    ]
+                    current_points = np.vstack([route.points for route in current_routes])
+                    sibling_audits = []
+                    for spec in sibling_specs:
+                        predecessor_indices = [
+                            member_index
+                            for predecessor_key in spec["predecessorKeys"]
+                            for member_index in group_members[predecessor_key]
+                            if member_index < index
+                        ]
+                        if not predecessor_indices:
+                            continue
+                        predecessor_points = np.vstack(
+                            [state["routes"][member_index].points for member_index in predecessor_indices]
+                        )
+                        axis = spec["axis"]
+                        current_front = float(np.min(current_points[:, axis]))
+                        predecessor_boundary = float(np.max(predecessor_points[:, axis]))
+                        separation = (
+                            current_front - predecessor_boundary
+                        ) / float(route_spans[axis])
+                        cross_axis = 1 - axis
+                        child_last_index = max(
+                            member_index
+                            for child_key in spec["childKeys"]
+                            for member_index in group_members[child_key]
+                        )
+                        cross_alignment_checked = index == child_last_index
+                        cross_overlap = None
+                        normalized_cross_center_gap = None
+                        hard_cross_misalignment = False
+                        if cross_alignment_checked:
+                            child_indices = [
+                                member_index
+                                for child_key in spec["childKeys"]
+                                for member_index in group_members[child_key]
+                            ]
+                            child_routes = [
+                                option
+                                if member_index == index
+                                else state["routes"][member_index]
+                                for member_index in child_indices
+                            ]
+                            child_points = np.vstack(
+                                [route.points for route in child_routes]
+                            )
+                            predecessor_cross_min = float(
+                                np.min(predecessor_points[:, cross_axis])
+                            )
+                            predecessor_cross_max = float(
+                                np.max(predecessor_points[:, cross_axis])
+                            )
+                            current_cross_min = float(
+                                np.min(child_points[:, cross_axis])
+                            )
+                            current_cross_max = float(
+                                np.max(child_points[:, cross_axis])
+                            )
+                            predecessor_cross_span_raw = (
+                                predecessor_cross_max - predecessor_cross_min
+                            )
+                            current_cross_span_raw = (
+                                current_cross_max - current_cross_min
+                            )
+                            if min(
+                                predecessor_cross_span_raw,
+                                current_cross_span_raw,
+                            ) >= 0.08 * float(route_spans[cross_axis]):
+                                cross_intersection = max(
+                                    0.0,
+                                    min(predecessor_cross_max, current_cross_max)
+                                    - max(predecessor_cross_min, current_cross_min),
+                                )
+                                cross_overlap = cross_intersection / min(
+                                    predecessor_cross_span_raw,
+                                    current_cross_span_raw,
+                                )
+                                normalized_cross_center_gap = abs(
+                                    0.5 * (current_cross_min + current_cross_max)
+                                    - 0.5
+                                    * (
+                                        predecessor_cross_min
+                                        + predecessor_cross_max
+                                    )
+                                ) / float(route_spans[cross_axis])
+                                hard_cross_misalignment = (
+                                    cross_overlap < 0.02
+                                    or normalized_cross_center_gap > 0.15
+                                )
+                        # A slanting stroke may overhang roughly ten percent
+                        # into the preceding sibling's axis-aligned box while
+                        # still belonging wholly to the later child (益's lower
+                        # 八 in U+6424-J).  Cross-axis alignment and whole-child
+                        # closure provide the complementary hard evidence.
+                        violation = max(0.0, -0.10 - separation)
+                        cross_violation = (
+                            0.0
+                            if cross_overlap is None
+                            else max(0.0, 0.08 - cross_overlap)
+                            + max(
+                                0.0,
+                                float(normalized_cross_center_gap or 0.0) - 0.08,
+                            )
+                        )
+                        recursive_sibling_order_cost += (
+                            8.0 * violation + 12.0 * cross_violation
+                        )
+                        # A linear IDS is two-dimensional: ⿱ children must
+                        # share horizontal territory and ⿰ children vertical
+                        # territory.  Axis order alone lets a lower 句 escape
+                        # sideways into 攵 while still being technically below
+                        # 艹 (the U+64CE-T failure).
+                        hard = separation < -0.14 or hard_cross_misalignment
+                        hard_recursive_sibling_violation = (
+                            hard_recursive_sibling_violation or hard
+                        )
+                        sibling_audits.append(
+                            {
+                                "parentId": spec["parentId"],
+                                "operator": spec["operator"],
+                                "axis": "x" if axis == 0 else "y",
+                                "predecessorBoundary": round(predecessor_boundary, 5),
+                                "currentFront": round(current_front, 5),
+                                "normalizedSeparation": round(separation, 5),
+                                "crossAxis": "y" if axis == 0 else "x",
+                                "crossAlignmentChecked": cross_alignment_checked,
+                                "crossAxisOverlap": (
+                                    None
+                                    if cross_overlap is None
+                                    else round(cross_overlap, 5)
+                                ),
+                                "normalizedCrossCenterGap": (
+                                    None
+                                    if normalized_cross_center_gap is None
+                                    else round(normalized_cross_center_gap, 5)
+                                ),
+                                "hardCrossAxisMisalignment": hard_cross_misalignment,
+                                "hardViolation": hard,
+                            }
+                        )
+                    if sibling_audits:
+                        recursive_sibling_evidence = {
+                            "enabled": True,
+                            **sibling_audits[0],
+                            "constraints": sibling_audits,
+                        }
+                        if recursive_sibling_order_cost > 0.08:
+                            relation_notes.append(
+                                "recursive-sibling-order:"
+                                f"{sibling_audits[0]['parentId']}:"
+                                f"{sibling_audits[0]['normalizedSeparation']:.2f}"
+                            )
                 reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
                 hard_reuse_violation = any(
-                    route_reuse_ratio(option, previous_route) >= 0.72
-                    for previous_route in state["routes"]
+                    route_reuse_ratio(option, previous_route)
+                    >= (
+                        0.40
+                        if group_keys[previous_index] == group_keys[index]
+                        else 0.72
+                    )
+                    for previous_index, previous_route in enumerate(state["routes"])
                 )
                 if hard_reuse_violation:
                     relation_notes.append("duplicate-route-reuse")
@@ -2294,6 +2811,9 @@ def choose_routes(
                     + structural_order_cost
                     + diagonal_front_cost
                     + leaf_centroid_cost
+                    + root_structure_scan_cost
+                    + recursive_structure_scan_cost
+                    + recursive_sibling_order_cost
                     + reuse_cost
                     - coverage_reward
                 )
@@ -2313,12 +2833,18 @@ def choose_routes(
                 hard_violation = (
                     hard_contact_violation
                     or hard_geometry_violation
+                    or hard_root_structure_violation
+                    or hard_recursive_structure_violation
+                    or hard_recursive_sibling_violation
                     or not future_feasible
                 )
                 destination = hard_fallback_beam if hard_violation else next_beam
                 fallback_penalty = (
                     (1000.0 if hard_contact_violation else 0.0)
                     + (1000.0 if hard_geometry_violation else 0.0)
+                    + (1000.0 if hard_root_structure_violation else 0.0)
+                    + (1000.0 if hard_recursive_structure_violation else 0.0)
+                    + (1000.0 if hard_recursive_sibling_violation else 0.0)
                     + (1000.0 if not future_feasible else 0.0)
                 )
                 destination.append(
@@ -2337,6 +2863,12 @@ def choose_routes(
                             "usedFutureFeasibilityFallback"
                         ]
                         or not future_feasible,
+                        "usedHardStructureFallback": state[
+                            "usedHardStructureFallback"
+                        ]
+                        or hard_root_structure_violation
+                        or hard_recursive_structure_violation
+                        or hard_recursive_sibling_violation,
                         "steps": state["steps"]
                         + [
                             {
@@ -2350,6 +2882,16 @@ def choose_routes(
                                 "diagonalFrontCost": round(diagonal_front_cost, 5),
                                 "leafCentroidOrderCost": round(leaf_centroid_cost, 5),
                                 "leafCentroidOrder": leaf_centroid_evidence,
+                                "rootStructureScanCost": round(root_structure_scan_cost, 5),
+                                "rootStructureScan": root_structure_scan_evidence,
+                                "recursiveStructureScanCost": round(
+                                    recursive_structure_scan_cost, 5
+                                ),
+                                "recursiveStructureScan": recursive_structure_scan_evidence,
+                                "recursiveSiblingOrderCost": round(
+                                    recursive_sibling_order_cost, 5
+                                ),
+                                "recursiveSiblingOrder": recursive_sibling_evidence,
                                 "reuseCost": round(reuse_cost, 5),
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
@@ -2367,6 +2909,56 @@ def choose_routes(
                 f"stroke {index + 1} has no globally feasible route hypothesis"
             )
         current_key = group_keys[index]
+        recursive_spec = recursive_scan_specs.get(current_key)
+        if recursive_spec is not None and group_last_index[current_key] == index:
+            member_indices = group_members[current_key]
+
+            def completed_leaf_front(state: dict) -> float:
+                points = np.vstack(
+                    [state["routes"][member_index].points for member_index in member_indices]
+                )
+                return float(np.min(points @ recursive_spec["vector"]))
+
+            observed_fronts = [completed_leaf_front(state) for state in next_beam]
+            available_front = min(observed_fronts)
+            structurally_valid = []
+            for state, observed_front in zip(next_beam, observed_fronts):
+                normalized_gap = max(
+                    0.0,
+                    (observed_front - available_front) / recursive_spec["span"],
+                )
+                cost = 8.0 * normalized_gap
+                # This scan is not yet clipped to the enclosing parent's
+                # ancestor domain.  It is therefore useful ranking evidence,
+                # but cannot be a hard gate: in U+64CE the globally earliest
+                # ⿹-like road belongs to the later 攵 sibling, not to 句.  The
+                # recursive sibling/ancestor constraints below decide the
+                # valid domain once that child subtree is complete.
+                hard_limit = (
+                    0.08
+                    if recursive_spec["operator"] in {"⿹", "⿸", "⿺", "⿵", "⿶", "⿷"}
+                    else 0.22
+                )
+                hard_violation = False
+                state["score"] += cost
+                state["steps"][-1]["recursiveStructureScanCost"] = round(cost, 5)
+                state["steps"][-1]["recursiveStructureScan"] = {
+                    "enabled": True,
+                    "parentId": recursive_spec["parentId"],
+                    "operator": recursive_spec["operator"],
+                    "vector": [float(value) for value in recursive_spec["vector"]],
+                    "availableFront": round(available_front, 5),
+                    "observedFront": round(observed_front, 5),
+                    "normalizedGap": round(normalized_gap, 5),
+                    "hardLimit": hard_limit,
+                    "hardViolation": hard_violation,
+                }
+                if normalized_gap > 0.03:
+                    state["steps"][-1]["notes"].append(
+                        f"recursive-structure-scan-front:"
+                        f"{recursive_spec['parentId']}:{normalized_gap:.2f}"
+                    )
+                structurally_valid.append(state)
         open_leaf_first = (
             group_members[current_key][0]
             if index < group_last_index[current_key]
@@ -2394,11 +2986,26 @@ def choose_routes(
         review_reasons.append("hard-geometry-fallback")
     if best["usedFutureFeasibilityFallback"]:
         review_reasons.append("future-feasibility-fallback")
+    if best["usedHardStructureFallback"]:
+        review_reasons.append("root-structure-scan-fallback")
+    root_scan_step = next(
+        (
+            step["rootStructureScan"]
+            for step in best["steps"]
+            if step.get("rootStructureScan", {}).get("enabled")
+        ),
+        {
+            "enabled": False,
+            "operator": root_operator or None,
+            "reason": "unsupported-or-missing-root-operator",
+        },
+    )
     return best["routes"], {
         "score": round(best["score"], 6),
         "beamWidth": 350,
         "coverageWeight": coverage_weight,
         "leafCentroidWeight": leaf_centroid_weight,
+        "rootStructureScan": root_scan_step,
         "unexplainedSkeletonPixels": unexplained_pixels,
         "unexplainedSkeletonRatio": round(unexplained_ratio, 6),
         "status": "needs-review" if review_reasons else "safe-candidate",
@@ -3411,7 +4018,11 @@ def main():
         learned_model=learned_model,
         excluded_training_case=excluded_training_case,
         source=args.source,
-        enforce_component_labels=args.decoder != "residual",
+        # Coarse PDF ink islands remain a weak prior, never a hard lock.
+        # rank_routes retains out-of-island recovery roads with a penalty so
+        # recursive IDS and whole-universe evidence can overrule a misleading
+        # centroid assignment.
+        enforce_component_labels=True,
     )
     normative_catalog = RESIDUAL_DECODER.ORDER.load_normative_catalog(
         args.stroke_order_catalog
@@ -3431,6 +4042,7 @@ def main():
             ranked,
             graph,
         )
+        ranked = compact_route_hypotheses(ranked)
     if any(not options for options in ranked):
         missing = [
             {
@@ -3559,6 +4171,7 @@ def main():
                 )
             ),
             "candidateGeometryUsedForTargetMask": False,
+            "candidateGeometryUsedForComponentIslandLock": False,
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,
             "beamWidth": args.beam_width if args.decoder == "residual" else None,
             "criticalNodeCount": len(graph.critical),
@@ -3638,7 +4251,7 @@ def main():
             json.dumps(audit, ensure_ascii=False, indent=2), "utf-8"
         )
     print(
-        json.dumps(audit, ensure_ascii=False, indent=2)
+        json.dumps(audit, ensure_ascii=True, indent=2)
     )
 
 
