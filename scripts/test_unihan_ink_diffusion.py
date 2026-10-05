@@ -15,6 +15,94 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_scan_seed_can_reach_a_distant_terminal_in_the_same_ink_island(self):
+        points = np.asarray([[0, index] for index in range(10)], dtype=int)
+        rows = []
+        columns = []
+        weights = []
+        for index in range(9):
+            rows.extend((index, index + 1))
+            columns.extend((index + 1, index))
+            weights.extend((1.0, 1.0))
+        crossing = np.full((1, 10), 2, dtype=np.uint8)
+        crossing[0, 9] = 1
+        graph = MODULE.SkeletonGraph(
+            points=points,
+            point_index={(0, index): index for index in range(10)},
+            matrix=MODULE.csr_matrix(
+                (weights, (rows, columns)), shape=(10, 10)
+            ),
+            critical=[(0, index) for index in range(10)],
+            components=np.ones((1, 10), dtype=np.int32),
+            crossing=crossing,
+            scan_seeds=((0, 0),),
+        )
+        routes = MODULE.all_routes(graph)
+        self.assertTrue(
+            any(
+                np.array_equal(route["points"][0], [0.0, 0.0])
+                and np.array_equal(route["points"][-1], [9.0, 0.0])
+                for route in routes
+            )
+        )
+
+    def test_compound_stroke_may_use_a_scan_seed_without_leaf_whitelisting(self):
+        key = (569, 0)
+        self.assertTrue(
+            MODULE.allows_diagonal_seed_route(
+                {"feature": "横折钩", "bendFractions": [0.2, 0.8]},
+                key,
+                set(),
+            )
+        )
+        self.assertFalse(
+            MODULE.allows_diagonal_seed_route(
+                {"feature": "横", "bendFractions": []},
+                key,
+                set(),
+            )
+        )
+        self.assertTrue(
+            MODULE.allows_diagonal_seed_route(
+                {"feature": "捺", "bendFractions": []},
+                key,
+                set(),
+                pen_down_touches_sibling=True,
+            )
+        )
+
+    def test_contact_start_prunes_a_dominated_suffix_route(self):
+        long = MODULE.RouteCandidate(
+            0,
+            2,
+            np.asarray([[0.0, 0.0], [5.0, 5.0], [10.0, 10.0]]),
+            frozenset((index, index) for index in range(11)),
+            1,
+            0.2,
+            {},
+        )
+        suffix = MODULE.RouteCandidate(
+            1,
+            2,
+            np.asarray([[5.0, 5.0], [10.0, 10.0]]),
+            frozenset((index, index) for index in range(5, 11)),
+            1,
+            0.4,
+            {},
+        )
+        self.assertEqual(
+            MODULE.prune_dominated_contact_start_suffixes(
+                [suffix, long], pen_down_touches_sibling=True
+            ),
+            [long],
+        )
+        self.assertEqual(
+            MODULE.prune_dominated_contact_start_suffixes(
+                [suffix, long], pen_down_touches_sibling=False
+            ),
+            [suffix, long],
+        )
+
     def test_open_leaf_beam_keeps_each_first_stroke_universe(self):
         states = []
         for first_rank in range(4):
@@ -304,6 +392,53 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(len(guarded[0]), 1)
         np.testing.assert_array_equal(guarded[0][0].points, falling_left.points)
         self.assertEqual(audit[0]["rejectedOppositeDirection"], 1)
+
+    def test_falling_left_stroke_rejects_a_westbound_initial_trunk(self):
+        west_then_falling = np.asarray(
+            [[10.0, 0.0], [2.0, 0.0], [1.0, 3.0], [0.0, 20.0]]
+        )
+        falling_from_pen_down = np.asarray(
+            [[10.0, 0.0], [9.0, 2.0], [5.0, 10.0], [0.0, 20.0]]
+        )
+        self.assertFalse(
+            MODULE.semantic_direction_compatible("撇", "SW", west_then_falling)
+        )
+        self.assertTrue(
+            MODULE.semantic_direction_compatible("撇", "SW", falling_from_pen_down)
+        )
+
+    def test_order_guard_trims_a_calligraphic_cap_before_a_falling_left_trunk(self):
+        points = np.asarray(
+            [[10.0, 0.0], [8.0, 0.0], [6.0, 0.0], [5.0, 2.0], [0.0, 20.0]]
+        )
+        option = MODULE.RouteCandidate(
+            0,
+            1,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            7,
+            0.0,
+            {},
+        )
+        strokes = [
+            {
+                "componentId": 7,
+                "occurrence": 0,
+                "feature": "撇",
+                "points": np.asarray([[5.0, 0.0], [0.0, 20.0]]),
+            }
+        ]
+        guarded, _audit = MODULE.apply_stroke_order_guard(
+            strokes,
+            [[option]],
+            source="J",
+            codepoint=0x6726,
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        self.assertLessEqual(float(guarded[0][0].points[0, 0]), 6.0)
+        self.assertTrue(
+            guarded[0][0].evidence.get("trimmedInitialSemanticSpur", False)
+        )
 
     def test_hybrid_order_guard_does_not_restore_an_opposite_hard_direction(self):
         points = np.asarray([[8.0, 2.0], [0.0, 2.0]])
@@ -965,6 +1100,32 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertIs(routes[0], long)
         self.assertEqual(decision["unexplainedSkeletonPixels"], 1)
         self.assertEqual(decision["status"], "safe-candidate")
+
+    def test_severely_incomplete_stroke_cannot_win_with_a_better_local_score(self):
+        stroke = {"points": np.asarray([[0.0, 0.0], [10.0, 0.0]])}
+        short = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [2.0, 0.0]]),
+            frozenset({(0, 0), (1, 0), (2, 0)}),
+            1,
+            -20.0,
+            {"candidateLengthFraction": 0.5, "routeLengthFraction": 0.1},
+        )
+        complete = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 1.0], [9.0, 1.0]]),
+            frozenset((x, 1) for x in range(10)),
+            1,
+            0.0,
+            {"candidateLengthFraction": 0.5, "routeLengthFraction": 0.48},
+        )
+        routes, decision = MODULE.choose_routes(
+            [stroke], [[short, complete]], total_skeleton_pixels=13
+        )
+        self.assertIs(routes[0], complete)
+        self.assertFalse(decision["steps"][0]["hardIncompleteStroke"])
 
     def test_large_unexplained_skeleton_forces_review(self):
         stroke = {"points": np.asarray([[0.0, 0.0], [1.0, 0.0]])}

@@ -311,12 +311,102 @@ def semantic_direction_compatible(
     points = np.asarray(points, dtype=float)
     if feature != "撇" or len(points) < 2:
         return True
-    displacement = points[-1] - points[0]
+    # The whole route may eventually travel left and down even after taking an
+    # illegal westbound branch at pen-down.  Judge the initial *main trunk*,
+    # not only the final displacement.  This prevents a cap or a neighbouring
+    # horizontal from masquerading as the beginning of 撇 (U+6726-J).
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    total = float(lengths.sum())
+    if total <= 1e-6:
+        return False
+    # Roughly the first two skeleton pixels describe the pen-down tangent.
+    # Looking much farther ahead lets a long later descent excuse an illegal
+    # horizontal entry; looking at one raster step is too sensitive to an
+    # alternating staircase on a genuine diagonal.
+    target = min(total, max(1.0, min(2.0, total * 0.08)))
+    cumulative = 0.0
+    prefix_end = points[-1]
+    for start, end, length in zip(points[:-1], points[1:], lengths):
+        if cumulative + float(length) >= target and length > 1e-6:
+            ratio = (target - cumulative) / float(length)
+            prefix_end = start + ratio * (end - start)
+            break
+        cumulative += float(length)
+    displacement = prefix_end - points[0]
     length = float(np.linalg.norm(displacement))
     return bool(
         length > 1e-6
-        and float(displacement[0]) < -0.18 * length
-        and float(displacement[1]) > 0.18 * length
+        and float(displacement[0]) < -0.12 * length
+        and float(displacement[1]) > 0.12 * length
+    )
+
+
+def allows_diagonal_seed_route(
+    stroke: dict,
+    key: tuple[int, int],
+    diagonal_seed_leaves: set[tuple[int, int]],
+    pen_down_touches_sibling: bool = False,
+) -> bool:
+    """Whether a local scan-front point may act as this pen's logical start.
+
+    Simple strokes only use the narrowly proven leaf families.  A compound
+    stroke with explicit candidate bend landmarks may also start at a
+    degree-two corner: otherwise a real 横折钩 whose pen-down is not a graph
+    endpoint can never exist in the route universe.
+    """
+    return (
+        key in diagonal_seed_leaves
+        or bool(stroke.get("bendFractions"))
+        or pen_down_touches_sibling
+    )
+
+
+def trim_initial_semantic_spur(
+    option: RouteCandidate,
+    feature: str,
+    expected_sector: str,
+    maximum_fraction: float = 0.22,
+) -> RouteCandidate:
+    """Move logical pen-down past a decorative cap or false entry branch.
+
+    Owned ink is intentionally unchanged: the cap still receives the stroke's
+    colour during width restoration.  Only the directed centreline begins at
+    the first suffix whose initial trunk obeys the named stroke grammar.
+    """
+    if semantic_direction_compatible(feature, expected_sector, option.points):
+        return option
+    points = np.asarray(option.points, dtype=float)
+    if len(points) < 4:
+        return option
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(lengths)]
+    total = float(cumulative[-1])
+    if total <= 1e-6:
+        return option
+    chosen = None
+    for index in range(1, len(points) - 2):
+        if float(cumulative[index] / total) > maximum_fraction:
+            break
+        if semantic_direction_compatible(feature, expected_sector, points[index:]):
+            chosen = index
+            break
+    if chosen is None:
+        return option
+    return RouteCandidate(
+        start_node=option.start_node,
+        end_node=option.end_node,
+        points=points[chosen:],
+        pixels=option.pixels,
+        component=option.component,
+        score=option.score,
+        evidence={
+            **option.evidence,
+            "trimmedInitialSemanticSpur": True,
+            "trimmedInitialSemanticSpurPixels": chosen,
+            "trimmedInitialSemanticSpurFraction": round(
+                float(cumulative[chosen] / total), 5
+            ),
+        },
     )
 
 
@@ -348,15 +438,24 @@ def all_routes(graph: SkeletonGraph) -> list[dict]:
         y, x = graph.points[seed]
         component = int(graph.components[y, x])
         local = []
+        terminal_nodes = set()
         for node in base_nodes:
             other_y, other_x = graph.points[node]
             if int(graph.components[other_y, other_x]) != component:
                 continue
             distance = math.hypot(float(other_y - y), float(other_x - x))
             local.append((distance, node))
+            if int(graph.crossing[other_y, other_x]) == 1:
+                terminal_nodes.add(node)
+        # A degree-two scan seed can be the logical pen-down of a long
+        # compound stroke.  Its pen-up is then a distant true endpoint, not
+        # one of the six closest junctions (for example 月's 横折钩 in
+        # U+6726-J).  Endpoints are bounded and semantically meaningful, so
+        # retaining all of them in the same ink island adds the missing
+        # universe without reconnecting every seed to every junction.
         seed_neighbours[seed] = {
             node for _distance, node in sorted(local)[:6]
-        }
+        } | terminal_nodes
     adjacency = graph_adjacency(graph.matrix)
     degrees = np.asarray([len(items) for items in adjacency])
     routes = []
@@ -1110,19 +1209,23 @@ def rank_routes(
 
     candidate_contacts = stroke_contact_matrix(strokes)
     diagonal_seed_leaves = diagonal_front_leaf_keys(strokes, candidate_contacts)
+    candidate_start_is_contact = []
     candidate_end_is_contact = []
     for index, stroke in enumerate(strokes):
-        constrained = False
+        start_constrained = False
+        end_constrained = False
         for other_index, other in enumerate(strokes):
             if index == other_index or not candidate_contacts[index, other_index]:
                 continue
             current_fraction, _other_fraction, _distance = contact_signature(
                 stroke["points"], other["points"]
             )
+            if current_fraction <= 0.16:
+                start_constrained = True
             if current_fraction >= 0.84:
-                constrained = True
-                break
-        candidate_end_is_contact.append(constrained)
+                end_constrained = True
+        candidate_start_is_contact.append(start_constrained)
+        candidate_end_is_contact.append(end_constrained)
 
     adjacency = graph_adjacency(graph.matrix)
     signatures = stroke_rule_signatures(strokes)
@@ -1159,7 +1262,12 @@ def rank_routes(
             # merely to terminate at a seed.
             if route.get("diagonalFrontSeedAtEnd") or (
                 route.get("diagonalFrontSeed")
-                and key not in diagonal_seed_leaves
+                and not allows_diagonal_seed_route(
+                    stroke,
+                    key,
+                    diagonal_seed_leaves,
+                    candidate_start_is_contact[stroke_index],
+                )
             ):
                 continue
             component_allowed = route["component"] in allowed_components[key]
@@ -1259,6 +1367,10 @@ def rank_routes(
             # routes (U+64CE-T).
             options.extend(component_recovery_options)
             options.sort(key=lambda item: item.score)
+        options = prune_dominated_contact_start_suffixes(
+            options,
+            candidate_start_is_contact[stroke_index],
+        )
         if not options:
             ranked.append([])
             continue
@@ -1383,6 +1495,11 @@ def apply_stroke_order_guard(
         observed_sector_counts: dict[str, int] = {}
         for option in options:
             option = trim_initial_medial_spur(option, expectation.expected_sector)
+            option = trim_initial_semantic_spur(
+                option,
+                expectation.feature,
+                expectation.expected_sector,
+            )
             observed = order.direction_sector(option.points, fraction=0.08)
             observed_sector_counts[observed] = observed_sector_counts.get(observed, 0) + 1
             if semantic_direction_compatible(
@@ -1924,6 +2041,52 @@ def route_reuse_ratio(first: RouteCandidate, second: RouteCandidate) -> float:
     )
 
 
+def route_completion_ratio(option: RouteCandidate) -> float | None:
+    """Length completeness relative to the scale-free candidate stroke.
+
+    Candidate and PDF lengths are each normalized by their own glyph diagonal,
+    so this is not a coordinate transfer.  It only rejects a tiny skeleton
+    twig pretending to be a complete semantic stroke.
+    """
+    expected = option.evidence.get("candidateLengthFraction")
+    observed = option.evidence.get("routeLengthFraction")
+    if expected is None or observed is None or float(expected) <= 1e-6:
+        return None
+    return max(0.0, float(observed) / float(expected))
+
+
+def prune_dominated_contact_start_suffixes(
+    options: list[RouteCandidate],
+    pen_down_touches_sibling: bool,
+    minimum_extension_ratio: float = 1.18,
+    minimum_suffix_overlap: float = 0.92,
+) -> list[RouteCandidate]:
+    """Remove a timid mid-stroke start dominated by its complete prefix route.
+
+    This is deliberately limited to strokes whose candidate grammar says the
+    pen-down touches a sibling.  A locally no-worse route with the same pen-up
+    that contains almost the whole short route plus an upstream prefix makes
+    that short route premature convergence, not another valid universe.
+    """
+    if not pen_down_touches_sibling or len(options) < 2:
+        return options
+    kept = []
+    for short in options:
+        short_length = max(1, len(short.pixels))
+        dominated = any(
+            long is not short
+            and long.score <= short.score + 1e-9
+            and len(long.pixels) >= short_length * minimum_extension_ratio
+            and float(np.linalg.norm(long.points[-1] - short.points[-1])) <= 2.5
+            and len(long.pixels & short.pixels) / short_length
+            >= minimum_suffix_overlap
+            for long in options
+        )
+        if not dominated:
+            kept.append(short)
+    return kept or options
+
+
 def leaf_centroid_order_cost(
     strokes: list[dict],
     routes: list[RouteCandidate],
@@ -2401,6 +2564,9 @@ def choose_routes(
         for future_index in range(next_index, len(ranked)):
             has_legal_option = False
             for future_option in ranked[future_index]:
+                future_completion = route_completion_ratio(future_option)
+                if future_completion is not None and future_completion < 0.42:
+                    continue
                 illegal = any(
                     route_reuse_ratio(future_option, previous_route) >= 0.72
                     for previous_route in selected_routes
@@ -2801,6 +2967,23 @@ def choose_routes(
                 )
                 if hard_reuse_violation:
                     relation_notes.append("duplicate-route-reuse")
+                completion_ratio = route_completion_ratio(option)
+                incomplete_stroke_cost = (
+                    0.0
+                    if completion_ratio is None
+                    else 4.0 * max(0.0, 0.82 - completion_ratio)
+                )
+                hard_incomplete_stroke = (
+                    completion_ratio is not None and completion_ratio < 0.42
+                )
+                if hard_incomplete_stroke:
+                    relation_notes.append(
+                        f"severely-incomplete-stroke:{completion_ratio:.2f}"
+                    )
+                elif incomplete_stroke_cost > 0.08:
+                    relation_notes.append(
+                        f"incomplete-stroke:{completion_ratio:.2f}"
+                    )
                 new_pixels = len(option.pixels - state["occupied"])
                 new_coverage = new_pixels / max(1, len(option.pixels))
                 coverage_reward = coverage_weight * new_pixels / max(1, total_skeleton_pixels)
@@ -2815,6 +2998,7 @@ def choose_routes(
                     + recursive_structure_scan_cost
                     + recursive_sibling_order_cost
                     + reuse_cost
+                    + incomplete_stroke_cost
                     - coverage_reward
                 )
                 if hard_contact_violation:
@@ -2828,7 +3012,9 @@ def choose_routes(
                 if not future_feasible:
                     relation_notes.append("remaining-route-infeasible")
                 hard_geometry_violation = (
-                    hard_relative_order_violation or hard_reuse_violation
+                    hard_relative_order_violation
+                    or hard_reuse_violation
+                    or hard_incomplete_stroke
                 )
                 hard_violation = (
                     hard_contact_violation
@@ -2893,6 +3079,15 @@ def choose_routes(
                                 ),
                                 "recursiveSiblingOrder": recursive_sibling_evidence,
                                 "reuseCost": round(reuse_cost, 5),
+                                "strokeCompletionRatio": (
+                                    None
+                                    if completion_ratio is None
+                                    else round(completion_ratio, 5)
+                                ),
+                                "incompleteStrokeCost": round(
+                                    incomplete_stroke_cost, 5
+                                ),
+                                "hardIncompleteStroke": hard_incomplete_stroke,
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
                                 "coverageReward": round(coverage_reward, 5),
