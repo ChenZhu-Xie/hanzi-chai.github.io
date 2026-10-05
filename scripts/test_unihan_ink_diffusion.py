@@ -1055,6 +1055,17 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertIn("document.querySelectorAll('.pdf-source-fit').forEach(fitPdfSource)", page)
         self.assertIn("红点＝模型笔尖", page)
         self.assertIn("青点＝人工笔尖", page)
+        self.assertIn("Shift＋滚轮＝全页正倒放", page)
+        self.assertIn("function scrubTimeline(event)", page)
+        self.assertIn(
+            "if(!event.shiftKey||event.ctrlKey||event.altKey||event.metaKey)return",
+            page,
+        )
+        self.assertIn(
+            "document.addEventListener('wheel',scrubTimeline,{passive:false})",
+            page,
+        )
+        self.assertIn("event.preventDefault();stopPlayback()", page)
         self.assertIn("perStrokeTrajectoryAudit", page)
         self.assertIn("function arcLengthPrefix(points,fraction)", page)
         self.assertIn("if(clamped>=1)return points.slice()", page)
