@@ -226,7 +226,11 @@ def total_turn(points: np.ndarray) -> float:
     length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
     simplified = cv2.approxPolyDP(
         np.asarray(points, dtype=np.float32).reshape(-1, 1, 2),
-        epsilon=max(1.5, length * 0.012),
+        # A PDF skeleton acquires tiny up/down detours at every crossing.  At
+        # the previous 1.2% scale those nubs made one straight 皿 baseline look
+        # like four full turns.  Three percent is still far below a genuine
+        # component-scale corner while suppressing junction-sized noise.
+        epsilon=max(2.0, length * 0.03),
         closed=False,
     ).reshape(-1, 2)
     if len(simplified) < 3:
@@ -249,6 +253,34 @@ def polyline_distance(first: np.ndarray, second: np.ndarray) -> float:
 def normalized_point(point: np.ndarray, bounds: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
     minimum, maximum = bounds
     return (point - minimum) / np.maximum(maximum - minimum, 1.0)
+
+
+def semantic_direction_compatible(
+    feature: str,
+    expected_sector: str,
+    points: np.ndarray,
+) -> bool:
+    """Check the named stroke's directed displacement, not only its octant.
+
+    The generic sector tolerance admits one neighbouring octant for raster
+    noise.  For 撇 that would also admit a purely horizontal westbound road,
+    even though a real 撇 must make material progress both leftward and
+    downward.  This invariant is independent of exact font geometry.
+    """
+    order = RESIDUAL_DECODER.ORDER
+    observed = order.direction_sector(points, fraction=0.08)
+    if not order.sector_compatible(expected_sector, observed):
+        return False
+    points = np.asarray(points, dtype=float)
+    if feature != "撇" or len(points) < 2:
+        return True
+    displacement = points[-1] - points[0]
+    length = float(np.linalg.norm(displacement))
+    return bool(
+        length > 1e-6
+        and float(displacement[0]) < -0.18 * length
+        and float(displacement[1]) > 0.18 * length
+    )
 
 
 @dataclass
@@ -988,9 +1020,9 @@ def rank_routes(
             source=source,
         )
         options = []
+        component_recovery_options = []
         for route in raw_routes:
-            if enforce_component_labels and route["component"] not in allowed_components[key]:
-                continue
+            component_allowed = route["component"] in allowed_components[key]
             direction = direction_dtw(stroke["points"], route["points"])
             turn = abs(total_turn(route["points"]) - expected_turn) / math.pi
             route_start = normalized_point(route["points"][0], target_glyph_bounds)
@@ -1009,15 +1041,18 @@ def rank_routes(
             learned_cost, learned_evidence = route_learned_cost(
                 route, graph, learned_rule, target_glyph_bounds
             )
+            component_recovery_cost = (
+                0.6 if enforce_component_labels and not component_allowed else 0.0
+            )
             score = (
                 5.0 * direction
                 + 0.8 * turn
                 + ordinal_weight * ordinal
                 + premature_stop_cost
                 + learned_cost
+                + component_recovery_cost
             )
-            options.append(
-                RouteCandidate(
+            candidate = RouteCandidate(
                     start_node=route["startNode"],
                     end_node=route["endNode"],
                     points=route["points"],
@@ -1034,11 +1069,20 @@ def rank_routes(
                         "routeLengthFraction": round(route_length_fraction, 5),
                         "learnedRuleSignature": signatures[stroke_index]["key"],
                         "learnedCost": round(learned_cost, 5),
+                        "componentLabelAllowed": component_allowed,
+                        "componentLabelRecoveryCost": component_recovery_cost,
                         **learned_evidence,
                     },
                 )
-            )
+            if enforce_component_labels and not component_allowed:
+                component_recovery_options.append(candidate)
+            else:
+                options.append(candidate)
         options.sort(key=lambda item: item.score)
+        component_recovery_options.sort(key=lambda item: item.score)
+        if not options:
+            options = component_recovery_options
+            component_recovery_options = []
         if not options:
             ranked.append([])
             continue
@@ -1051,7 +1095,63 @@ def rank_routes(
             for item in options
             if item.evidence["directionGrammar"] <= best_direction + 0.22
         ]
-        ranked.append(compatible[:48])
+        # Do not let a local template-DTW winner erase every route in another
+        # pen-down direction before the semantic stroke-order guard runs.  A
+        # connected neighbouring component can make the wrong road look more
+        # like the candidate globally (notably the two strokes of 八).  Keep a
+        # small, score-ordered reserve for every observed start sector so the
+        # whole-character decoder can backtrack into the correct universe.
+        retained = list(compatible[:48])
+        retained_ids = {id(item) for item in retained}
+        sector_counts: dict[str, int] = {}
+        order = RESIDUAL_DECODER.ORDER
+        for item in options:
+            sector = order.direction_sector(item.points, fraction=0.08)
+            if sector_counts.get(sector, 0) >= 12:
+                continue
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            if id(item) not in retained_ids:
+                retained.append(item)
+                retained_ids.add(id(item))
+        expected_sector = RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
+            str(stroke.get("feature") or ""),
+            "unknown",
+        )
+        recovered = []
+        recovered_paths: set[tuple[tuple[int, int], ...]] = set()
+        for item in component_recovery_options:
+            normalized = trim_initial_medial_spur(item, expected_sector)
+            if semantic_direction_compatible(
+                str(stroke.get("feature") or ""),
+                expected_sector,
+                normalized.points,
+            ):
+                path_key = tuple(
+                    (int(round(float(x))), int(round(float(y))))
+                    for x, y in normalized.points
+                )
+                if path_key in recovered_paths:
+                    continue
+                recovered_paths.add(path_key)
+                recovered.append(
+                    RouteCandidate(
+                        start_node=item.start_node,
+                        end_node=item.end_node,
+                        points=item.points,
+                        pixels=item.pixels,
+                        component=item.component,
+                        score=item.score,
+                        evidence={
+                            **item.evidence,
+                            "recoveredAcrossConnectedComponentBoundary": True,
+                        },
+                    )
+                )
+            if len(recovered) >= 24:
+                break
+        retained.extend(recovered)
+        retained.sort(key=lambda item: item.score)
+        ranked.append(retained)
     return ranked
 
 
@@ -1065,11 +1165,10 @@ def apply_stroke_order_guard(
     """Add stroke-order knowledge without replacing the classic decoder.
 
     Candidate geometry already supplies a directed stroke grammar.  This guard
-    makes its pen-down direction explicit and source-auditable.  It rejects an
-    opposite/quarter-turn start only when another classic candidate remains;
-    otherwise it preserves the complete classic set and reports the conflict.
-    That fallback is deliberate: incomplete source conventions must never
-    erase the formerly successful global solution.
+    makes its pen-down direction explicit and source-auditable.  A direction
+    backed by hard semantic/repository evidence stays hard even when every
+    locally preferred road disagrees: restoring those opposite roads would
+    make a 撇 consume a 捺 and prevents whole-character backtracking.
     """
     order = RESIDUAL_DECODER.ORDER
     expectations = order.compile_stroke_expectations(
@@ -1083,10 +1182,16 @@ def apply_stroke_order_guard(
     for expectation, options in zip(expectations, ranked):
         compatible = []
         rejected = []
+        observed_sector_counts: dict[str, int] = {}
         for option in options:
             option = trim_initial_medial_spur(option, expectation.expected_sector)
             observed = order.direction_sector(option.points, fraction=0.08)
-            if order.sector_compatible(expectation.expected_sector, observed):
+            observed_sector_counts[observed] = observed_sector_counts.get(observed, 0) + 1
+            if semantic_direction_compatible(
+                expectation.feature,
+                expectation.expected_sector,
+                option.points,
+            ):
                 evidence = {
                     **option.evidence,
                     "strokeOrderExpectedSector": expectation.expected_sector,
@@ -1114,7 +1219,15 @@ def apply_stroke_order_guard(
                 )
             else:
                 rejected.append(option)
-        fallback = bool(options) and not compatible
+        hard_direction_constraint = any(
+            bool(item.hard)
+            and item.rule in {
+                "semantic-pen-down-direction",
+                "candidate-stroke-order-and-direction",
+            }
+            for item in expectation.evidence
+        )
+        fallback = bool(options) and not compatible and not hard_direction_constraint
         guarded.append(list(options) if fallback else compatible)
         audit.append(
             {
@@ -1125,7 +1238,9 @@ def apply_stroke_order_guard(
                 "classicCandidateCount": len(options),
                 "acceptedCandidateCount": len(options) if fallback else len(compatible),
                 "rejectedOppositeDirection": len(rejected),
+                "observedSectorCounts": observed_sector_counts,
                 "fallbackToClassicCandidates": fallback,
+                "hardDirectionConstraint": hard_direction_constraint,
                 "evidence": [
                     {
                         "level": item.level,
@@ -1506,6 +1621,37 @@ def relative_stroke_signature(first: np.ndarray, second: np.ndarray) -> np.ndarr
     return np.r_[displacement, overlap]
 
 
+def violates_strong_relative_axis_order(
+    expected: np.ndarray,
+    observed: np.ndarray,
+    minimum_expected_separation: float = 0.18,
+    minimum_observed_separation: float = 0.035,
+) -> bool:
+    """Whether a clear candidate left/right or above/below order collapsed.
+
+    The candidate's scale and exact placement are untrusted, but a strong
+    internal order such as 八's 撇 being left of its 捺 is structural.  Reversal
+    *or collapse onto the same road* is therefore a hard contradiction.
+    """
+    expected = np.asarray(expected, dtype=float)
+    observed = np.asarray(observed, dtype=float)
+    for axis in (0, 1):
+        reference = float(expected[axis])
+        if abs(reference) < minimum_expected_separation:
+            continue
+        aligned = math.copysign(1.0, reference) * float(observed[axis])
+        if aligned < minimum_observed_separation:
+            return True
+    return False
+
+
+def route_reuse_ratio(first: RouteCandidate, second: RouteCandidate) -> float:
+    """Fraction of the shorter centreline already consumed by another pen."""
+    return len(first.pixels & second.pixels) / max(
+        1, min(len(first.pixels), len(second.pixels))
+    )
+
+
 def choose_routes(
     strokes: list[dict],
     ranked: list[list[RouteCandidate]],
@@ -1569,7 +1715,8 @@ def choose_routes(
                     strokes[current]["points"], strokes[previous]["points"]
                 )[:2]
     relation_cache: dict[
-        tuple[int, int, int, int], tuple[float, float, float, list[str], bool]
+        tuple[int, int, int, int],
+        tuple[float, float, float, list[str], bool, bool],
     ] = {}
     for current_index, current_options in enumerate(ranked):
         for previous_index in range(current_index):
@@ -1586,6 +1733,7 @@ def choose_routes(
                         and group_keys[current_index] == group_keys[previous_index]
                     )
                     hard_contact_violation = same_leaf and expected != observed
+                    hard_relative_order_violation = False
                     if expected and not observed:
                         relation_cost += 0.25
                         notes.append(f"missing-contact-{previous_index + 1}")
@@ -1641,6 +1789,25 @@ def choose_routes(
                             np.mean(np.abs(expected_relative - observed_relative))
                         )
                         relative_position_cost = 1.2 * relative_mismatch
+                        # A clear left/right or above/below order is a hard
+                        # invariant only for disjoint sibling strokes (for
+                        # example 八's 撇/捺).  Intersecting strokes such as
+                        # 扌's 横/竖钩 can exchange a great deal of relative
+                        # centroid mass across a source glyph; treating that
+                        # secondary cue as hard incorrectly deletes the true
+                        # topology.  Their order still contributes the soft
+                        # relative-position cost above.
+                        hard_relative_order_violation = (
+                            not expected
+                            and violates_strong_relative_axis_order(
+                                expected_relative,
+                                observed_relative,
+                            )
+                        )
+                        if hard_relative_order_violation:
+                            notes.append(
+                                f"hard-relative-axis-{previous_index + 1}"
+                            )
                         if relative_mismatch > 0.28:
                             notes.append(
                                 f"same-leaf-relative-position-{previous_index + 1}:"
@@ -1660,6 +1827,7 @@ def choose_routes(
                         relative_position_cost,
                         notes,
                         hard_contact_violation,
+                        hard_relative_order_violation,
                     )
 
     beam = [
@@ -1670,11 +1838,43 @@ def choose_routes(
             "occupied": frozenset(),
             "steps": [],
             "usedHardContactFallback": False,
+            "usedHardGeometryFallback": False,
+            "usedFutureFeasibilityFallback": False,
         }
     ]
+
+    def remaining_routes_feasible(
+        next_index: int,
+        selected_routes: list[RouteCandidate],
+    ) -> bool:
+        """Cheap look-ahead: every later pen must retain one legal road.
+
+        This is deliberately a necessary, not sufficient, test.  It catches a
+        current stroke stealing the only road of a later stroke without
+        recursively exploding all future combinations.  Pairwise contact and
+        relative-position constraints are *not* evaluated here: before the
+        intervening strokes have been chosen, those constraints are not a
+        sound reason to prune a partial universe.  The outer beam evaluates
+        them exactly when both routes are present.
+        """
+        for future_index in range(next_index, len(ranked)):
+            has_legal_option = False
+            for future_option in ranked[future_index]:
+                illegal = any(
+                    route_reuse_ratio(future_option, previous_route) >= 0.72
+                    for previous_route in selected_routes
+                )
+                if illegal:
+                    continue
+                has_legal_option = True
+                break
+            if not has_legal_option:
+                return False
+        return True
+
     for index, options in enumerate(ranked):
         next_beam = []
-        contact_fallback_beam = []
+        hard_fallback_beam = []
         for state in beam:
             for option_rank, option in enumerate(options):
                 score = state["score"] + option.score
@@ -1684,15 +1884,24 @@ def choose_routes(
                 relative_position_cost = 0.0
                 relation_notes = []
                 hard_contact_violation = False
+                hard_relative_order_violation = False
                 for previous_index, previous_rank in enumerate(state["routeRanks"]):
-                    relation, role, relative, notes, hard_violation = relation_cache[
-                        index, option_rank, previous_index, previous_rank
-                    ]
+                    (
+                        relation,
+                        role,
+                        relative,
+                        notes,
+                        hard_contact,
+                        hard_relative,
+                    ) = relation_cache[index, option_rank, previous_index, previous_rank]
                     relation_cost += relation
                     contact_role_cost += role
                     relative_position_cost += relative
                     relation_notes.extend(notes)
-                    hard_contact_violation = hard_contact_violation or hard_violation
+                    hard_contact_violation = hard_contact_violation or hard_contact
+                    hard_relative_order_violation = (
+                        hard_relative_order_violation or hard_relative
+                    )
                 structural_order_cost = 0.0
                 predecessor = sibling_predecessor.get(index)
                 if predecessor is not None:
@@ -1714,6 +1923,12 @@ def choose_routes(
                                 f"sibling-order-{predecessor_key[0]}:{violation:.2f}"
                             )
                 reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
+                hard_reuse_violation = any(
+                    route_reuse_ratio(option, previous_route) >= 0.72
+                    for previous_route in state["routes"]
+                )
+                if hard_reuse_violation:
+                    relation_notes.append("duplicate-route-reuse")
                 new_pixels = len(option.pixels - state["occupied"])
                 new_coverage = new_pixels / max(1, len(option.pixels))
                 coverage_reward = coverage_weight * new_pixels / max(1, total_skeleton_pixels)
@@ -1727,15 +1942,44 @@ def choose_routes(
                 )
                 if hard_contact_violation:
                     relation_notes.append("same-leaf-contact-fallback")
-                destination = contact_fallback_beam if hard_contact_violation else next_beam
+                selected_routes = state["routes"] + [option]
+                selected_ranks = state["routeRanks"] + [option_rank]
+                future_feasible = remaining_routes_feasible(
+                    index + 1,
+                    selected_routes,
+                )
+                if not future_feasible:
+                    relation_notes.append("remaining-route-infeasible")
+                hard_geometry_violation = (
+                    hard_relative_order_violation or hard_reuse_violation
+                )
+                hard_violation = (
+                    hard_contact_violation
+                    or hard_geometry_violation
+                    or not future_feasible
+                )
+                destination = hard_fallback_beam if hard_violation else next_beam
+                fallback_penalty = (
+                    (1000.0 if hard_contact_violation else 0.0)
+                    + (1000.0 if hard_geometry_violation else 0.0)
+                    + (1000.0 if not future_feasible else 0.0)
+                )
                 destination.append(
                     {
-                        "score": score + (1000.0 if hard_contact_violation else 0.0),
-                        "routes": state["routes"] + [option],
-                        "routeRanks": state["routeRanks"] + [option_rank],
+                        "score": score + fallback_penalty,
+                        "routes": selected_routes,
+                        "routeRanks": selected_ranks,
                         "occupied": state["occupied"] | option.pixels,
                         "usedHardContactFallback": state["usedHardContactFallback"]
                         or hard_contact_violation,
+                        "usedHardGeometryFallback": state[
+                            "usedHardGeometryFallback"
+                        ]
+                        or hard_geometry_violation,
+                        "usedFutureFeasibilityFallback": state[
+                            "usedFutureFeasibilityFallback"
+                        ]
+                        or not future_feasible,
                         "steps": state["steps"]
                         + [
                             {
@@ -1750,13 +1994,18 @@ def choose_routes(
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
                                 "coverageReward": round(coverage_reward, 5),
+                                "remainingRoutesFeasible": future_feasible,
                                 "notes": relation_notes,
                             }
                         ],
                     }
                 )
         if not next_beam:
-            next_beam = contact_fallback_beam
+            next_beam = hard_fallback_beam
+        if not next_beam:
+            raise RuntimeError(
+                f"stroke {index + 1} has no globally feasible route hypothesis"
+            )
         next_beam.sort(key=lambda item: item["score"])
         beam = next_beam[:350]
     best = beam[0]
@@ -1772,6 +2021,10 @@ def choose_routes(
         review_reasons.append("candidate-stroke-grammar-mismatch")
     if best["usedHardContactFallback"]:
         review_reasons.append("same-leaf-contact-fallback")
+    if best["usedHardGeometryFallback"]:
+        review_reasons.append("hard-geometry-fallback")
+    if best["usedFutureFeasibilityFallback"]:
+        review_reasons.append("future-feasibility-fallback")
     return best["routes"], {
         "score": round(best["score"], 6),
         "beamWidth": 350,
@@ -2806,7 +3059,23 @@ def main():
             graph,
         )
     if any(not options for options in ranked):
-        raise RuntimeError("at least one candidate stroke has no feasible PDF route")
+        missing = [
+            {
+                "stroke": index + 1,
+                "feature": candidate[index].get("feature"),
+                "componentId": candidate[index].get("componentId"),
+                "orderGuard": order_guard_audit[index] if order_guard_audit else None,
+                "topologyGuard": (
+                    topology_guard_audit[index] if topology_guard_audit else None
+                ),
+            }
+            for index, options in enumerate(ranked)
+            if not options
+        ]
+        raise RuntimeError(
+            "candidate strokes have no feasible PDF route: "
+            + json.dumps(missing, ensure_ascii=False)
+        )
     residual_result = None
     if args.decoder == "residual":
         residual_result = RESIDUAL_DECODER.decode_residual_routes(

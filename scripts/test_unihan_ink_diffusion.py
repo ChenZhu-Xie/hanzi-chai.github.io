@@ -100,7 +100,40 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(audit[0]["rejectedOppositeDirection"], 1)
         self.assertFalse(audit[0]["fallbackToClassicCandidates"])
 
-    def test_hybrid_order_guard_never_deletes_every_classic_candidate(self):
+    def test_hybrid_order_guard_rejects_a_horizontal_road_for_a_falling_left_stroke(self):
+        def option(points, score):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(
+                0,
+                1,
+                points,
+                frozenset((int(x), int(y)) for x, y in points),
+                7,
+                score,
+                {},
+            )
+
+        strokes = [
+            {
+                "componentId": 117,
+                "occurrence": 0,
+                "feature": "撇",
+                "points": np.asarray([[5.0, 0.0], [0.0, 8.0]]),
+            }
+        ]
+        horizontal = option([[10.0, 2.0], [0.0, 2.0]], 0.0)
+        falling_left = option([[8.0, 0.0], [1.0, 9.0]], 1.0)
+        guarded, audit = MODULE.apply_stroke_order_guard(
+            strokes,
+            [[horizontal, falling_left]],
+            source="G",
+            codepoint=0x4E00,
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        np.testing.assert_array_equal(guarded[0][0].points, falling_left.points)
+        self.assertEqual(audit[0]["rejectedOppositeDirection"], 1)
+
+    def test_hybrid_order_guard_does_not_restore_an_opposite_hard_direction(self):
         points = np.asarray([[8.0, 2.0], [0.0, 2.0]])
         option = MODULE.RouteCandidate(
             0, 1, points, frozenset((int(x), int(y)) for x, y in points), 7, 0.1, {}
@@ -119,8 +152,9 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             source="G",
             codepoint=0x4E00,
         )
-        self.assertEqual(guarded, [[option]])
-        self.assertTrue(audit[0]["fallbackToClassicCandidates"])
+        self.assertEqual(guarded, [[]])
+        self.assertFalse(audit[0]["fallbackToClassicCandidates"])
+        self.assertTrue(audit[0]["hardDirectionConstraint"])
 
     def test_topology_guard_keeps_complete_rising_stroke_not_junction_fragment(self):
         graph = SimpleNamespace(
@@ -484,6 +518,32 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertLess(MODULE.total_turn(noisy_vertical), 0.2)
         self.assertAlmostEqual(MODULE.total_turn(right_angle), np.pi / 2, delta=0.08)
 
+    def test_total_turn_ignores_small_junction_detours_on_a_long_stroke(self):
+        bottom_with_junction_nubs = np.asarray(
+            [
+                [0.0, 20.0],
+                [22.0, 20.0],
+                [25.0, 17.0],
+                [29.0, 20.0],
+                [50.0, 20.0],
+                [53.0, 17.0],
+                [57.0, 20.0],
+                [78.0, 20.0],
+                [81.0, 17.0],
+                [85.0, 20.0],
+                [140.0, 20.0],
+            ]
+        )
+        fold_with_junction_nubs = np.vstack(
+            [bottom_with_junction_nubs, np.asarray([[140.0, 75.0]])]
+        )
+        self.assertLess(MODULE.total_turn(bottom_with_junction_nubs), 0.12)
+        self.assertAlmostEqual(
+            MODULE.total_turn(fold_with_junction_nubs),
+            np.pi / 2,
+            delta=0.12,
+        )
+
     def test_more_leaf_components_can_share_their_nearest_pdf_ink_island(self):
         skeleton = np.zeros((12, 12), dtype=bool)
         skeleton[1:11, 1] = True
@@ -763,6 +823,156 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             MODULE.relative_stroke_signature(first, second),
             MODULE.relative_stroke_signature(transformed_first, transformed_second),
         )
+
+    def test_same_leaf_axis_order_backtracks_instead_of_reusing_one_road(self):
+        strokes = [
+            {
+                "componentId": 117,
+                "occurrence": 0,
+                "feature": "撇",
+                "points": np.asarray([[4.0, 0.0], [0.0, 8.0]]),
+            },
+            {
+                "componentId": 117,
+                "occurrence": 0,
+                "feature": "捺",
+                "points": np.asarray([[6.0, 0.0], [10.0, 8.0]]),
+            },
+        ]
+        left = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[5.0, 1.0], [1.0, 9.0]]),
+            frozenset({(5, 1), (4, 3), (3, 5), (2, 7), (1, 9)}),
+            1,
+            2.0,
+            {},
+        )
+        duplicated_right = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[7.0, 1.0], [11.0, 9.0]]),
+            frozenset({(7, 1), (8, 3), (9, 5), (10, 7), (11, 9)}),
+            1,
+            -20.0,
+            {},
+        )
+        right = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[7.0, 1.0], [11.0, 9.0]]),
+            duplicated_right.pixels,
+            1,
+            0.0,
+            {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[duplicated_right, left], [right]],
+            total_skeleton_pixels=10,
+        )
+        self.assertIs(routes[0], left)
+        self.assertIs(routes[1], right)
+        self.assertTrue(decision["steps"][0]["remainingRoutesFeasible"])
+
+    def test_intersecting_same_leaf_uses_relative_position_as_soft_evidence(self):
+        strokes = [
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 220,
+                "occurrence": 0,
+                "feature": "竖钩",
+                "points": np.asarray([[9.0, 0.0], [9.0, 10.0]]),
+            },
+        ]
+        horizontal = MODULE.RouteCandidate(
+            0,
+            1,
+            strokes[0]["points"],
+            frozenset((x, 5) for x in range(11)),
+            1,
+            0.0,
+            {},
+        )
+        source_shifted_vertical = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[1.0, 0.0], [1.0, 10.0]]),
+            frozenset((1, y) for y in range(11)),
+            1,
+            -10.0,
+            {},
+        )
+        candidate_aligned_vertical = MODULE.RouteCandidate(
+            4,
+            5,
+            strokes[1]["points"],
+            frozenset((9, y) for y in range(11)),
+            1,
+            0.0,
+            {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[horizontal], [source_shifted_vertical, candidate_aligned_vertical]],
+            total_skeleton_pixels=31,
+        )
+        self.assertIs(routes[1], source_shifted_vertical)
+        self.assertNotIn("hard-geometry-fallback", decision["reviewReasons"])
+
+    def test_future_feasibility_prunes_a_branch_needed_by_a_later_stroke(self):
+        strokes = [
+            {
+                "componentId": 744,
+                "occurrence": 0,
+                "feature": "横折",
+                "points": np.asarray([[0.0, 0.0], [8.0, 0.0], [8.0, 8.0]]),
+            },
+            {
+                "componentId": 744,
+                "occurrence": 0,
+                "feature": "竖",
+                "points": np.asarray([[4.0, 0.0], [4.0, 8.0]]),
+            },
+        ]
+        steals_vertical = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [4.0, 0.0], [4.0, 8.0]]),
+            frozenset({(0, 0), (2, 0), (4, 0), (4, 2), (4, 4), (4, 6), (4, 8)}),
+            1,
+            -20.0,
+            {},
+        )
+        outer_fold = MODULE.RouteCandidate(
+            0,
+            2,
+            np.asarray([[0.0, 0.0], [8.0, 0.0], [8.0, 8.0]]),
+            frozenset({(0, 0), (2, 0), (4, 0), (6, 0), (8, 0), (8, 2), (8, 4), (8, 6), (8, 8)}),
+            1,
+            1.0,
+            {},
+        )
+        inner_vertical = MODULE.RouteCandidate(
+            3,
+            4,
+            np.asarray([[4.0, 0.0], [4.0, 8.0]]),
+            frozenset({(4, 0), (4, 2), (4, 4), (4, 6), (4, 8)}),
+            1,
+            0.0,
+            {},
+        )
+        routes, _decision = MODULE.choose_routes(
+            strokes,
+            [[steals_vertical, outer_fold], [inner_vertical]],
+            total_skeleton_pixels=13,
+        )
+        self.assertIs(routes[0], outer_fold)
 
     def test_direct_sibling_order_rejects_a_lower_leaf_above_its_predecessor(self):
         upper = {
