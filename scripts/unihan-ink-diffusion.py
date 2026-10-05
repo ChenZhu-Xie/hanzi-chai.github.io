@@ -447,11 +447,12 @@ def diagonal_front_leaf_keys(
 ) -> set[tuple[int, int]]:
     """Leaves where a scan seed is a safe route-recovery hypothesis.
 
-    The current proven case is a three-stroke closed box such as 口: vertical,
-    turning enclosure, closing horizontal, with every pair touching.  Merely
-    starting with a vertical is not enough (日 and 皿 have additional internal
-    strokes and already possess stable routes).  Keeping this structural gate
-    avoids exposing every component to speculative scan-seed roads.
+    Proven cases are a three-stroke closed box such as 口 and the four-stroke
+    broken grass head whose direction signature is horizontal, vertical,
+    vertical, horizontal.  Merely starting with a vertical is not enough (日
+    and 皿 have additional internal strokes and already possess stable routes).
+    Keeping this structural gate avoids exposing every component to
+    speculative scan-seed roads.
     """
     if contacts is None:
         contacts = stroke_contact_matrix(strokes)
@@ -461,17 +462,41 @@ def diagonal_front_leaf_keys(
         groups.setdefault(key, []).append(index)
     eligible = set()
     for key, indices in groups.items():
+        sectors = [
+            RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
+                str(strokes[index].get("feature") or ""),
+                "unknown",
+            )
+            for index in indices
+        ]
+        if sectors == ["E", "S", "S", "E"]:
+            eligible.add(key)
+            continue
         if len(indices) != 3:
             continue
-        first_sector = RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
-            str(strokes[indices[0]].get("feature") or ""),
-            "unknown",
-        )
-        if first_sector != "S":
+        if sectors[0] != "S":
             continue
         if all(bool(contacts[left, right]) for left in indices for right in indices if left > right):
             eligible.add(key)
     return eligible
+
+
+def broken_grass_head_keys(strokes: list[dict]) -> set[tuple[int, int]]:
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke.get("componentId", -1)), int(stroke.get("occurrence", 0)))
+        groups.setdefault(key, []).append(index)
+    result = set()
+    for key, indices in groups.items():
+        sectors = [
+            RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
+                str(strokes[index].get("feature") or ""), "unknown"
+            )
+            for index in indices
+        ]
+        if sectors == ["E", "S", "S", "E"]:
+            result.add(key)
+    return result
 
 
 def contact_signature(first: np.ndarray, second: np.ndarray) -> tuple[float, float, float]:
@@ -1208,6 +1233,9 @@ def rank_routes(
                         "learnedCost": round(learned_cost, 5),
                         "componentLabelAllowed": component_allowed,
                         "componentLabelRecoveryCost": component_recovery_cost,
+                        "diagonalFrontSeedRoute": bool(
+                            route.get("diagonalFrontSeed")
+                        ),
                         **normalized.evidence,
                         **learned_evidence,
                     },
@@ -1792,11 +1820,135 @@ def route_reuse_ratio(first: RouteCandidate, second: RouteCandidate) -> float:
     )
 
 
+def leaf_centroid_order_cost(
+    strokes: list[dict],
+    routes: list[RouteCandidate],
+    horizontal_band: float = 0.10,
+) -> tuple[float, dict]:
+    """Score the first stroke inside a completed leaf-route hypothesis.
+
+    Candidate semantics already provide the first stroke's coarse direction.
+    Among routes of that same direction class, compare centroids in the tight
+    bounding box of the *PDF hypothesis*: top-to-bottom first, then left-to-
+    right for centroids within ten percent of leaf height.  Candidate absolute
+    coordinates never enter this calculation.
+    """
+    if not strokes or len(strokes) != len(routes):
+        return 0.0, {"enabled": False, "reason": "incomplete-leaf"}
+    order = RESIDUAL_DECODER.ORDER
+    sectors = [
+        order.FEATURE_INITIAL_SECTORS.get(
+            str(stroke.get("feature") or ""), "unknown"
+        )
+        for stroke in strokes
+    ]
+    compatible = [index for index, sector in enumerate(sectors) if sector == sectors[0]]
+    if len(compatible) <= 1:
+        return 0.0, {
+            "enabled": False,
+            "reason": "no-same-direction-rival",
+            "firstSector": sectors[0],
+        }
+    leaf_points = np.vstack([route.points for route in routes])
+    leaf_min = leaf_points.min(axis=0)
+    leaf_span = np.maximum(leaf_points.max(axis=0) - leaf_min, 1.0)
+    centroids = np.asarray(
+        [(route.points.mean(axis=0) - leaf_min) / leaf_span for route in routes],
+        dtype=float,
+    )
+    top = min(float(centroids[index, 1]) for index in compatible)
+    same_row = [
+        index
+        for index in compatible
+        if float(centroids[index, 1]) <= top + horizontal_band
+    ]
+    preferred = min(
+        same_row,
+        key=lambda index: (
+            float(centroids[index, 0]),
+            float(centroids[index, 1]),
+        ),
+    )
+    mismatch = preferred != 0
+    # This is deliberately soft.  Stroke topology and normative order remain
+    # hard constraints; centroid order only separates otherwise plausible
+    # whole-leaf universes.
+    cost = 1.0 if mismatch else 0.0
+    return cost, {
+        "enabled": True,
+        "horizontalBand": horizontal_band,
+        "firstSector": sectors[0],
+        "compatibleStrokes": [index + 1 for index in compatible],
+        "preferredStroke": preferred + 1,
+        "centroids": [
+            [round(float(point[0]), 5), round(float(point[1]), 5)]
+            for point in centroids
+        ],
+        "mismatch": mismatch,
+    }
+
+
+def prune_open_leaf_beam(
+    states: list[dict],
+    width: int,
+    first_stroke_index: int | None = None,
+) -> list[dict]:
+    """Prune without erasing every universe of an unfinished leaf.
+
+    Until all strokes of the current leaf have been selected, its centroid,
+    complete contact matrix, and coverage cannot be evaluated.  Preserve the
+    best continuation for every surviving first-stroke route hypothesis, then
+    fill the remaining beam slots globally by score.
+    """
+    ordered = sorted(states, key=lambda item: item["score"])
+    if first_stroke_index is None:
+        return ordered[:width]
+    representatives: dict[int, dict] = {}
+    for state in ordered:
+        ranks = state.get("routeRanks", [])
+        if first_stroke_index >= len(ranks):
+            continue
+        representatives.setdefault(int(ranks[first_stroke_index]), state)
+    selected = sorted(representatives.values(), key=lambda item: item["score"])[
+        :width
+    ]
+    selected_ids = {id(state) for state in selected}
+    for state in ordered:
+        if len(selected) >= width:
+            break
+        if id(state) in selected_ids:
+            continue
+        selected.append(state)
+    return sorted(selected, key=lambda item: item["score"])
+
+
+def grass_diagonal_recovery_needed(
+    strokes: list[dict],
+    routes: list[RouteCandidate],
+) -> list[tuple[int, int]]:
+    grass_keys = broken_grass_head_keys(strokes)
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke.get("componentId", -1)), int(stroke.get("occurrence", 0)))
+        groups.setdefault(key, []).append(index)
+    failed = []
+    for key in grass_keys:
+        indices = groups[key]
+        cost, _evidence = leaf_centroid_order_cost(
+            [strokes[index] for index in indices],
+            [routes[index] for index in indices],
+        )
+        if cost > 0:
+            failed.append(key)
+    return sorted(failed)
+
+
 def choose_routes(
     strokes: list[dict],
     ranked: list[list[RouteCandidate]],
     total_skeleton_pixels: int,
     coverage_weight: float = 12.0,
+    leaf_centroid_weight: float = 0.25,
 ) -> tuple[list[RouteCandidate], dict]:
     expected_contact = stroke_contact_matrix(strokes)
     parent = list(range(len(strokes)))
@@ -1819,6 +1971,7 @@ def choose_routes(
     group_members: dict[tuple[int, int], list[int]] = {}
     for index, key in enumerate(group_keys):
         group_members.setdefault(key, []).append(index)
+    group_last_index = {key: indices[-1] for key, indices in group_members.items()}
     diagonal_seed_leaves = diagonal_front_leaf_keys(strokes, expected_contact)
     group_centres = {
         key: np.vstack([strokes[index]["points"] for index in indices]).mean(axis=0)
@@ -2102,6 +2255,28 @@ def choose_routes(
                             relation_notes.append(
                                 f"first-leaf-diagonal-front:{option_front - diagonal_front:.1f}"
                             )
+                leaf_centroid_cost = 0.0
+                leaf_centroid_evidence = {
+                    "enabled": False,
+                    "reason": "leaf-not-complete",
+                }
+                if group_last_index[group_keys[index]] == index:
+                    member_indices = group_members[group_keys[index]]
+                    member_routes = [
+                        option if member_index == index else state["routes"][member_index]
+                        for member_index in member_indices
+                    ]
+                    member_strokes = [strokes[member_index] for member_index in member_indices]
+                    raw_leaf_centroid_cost, leaf_centroid_evidence = leaf_centroid_order_cost(
+                        member_strokes,
+                        member_routes,
+                    )
+                    leaf_centroid_cost = leaf_centroid_weight * raw_leaf_centroid_cost
+                    if leaf_centroid_cost:
+                        relation_notes.append(
+                            "leaf-centroid-first-stroke:"
+                            f"{leaf_centroid_evidence['preferredStroke']}"
+                        )
                 reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
                 hard_reuse_violation = any(
                     route_reuse_ratio(option, previous_route) >= 0.72
@@ -2118,6 +2293,7 @@ def choose_routes(
                     + relative_position_cost
                     + structural_order_cost
                     + diagonal_front_cost
+                    + leaf_centroid_cost
                     + reuse_cost
                     - coverage_reward
                 )
@@ -2172,6 +2348,8 @@ def choose_routes(
                                 "relativePositionCost": round(relative_position_cost, 5),
                                 "structuralOrderCost": round(structural_order_cost, 5),
                                 "diagonalFrontCost": round(diagonal_front_cost, 5),
+                                "leafCentroidOrderCost": round(leaf_centroid_cost, 5),
+                                "leafCentroidOrder": leaf_centroid_evidence,
                                 "reuseCost": round(reuse_cost, 5),
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
@@ -2188,8 +2366,17 @@ def choose_routes(
             raise RuntimeError(
                 f"stroke {index + 1} has no globally feasible route hypothesis"
             )
-        next_beam.sort(key=lambda item: item["score"])
-        beam = next_beam[:350]
+        current_key = group_keys[index]
+        open_leaf_first = (
+            group_members[current_key][0]
+            if index < group_last_index[current_key]
+            else None
+        )
+        beam = prune_open_leaf_beam(
+            next_beam,
+            width=350,
+            first_stroke_index=open_leaf_first,
+        )
     best = beam[0]
     runner_up_margin = beam[1]["score"] - best["score"] if len(beam) > 1 else None
     unexplained_pixels = max(0, int(total_skeleton_pixels - len(best["occupied"])))
@@ -2211,6 +2398,7 @@ def choose_routes(
         "score": round(best["score"], 6),
         "beamWidth": 350,
         "coverageWeight": coverage_weight,
+        "leafCentroidWeight": leaf_centroid_weight,
         "unexplainedSkeletonPixels": unexplained_pixels,
         "unexplainedSkeletonRatio": round(unexplained_ratio, 6),
         "status": "needs-review" if review_reasons else "safe-candidate",
@@ -3149,6 +3337,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--canvas", type=int, default=256)
     parser.add_argument("--ordinal-weight", type=float, default=0.12)
     parser.add_argument("--coverage-weight", type=float, default=12.0)
+    parser.add_argument("--leaf-centroid-weight", type=float, default=0.25)
     parser.add_argument(
         "--decoder",
         choices=("hybrid", "legacy", "residual"),
@@ -3277,12 +3466,54 @@ def main():
         owner = residual_result.ledger.visible_owner
         decision = residual_decision_payload(residual_result, target)
     else:
+        grass_keys = broken_grass_head_keys(candidate)
+        baseline_ranked = []
+        for stroke, options in zip(candidate, ranked):
+            key = (
+                int(stroke.get("componentId", -1)),
+                int(stroke.get("occurrence", 0)),
+            )
+            if args.decoder == "hybrid" and key in grass_keys:
+                without_scan_seed = [
+                    option
+                    for option in options
+                    if not option.evidence.get("diagonalFrontSeedRoute")
+                ]
+                baseline_ranked.append(without_scan_seed or options)
+            else:
+                baseline_ranked.append(options)
         routes, decision = choose_routes(
             candidate,
-            ranked,
+            baseline_ranked,
             int(skeleton.sum()),
             coverage_weight=args.coverage_weight,
+            leaf_centroid_weight=args.leaf_centroid_weight,
         )
+        grass_recovery_keys = (
+            grass_diagonal_recovery_needed(candidate, routes)
+            if args.decoder == "hybrid"
+            else []
+        )
+        if grass_recovery_keys:
+            baseline_score = decision["score"]
+            routes, decision = choose_routes(
+                candidate,
+                ranked,
+                int(skeleton.sum()),
+                coverage_weight=args.coverage_weight,
+                leaf_centroid_weight=args.leaf_centroid_weight,
+            )
+            decision["grassDiagonalFrontRecovery"] = {
+                "triggered": True,
+                "leafKeys": [list(key) for key in grass_recovery_keys],
+                "baselineScore": baseline_score,
+                "reason": "completed-grass-head-centroid-order-mismatch",
+            }
+        else:
+            decision["grassDiagonalFrontRecovery"] = {
+                "triggered": False,
+                "leafKeys": [],
+            }
         if args.decoder == "hybrid":
             routes = normalize_selected_pen_paths(
                 candidate,

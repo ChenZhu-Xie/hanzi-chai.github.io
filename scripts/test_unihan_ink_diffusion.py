@@ -15,12 +15,104 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_open_leaf_beam_keeps_each_first_stroke_universe(self):
+        states = []
+        for first_rank in range(4):
+            for continuation in range(120):
+                states.append(
+                    {
+                        "score": float(continuation) + first_rank * 0.01,
+                        "routeRanks": [first_rank, continuation],
+                    }
+                )
+        pruned = MODULE.prune_open_leaf_beam(
+            states,
+            width=350,
+            first_stroke_index=0,
+        )
+        self.assertEqual(len(pruned), 350)
+        self.assertEqual({state["routeRanks"][0] for state in pruned}, {0, 1, 2, 3})
+
+    def test_leaf_centroid_order_treats_nearby_rows_as_left_to_right(self):
+        strokes = [
+            {"feature": "横", "points": np.asarray([[0.0, 0.0], [2.0, 0.0]])},
+            {"feature": "竖", "points": np.asarray([[5.0, 0.0], [5.0, 8.0]])},
+            {"feature": "横", "points": np.asarray([[7.0, -0.5], [9.0, -0.5]])},
+        ]
+
+        def route(points):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(
+                0,
+                1,
+                points,
+                frozenset((int(x), int(y)) for x, y in points),
+                1,
+                0.0,
+                {},
+            )
+
+        correct = [
+            route([[0.0, 4.0], [2.0, 4.0]]),
+            route([[5.0, 1.0], [5.0, 9.0]]),
+            route([[7.0, 3.2], [9.0, 3.2]]),
+        ]
+        cost, evidence = MODULE.leaf_centroid_order_cost(strokes, correct)
+        self.assertEqual(cost, 0.0)
+        self.assertEqual(evidence["preferredStroke"], 1)
+
+        wrong = [
+            route([[7.0, 4.0], [9.0, 4.0]]),
+            correct[1],
+            route([[0.0, 3.2], [2.0, 3.2]]),
+        ]
+        cost, evidence = MODULE.leaf_centroid_order_cost(strokes, wrong)
+        self.assertGreater(cost, 0.0)
+        self.assertEqual(evidence["preferredStroke"], 3)
+
     def test_diagonal_front_adds_a_temporary_seed_at_an_l_corner(self):
         skeleton = np.zeros((16, 16), dtype=bool)
         skeleton[3, 3:12] = True
         skeleton[3:13, 3] = True
         graph = MODULE.build_skeleton_graph(skeleton)
         self.assertIn((3, 3), graph.critical)
+
+    def test_broken_grass_head_uses_the_diagonal_front_model(self):
+        strokes = [
+            {
+                "componentId": 486,
+                "occurrence": 0,
+                "feature": feature,
+                "points": np.asarray(points, dtype=float),
+            }
+            for feature, points in (
+                ("横", [[0, 2], [4, 2]]),
+                ("竖", [[2, 0], [2, 6]]),
+                ("竖", [[8, 0], [8, 6]]),
+                ("横", [[6, 2], [10, 2]]),
+            )
+        ]
+        self.assertIn((486, 0), MODULE.diagonal_front_leaf_keys(strokes))
+
+        def route(points):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(
+                0,
+                1,
+                points,
+                frozenset((int(x), int(y)) for x, y in points),
+                1,
+                0.0,
+                {},
+            )
+
+        correct = [route(stroke["points"]) for stroke in strokes]
+        self.assertEqual(MODULE.grass_diagonal_recovery_needed(strokes, correct), [])
+        wrong = [correct[3], correct[1], correct[2], correct[0]]
+        self.assertEqual(
+            MODULE.grass_diagonal_recovery_needed(strokes, wrong),
+            [(486, 0)],
+        )
 
     def test_first_leaf_stroke_prefers_the_earliest_compatible_diagonal_front(self):
         strokes = [
