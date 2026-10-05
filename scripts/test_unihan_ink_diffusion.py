@@ -15,6 +15,78 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_diagonal_front_adds_a_temporary_seed_at_an_l_corner(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[3, 3:12] = True
+        skeleton[3:13, 3] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        self.assertIn((3, 3), graph.critical)
+
+    def test_first_leaf_stroke_prefers_the_earliest_compatible_diagonal_front(self):
+        strokes = [
+            {
+                "componentId": 282,
+                "occurrence": 0,
+                "feature": "竖",
+                "points": np.asarray([[0.0, 0.0], [0.0, 10.0]]),
+            },
+            {
+                "componentId": 282,
+                "occurrence": 0,
+                "feature": "横折",
+                "points": np.asarray([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]),
+            },
+            {
+                "componentId": 282,
+                "occurrence": 0,
+                "feature": "横",
+                "points": np.asarray([[0.0, 10.0], [10.0, 10.0]]),
+            },
+        ]
+
+        def vertical(x, score):
+            points = np.asarray([[float(x), 5.0], [float(x), 15.0]])
+            return MODULE.RouteCandidate(
+                0,
+                1,
+                points,
+                frozenset((int(x), y) for y in range(5, 16)),
+                1,
+                score,
+                {},
+            )
+
+        left_front = vertical(10, 0.5)
+        wrong_right = vertical(20, 0.0)
+        enclosure_points = np.asarray([[10.0, 5.0], [30.0, 5.0], [30.0, 15.0]])
+        enclosure = MODULE.RouteCandidate(
+            2,
+            3,
+            enclosure_points,
+            frozenset({(10, 5), (20, 5), (30, 5), (30, 10), (30, 15)}),
+            1,
+            0.0,
+            {},
+        )
+        bottom_points = np.asarray([[10.0, 15.0], [30.0, 15.0]])
+        bottom = MODULE.RouteCandidate(
+            4,
+            5,
+            bottom_points,
+            frozenset({(10, 15), (20, 15), (30, 15)}),
+            1,
+            0.0,
+            {},
+        )
+        self.assertIn((282, 0), MODULE.diagonal_front_leaf_keys(strokes))
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[wrong_right, left_front], [enclosure], [bottom]],
+            total_skeleton_pixels=30,
+        )
+        self.assertIs(routes[0], left_front)
+        self.assertEqual(decision["steps"][0]["diagonalFrontCost"], 0.0)
+
     def test_html_lists_pen_down_acceptance_and_rejection_reasons(self):
         self.assertTrue(hasattr(MODULE, "residual_review_markup"))
         markup = MODULE.residual_review_markup()
@@ -254,6 +326,50 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertEqual(trimmed.points[-1].tolist(), [-3.0, 53.0])
         self.assertEqual(trimmed.pixels, option.pixels)
         self.assertTrue(trimmed.evidence["trimmedInitialMedialSpur"])
+
+    def test_vertical_pen_down_ignores_a_long_calligraphic_head_cap(self):
+        points = np.asarray(
+            [
+                [8.0, 0.0],
+                [6.0, 0.0],
+                [4.0, 0.0],
+                [2.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 8.0],
+                [0.0, 20.0],
+                [0.0, 32.0],
+            ]
+        )
+        option = MODULE.RouteCandidate(
+            0,
+            1,
+            points,
+            frozenset((int(x), int(y)) for x, y in points),
+            1,
+            0.1,
+            {},
+        )
+        trimmed = MODULE.trim_initial_medial_spur(option, "S")
+        self.assertEqual(trimmed.points[0].tolist(), [0.0, 0.0])
+        self.assertEqual(trimmed.points[-1].tolist(), [0.0, 32.0])
+        self.assertEqual(trimmed.pixels, option.pixels)
+
+        strokes = [
+            {
+                "componentId": 486,
+                "occurrence": 0,
+                "feature": "竖",
+                "points": np.asarray([[0.0, 0.0], [0.0, 20.0]]),
+            }
+        ]
+        guarded, _audit = MODULE.apply_stroke_order_guard(
+            strokes,
+            [[option]],
+            source="T",
+            codepoint=0x64CE,
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        self.assertEqual(guarded[0][0].points[0].tolist(), [0.0, 0.0])
 
     def test_hook_pen_path_uses_longest_terminal_branch_not_short_ink_spur(self):
         skeleton = np.zeros((16, 16), dtype=bool)

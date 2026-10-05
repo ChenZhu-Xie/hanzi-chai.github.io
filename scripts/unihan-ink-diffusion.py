@@ -95,6 +95,34 @@ class SkeletonGraph:
     critical: list[tuple[int, int]]
     components: np.ndarray
     crossing: np.ndarray
+    scan_seeds: tuple[tuple[int, int], ...]
+
+
+def diagonal_front_seeds(
+    skeleton: np.ndarray,
+    crossing: np.ndarray,
+    radius: float = 4.0,
+) -> list[tuple[int, int]]:
+    """Return local first-contact regions of an upper-left scan front.
+
+    In screen coordinates the moving 45-degree front is ``x + y = c``.  Its
+    local minima are useful *temporary route seeds*: notably, the upper-left
+    corner of 口 is a degree-two bend, so it is neither an endpoint nor a
+    junction in the ordinary skeleton graph.  This does not claim that every
+    seed is a pen-down point or impose a global stroke order.  Later semantic
+    stroke filtering decides whether a route through the seed is relevant.
+    """
+    points = np.argwhere(skeleton & (crossing == 2))
+    if not len(points):
+        return []
+    tree = cKDTree(points.astype(float))
+    fronts = points[:, 0] + points[:, 1]
+    minima = np.zeros_like(skeleton, dtype=bool)
+    for index, point in enumerate(points):
+        neighbours = tree.query_ball_point(point.astype(float), r=radius)
+        if neighbours and fronts[index] <= int(np.min(fronts[neighbours])):
+            minima[tuple(point)] = True
+    return cluster_points(minima, radius=2)
 
 
 def build_skeleton_graph(skeleton: np.ndarray) -> SkeletonGraph:
@@ -116,9 +144,18 @@ def build_skeleton_graph(skeleton: np.ndarray) -> SkeletonGraph:
     _count, crossing = crossing_numbers(skeleton)
     endpoints = [tuple(map(int, point)) for point in np.argwhere(skeleton & (crossing == 1))]
     junctions = cluster_points(skeleton & (crossing >= 3), radius=2)
-    critical = list(dict.fromkeys(endpoints + junctions))
+    scan_seeds = diagonal_front_seeds(skeleton, crossing)
+    critical = list(dict.fromkeys(endpoints + junctions + scan_seeds))
     _component_count, components = cv2.connectedComponents(skeleton.astype(np.uint8), connectivity=8)
-    return SkeletonGraph(points, point_index, matrix, critical, components, crossing)
+    return SkeletonGraph(
+        points,
+        point_index,
+        matrix,
+        critical,
+        components,
+        crossing,
+        tuple(scan_seeds),
+    )
 
 
 def reconstruct_path(
@@ -296,6 +333,30 @@ class RouteCandidate:
 
 def all_routes(graph: SkeletonGraph) -> list[dict]:
     nodes = [graph.point_index[point] for point in graph.critical if point in graph.point_index]
+    scan_nodes = {
+        graph.point_index[point]
+        for point in graph.scan_seeds
+        if point in graph.point_index
+    }
+    base_nodes = [node for node in nodes if node not in scan_nodes]
+    # A diagonal-front seed is a local hypothesis, not a new globally
+    # connected landmark.  Link it only to nearby ordinary critical nodes in
+    # the same ink island.  This retains both directions of useful routes
+    # without quadratically connecting every seed to every other seed.
+    seed_neighbours: dict[int, set[int]] = {}
+    for seed in scan_nodes:
+        y, x = graph.points[seed]
+        component = int(graph.components[y, x])
+        local = []
+        for node in base_nodes:
+            other_y, other_x = graph.points[node]
+            if int(graph.components[other_y, other_x]) != component:
+                continue
+            distance = math.hypot(float(other_y - y), float(other_x - x))
+            local.append((distance, node))
+        seed_neighbours[seed] = {
+            node for _distance, node in sorted(local)[:6]
+        }
     adjacency = graph_adjacency(graph.matrix)
     degrees = np.asarray([len(items) for items in adjacency])
     routes = []
@@ -305,6 +366,10 @@ def all_routes(graph: SkeletonGraph) -> list[dict]:
         )
         for end_position, end in enumerate(nodes):
             if start == end or not np.isfinite(distances[end]):
+                continue
+            if start in scan_nodes and end not in seed_neighbours[start]:
+                continue
+            if end in scan_nodes and start not in seed_neighbours[end]:
                 continue
             base_indices = []
             current = end
@@ -359,6 +424,8 @@ def all_routes(graph: SkeletonGraph) -> list[dict]:
                         "pixels": frozenset((int(p[0]), int(p[1])) for p in path),
                         "component": int(graph.components[y, x]),
                         "length": length,
+                        "diagonalFrontSeed": start in scan_nodes,
+                        "diagonalFrontSeedAtEnd": end in scan_nodes,
                     }
                 )
     return routes
@@ -372,6 +439,39 @@ def stroke_contact_matrix(strokes: list[dict], threshold: float = 3.0) -> np.nda
             contact = polyline_distance(strokes[left]["points"], strokes[right]["points"]) <= threshold
             matrix[left, right] = matrix[right, left] = contact
     return matrix
+
+
+def diagonal_front_leaf_keys(
+    strokes: list[dict],
+    contacts: np.ndarray | None = None,
+) -> set[tuple[int, int]]:
+    """Leaves where a scan seed is a safe route-recovery hypothesis.
+
+    The current proven case is a three-stroke closed box such as 口: vertical,
+    turning enclosure, closing horizontal, with every pair touching.  Merely
+    starting with a vertical is not enough (日 and 皿 have additional internal
+    strokes and already possess stable routes).  Keeping this structural gate
+    avoids exposing every component to speculative scan-seed roads.
+    """
+    if contacts is None:
+        contacts = stroke_contact_matrix(strokes)
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke.get("componentId", -1)), int(stroke.get("occurrence", 0)))
+        groups.setdefault(key, []).append(index)
+    eligible = set()
+    for key, indices in groups.items():
+        if len(indices) != 3:
+            continue
+        first_sector = RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
+            str(strokes[indices[0]].get("feature") or ""),
+            "unknown",
+        )
+        if first_sector != "S":
+            continue
+        if all(bool(contacts[left, right]) for left in indices for right in indices if left > right):
+            eligible.add(key)
+    return eligible
 
 
 def contact_signature(first: np.ndarray, second: np.ndarray) -> tuple[float, float, float]:
@@ -984,6 +1084,7 @@ def rank_routes(
     )
 
     candidate_contacts = stroke_contact_matrix(strokes)
+    diagonal_seed_leaves = diagonal_front_leaf_keys(strokes, candidate_contacts)
     candidate_end_is_contact = []
     for index, stroke in enumerate(strokes):
         constrained = False
@@ -1019,19 +1120,55 @@ def rank_routes(
             excluded_training_case,
             source=source,
         )
+        expected_sector = RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
+            str(stroke.get("feature") or ""),
+            "unknown",
+        )
         options = []
         component_recovery_options = []
         for route in raw_routes:
+            # A diagonal seed resolves the specific ambiguity “which complete
+            # vertical covers this leaf's first-contact region?”.  Do not
+            # expose those extra roads to leaves whose first semantic stroke
+            # is not vertical (八, 扌, etc.), and never run a stroke backwards
+            # merely to terminate at a seed.
+            if route.get("diagonalFrontSeedAtEnd") or (
+                route.get("diagonalFrontSeed")
+                and key not in diagonal_seed_leaves
+            ):
+                continue
             component_allowed = route["component"] in allowed_components[key]
-            direction = direction_dtw(stroke["points"], route["points"])
-            turn = abs(total_turn(route["points"]) - expected_turn) / math.pi
-            route_start = normalized_point(route["points"][0], target_glyph_bounds)
+            unnormalized = RouteCandidate(
+                start_node=route["startNode"],
+                end_node=route["endNode"],
+                points=route["points"],
+                pixels=route["pixels"],
+                component=int(route["component"]),
+                score=0.0,
+                evidence={},
+            )
+            # Only a semantic vertical needs its sizeable calligraphic head
+            # cap removed before local ranking.  Applying this early to curves
+            # and diagonals perturbs legitimate 撇/捺 entry geometry; those
+            # retain the established post-selection normalization path.
+            normalized = (
+                trim_initial_medial_spur(unnormalized, expected_sector)
+                if expected_sector == "S"
+                else unnormalized
+            )
+            scoring_route = {**route, "points": normalized.points}
+            direction = direction_dtw(stroke["points"], normalized.points)
+            turn = abs(total_turn(normalized.points) - expected_turn) / math.pi
+            route_start = normalized_point(normalized.points[0], target_glyph_bounds)
             ordinal = float(np.linalg.norm(route_start - expected_start))
-            route_length_fraction = float(route["length"] / max(1.0, target_diagonal))
+            normalized_length = float(
+                np.linalg.norm(np.diff(normalized.points, axis=0), axis=1).sum()
+            )
+            route_length_fraction = normalized_length / max(1.0, target_diagonal)
             premature_stop = (
                 not candidate_end_is_contact[stroke_index]
                 and has_forward_continuation(
-                    graph, route["points"], adjacency=adjacency
+                    graph, normalized.points, adjacency=adjacency
                 )
                 and route_length_fraction < expected_length_fraction * 0.62
             )
@@ -1039,7 +1176,7 @@ def rank_routes(
             # breaker. A free pen-up cannot truncate a visibly continuing road.
             premature_stop_cost = 1.6 if premature_stop else 0.0
             learned_cost, learned_evidence = route_learned_cost(
-                route, graph, learned_rule, target_glyph_bounds
+                scoring_route, graph, learned_rule, target_glyph_bounds
             )
             component_recovery_cost = (
                 0.6 if enforce_component_labels and not component_allowed else 0.0
@@ -1055,7 +1192,7 @@ def rank_routes(
             candidate = RouteCandidate(
                     start_node=route["startNode"],
                     end_node=route["endNode"],
-                    points=route["points"],
+                    points=normalized.points,
                     pixels=route["pixels"],
                     component=int(route["component"]),
                     score=score,
@@ -1071,6 +1208,7 @@ def rank_routes(
                         "learnedCost": round(learned_cost, 5),
                         "componentLabelAllowed": component_allowed,
                         "componentLabelRecoveryCost": component_recovery_cost,
+                        **normalized.evidence,
                         **learned_evidence,
                     },
                 )
@@ -1113,10 +1251,6 @@ def rank_routes(
             if id(item) not in retained_ids:
                 retained.append(item)
                 retained_ids.add(id(item))
-        expected_sector = RESIDUAL_DECODER.ORDER.FEATURE_INITIAL_SECTORS.get(
-            str(stroke.get("feature") or ""),
-            "unknown",
-        )
         recovered = []
         recovered_paths: set[tuple[tuple[int, int], ...]] = set()
         for item in component_recovery_options:
@@ -1395,9 +1529,16 @@ def normalize_hook_terminal_branch(
 def trim_initial_medial_spur(
     option: RouteCandidate,
     expected_sector: str,
-    maximum_fraction: float = 0.12,
+    maximum_fraction: float | None = None,
 ) -> RouteCandidate:
     """Lightly normalize candidate caps before stroke-order comparison."""
+    if maximum_fraction is None:
+        # A vertical stroke in a serif/calligraphic source often begins on a
+        # sizeable horizontal head cap.  That cap is ink owned by the stroke,
+        # but it is not the directed pen-down road.  Allow the logical tip to
+        # advance farther than for other strokes so 横-before-竖 ordering and
+        # same-leaf geometry are compared against the stable vertical trunk.
+        maximum_fraction = 0.30 if expected_sector == "S" else 0.12
     points = np.asarray(option.points, dtype=float)
     if len(points) < 3:
         return option
@@ -1423,14 +1564,13 @@ def trim_initial_medial_spur(
     if chosen is None:
         return option
     trimmed_points = points[chosen:]
-    trimmed_pixels = frozenset(
-        (int(round(float(x))), int(round(float(y)))) for x, y in trimmed_points
-    )
     return RouteCandidate(
         start_node=option.start_node,
         end_node=option.end_node,
         points=trimmed_points,
-        pixels=trimmed_pixels,
+        # The cap remains ink owned by this stroke.  Only the logical directed
+        # centreline starts at the stable trunk after the calligraphic spur.
+        pixels=option.pixels,
         component=option.component,
         score=option.score,
         evidence={
@@ -1679,6 +1819,7 @@ def choose_routes(
     group_members: dict[tuple[int, int], list[int]] = {}
     for index, key in enumerate(group_keys):
         group_members.setdefault(key, []).append(index)
+    diagonal_seed_leaves = diagonal_front_leaf_keys(strokes, expected_contact)
     group_centres = {
         key: np.vstack([strokes[index]["points"] for index in indices]).mean(axis=0)
         for key, indices in group_members.items()
@@ -1875,7 +2016,31 @@ def choose_routes(
     for index, options in enumerate(ranked):
         next_beam = []
         hard_fallback_beam = []
+        first_stroke_in_leaf = group_members[group_keys[index]][0] == index
         for state in beam:
+            # The candidate hierarchy has already told us which semantic leaf
+            # comes next, and the order guard has already restricted routes to
+            # the expected stroke class.  Only within that compatible set do
+            # we use the upper-left diagonal front: the first route of a leaf
+            # should cover its earliest still-unpainted contact region.  The
+            # contact is a seed region, not necessarily the exact pen-down.
+            diagonal_front = None
+            if first_stroke_in_leaf and group_keys[index] in diagonal_seed_leaves:
+                compatible_fronts = []
+                for candidate_option in options:
+                    if any(
+                        route_reuse_ratio(candidate_option, previous_route) >= 0.72
+                        for previous_route in state["routes"]
+                    ):
+                        continue
+                    residual_pixels = candidate_option.pixels - state["occupied"]
+                    if not residual_pixels:
+                        continue
+                    compatible_fronts.append(
+                        min(float(x + y) for x, y in residual_pixels)
+                    )
+                if compatible_fronts:
+                    diagonal_front = min(compatible_fronts)
             for option_rank, option in enumerate(options):
                 score = state["score"] + option.score
                 shared = len(state["occupied"] & option.pixels)
@@ -1922,6 +2087,21 @@ def choose_routes(
                             relation_notes.append(
                                 f"sibling-order-{predecessor_key[0]}:{violation:.2f}"
                             )
+                diagonal_front_cost = 0.0
+                if diagonal_front is not None:
+                    residual_pixels = option.pixels - state["occupied"]
+                    if residual_pixels:
+                        option_front = min(float(x + y) for x, y in residual_pixels)
+                        diagonal_front_cost = min(
+                            1.0,
+                            6.0
+                            * max(0.0, option_front - diagonal_front)
+                            / max(1.0, float(np.linalg.norm(route_spans))),
+                        )
+                        if diagonal_front_cost > 0.08:
+                            relation_notes.append(
+                                f"first-leaf-diagonal-front:{option_front - diagonal_front:.1f}"
+                            )
                 reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
                 hard_reuse_violation = any(
                     route_reuse_ratio(option, previous_route) >= 0.72
@@ -1937,6 +2117,7 @@ def choose_routes(
                     + contact_role_cost
                     + relative_position_cost
                     + structural_order_cost
+                    + diagonal_front_cost
                     + reuse_cost
                     - coverage_reward
                 )
@@ -1990,6 +2171,7 @@ def choose_routes(
                                 "contactRoleCost": round(contact_role_cost, 5),
                                 "relativePositionCost": round(relative_position_cost, 5),
                                 "structuralOrderCost": round(structural_order_cost, 5),
+                                "diagonalFrontCost": round(diagonal_front_cost, 5),
                                 "reuseCost": round(reuse_cost, 5),
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
