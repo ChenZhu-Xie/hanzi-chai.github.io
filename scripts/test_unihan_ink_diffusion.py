@@ -15,6 +15,39 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_review_mode_returns_best_prefix_when_later_stroke_has_no_route(self):
+        strokes = [
+            {
+                "componentId": 1,
+                "occurrence": 0,
+                "points": np.asarray([[1.0, 1.0], [4.0, 1.0]]),
+            },
+            {
+                "componentId": 2,
+                "occurrence": 0,
+                "points": np.asarray([[8.0, 8.0], [8.0, 10.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0,
+            1,
+            strokes[0]["points"],
+            frozenset({(1, 1), (2, 1), (3, 1), (4, 1)}),
+            1,
+            0.0,
+            {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[first], []],
+            total_skeleton_pixels=8,
+            allow_partial=True,
+        )
+        self.assertEqual(routes, [first])
+        self.assertTrue(decision["partialPrediction"])
+        self.assertEqual(decision["failedStroke"]["stroke"], 2)
+        self.assertIn("no-feasible-route", decision["reviewReasons"])
+
     def test_separated_pen_up_endpoints_are_not_candidate_contacts(self):
         strokes = [
             {"points": np.asarray([[62.0, 45.0], [66.0, 53.0]])},

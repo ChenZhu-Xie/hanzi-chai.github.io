@@ -3187,6 +3187,7 @@ def choose_routes(
     beam_width: int = 350,
     graph: SkeletonGraph | None = None,
     protect_completed_stroke_residuals: bool = True,
+    allow_partial: bool = False,
 ) -> tuple[list[RouteCandidate], dict]:
     minimum_hard_completion_ratio = 0.50
     expected_contact = stroke_contact_matrix(strokes)
@@ -3706,6 +3707,7 @@ def choose_routes(
                 return False
         return True
 
+    partial_failure: dict | None = None
     for index, options in enumerate(ranked):
         next_beam = []
         hard_fallback_beam = []
@@ -4539,6 +4541,14 @@ def choose_routes(
         if not next_beam:
             next_beam = hard_fallback_beam
         if not next_beam:
+            if allow_partial:
+                partial_failure = {
+                    "stroke": index + 1,
+                    "feature": strokes[index].get("feature"),
+                    "componentId": strokes[index].get("componentId"),
+                    "reason": "no-globally-feasible-route-hypothesis",
+                }
+                break
             raise RuntimeError(
                 f"stroke {index + 1} has no globally feasible route hypothesis"
             )
@@ -4624,6 +4634,8 @@ def choose_routes(
         review_reasons.append("root-structure-scan-fallback")
     if best["usedReservedPenDownConflict"]:
         review_reasons.append("reserved-pen-down-conflict")
+    if partial_failure is not None:
+        review_reasons.append("no-feasible-route")
     root_scan_step = next(
         (
             step["rootStructureScan"]
@@ -4642,6 +4654,8 @@ def choose_routes(
         "coverageWeight": coverage_weight,
         "leafCentroidWeight": leaf_centroid_weight,
         "completedStrokeResidualProtection": protect_completed_stroke_residuals,
+        "partialPrediction": partial_failure is not None,
+        "failedStroke": partial_failure,
         "rootStructureScan": root_scan_step,
         "unexplainedSkeletonPixels": unexplained_pixels,
         "unexplainedSkeletonRatio": round(unexplained_ratio, 6),
@@ -5595,6 +5609,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="A/B audit only: allow later pen-downs in protected residual detail",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Review only: render the best prefix when a later stroke has no route",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit-output", type=Path)
     return parser
@@ -5765,13 +5784,14 @@ def main():
             protect_completed_stroke_residuals=(
                 not args.disable_completed_stroke_reservation
             ),
+            allow_partial=args.allow_partial,
         )
         grass_recovery_keys = (
             grass_diagonal_recovery_needed(candidate, routes)
             if args.decoder == "hybrid"
             else []
         )
-        if grass_recovery_keys:
+        if grass_recovery_keys and len(routes) == len(candidate):
             baseline_score = decision["score"]
             routes, decision = choose_routes(
                 candidate,
@@ -5784,6 +5804,7 @@ def main():
                 protect_completed_stroke_residuals=(
                     not args.disable_completed_stroke_reservation
                 ),
+                allow_partial=args.allow_partial,
             )
             decision["grassDiagonalFrontRecovery"] = {
                 "triggered": True,
