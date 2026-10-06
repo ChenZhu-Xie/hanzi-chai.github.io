@@ -15,6 +15,78 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_separated_pen_up_endpoints_are_not_candidate_contacts(self):
+        strokes = [
+            {"points": np.asarray([[62.0, 45.0], [66.0, 53.0]])},
+            {"points": np.asarray([[72.0, 45.0], [69.0, 53.0]])},
+        ]
+        self.assertFalse(MODULE.stroke_contact_matrix(strokes)[0, 1])
+
+    def test_exact_pen_up_join_remains_a_candidate_contact(self):
+        strokes = [
+            {"points": np.asarray([[10.0, 2.0], [10.0, 8.0], [15.0, 8.0]])},
+            {"points": np.asarray([[15.0, 2.0], [15.0, 8.0]])},
+        ]
+        self.assertTrue(MODULE.stroke_contact_matrix(strokes)[0, 1])
+
+    def test_completed_leaf_claims_short_terminal_shared_pen_down_cap(self):
+        skeleton = np.zeros((14, 14), dtype=bool)
+        skeleton[5, 5:11] = True
+        skeleton[5:11, 5] = True
+        skeleton[2, 2] = True
+        skeleton[3, 3] = True
+        skeleton[4, 4] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {"points": np.asarray([[5.0, 5.0], [10.0, 5.0]])},
+            {"points": np.asarray([[5.0, 5.0], [5.0, 10.0]])},
+        ]
+        routes = [
+            MODULE.RouteCandidate(
+                0,
+                1,
+                strokes[0]["points"],
+                frozenset((x, 5) for x in range(5, 11)),
+                1,
+                0.0,
+                {},
+            ),
+            MODULE.RouteCandidate(
+                0,
+                1,
+                strokes[1]["points"],
+                frozenset((5, y) for y in range(5, 11)),
+                1,
+                0.0,
+                {},
+            ),
+        ]
+        closure = MODULE.completed_leaf_residual_closure(strokes, routes, graph)
+        self.assertEqual(closure, frozenset({(2, 2), (3, 3), (4, 4)}))
+
+    def test_completed_leaf_claims_bounded_terminal_residual_away_from_pen_down(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[3, 2:13] = True
+        skeleton[3:13, 2] = True
+        skeleton[3:9, 8] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {"points": np.asarray([[2.0, 3.0], [12.0, 3.0]])},
+            {"points": np.asarray([[2.0, 3.0], [2.0, 12.0]])},
+        ]
+        routes = [
+            MODULE.RouteCandidate(
+                0, 1, strokes[0]["points"],
+                frozenset((x, 3) for x in range(2, 13)), 1, 0.0, {},
+            ),
+            MODULE.RouteCandidate(
+                0, 1, strokes[1]["points"],
+                frozenset((2, y) for y in range(3, 13)), 1, 0.0, {},
+            ),
+        ]
+        closure = MODULE.completed_leaf_residual_closure(strokes, routes, graph)
+        self.assertTrue(frozenset((8, y) for y in range(4, 9)) <= closure)
+
     def test_scan_seed_can_reach_a_distant_terminal_in_the_same_ink_island(self):
         points = np.asarray([[0, index] for index in range(10)], dtype=int)
         rows = []
@@ -71,6 +143,37 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             )
         )
 
+    def test_compound_diagonal_tail_cannot_collapse_into_a_vertical_tail(self):
+        stroke = {
+            "feature": "横撇",
+            "bendFractions": [0.45],
+            "points": np.asarray([[0.0, 0.0], [6.0, 0.0], [3.0, 8.0]]),
+        }
+        vertical_tail = np.asarray(
+            [[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [6.0, 8.0]]
+        )
+        diagonal_tail = np.asarray(
+            [[0.0, 0.0], [6.0, 0.0], [5.0, 3.0], [3.0, 8.0]]
+        )
+        self.assertFalse(
+            MODULE.compound_terminal_direction_compatible(stroke, vertical_tail)
+        )
+        self.assertTrue(
+            MODULE.compound_terminal_direction_compatible(stroke, diagonal_tail)
+        )
+
+    def test_human_leaf_pen_down_starts_when_it_exits_previous_broad_ink(self):
+        previous = np.asarray([[0.0, 0.0], [20.0, 0.0]])
+        current = np.asarray(
+            [[10.0, 0.0], [10.0, 3.0], [10.0, 6.0], [9.0, 10.0], [4.0, 20.0]]
+        )
+        trimmed, hidden = MODULE.trim_broad_ink_contact_prefix(
+            current, previous, ink_radius=8.0
+        )
+        self.assertGreater(hidden, 4.0)
+        self.assertGreaterEqual(trimmed[0, 1], 8.0)
+        self.assertLess(trimmed[-1, 0], trimmed[0, 0])
+
     def test_contact_start_prunes_a_dominated_suffix_route(self):
         long = MODULE.RouteCandidate(
             0,
@@ -102,6 +205,294 @@ class DirectedInkDiffusionTests(unittest.TestCase):
             ),
             [suffix, long],
         )
+
+    def test_free_pen_up_prunes_a_dominated_incomplete_prefix(self):
+        short = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [4.0, -2.0]]),
+            frozenset((index, 0) for index in range(5)),
+            1,
+            0.2,
+            {
+                "candidateLengthFraction": 0.20,
+                "routeLengthFraction": 0.11,
+            },
+        )
+        complete = MODULE.RouteCandidate(
+            0,
+            2,
+            np.asarray([[0.0, 0.0], [4.0, -2.0], [10.0, -5.0]]),
+            frozenset((index, 0) for index in range(11)),
+            1,
+            0.55,
+            {
+                "candidateLengthFraction": 0.20,
+                "routeLengthFraction": 0.24,
+            },
+        )
+        self.assertEqual(
+            MODULE.prune_dominated_incomplete_prefixes(
+                [short, complete], pen_up_touches_sibling=False
+            ),
+            [complete],
+        )
+        self.assertEqual(
+            MODULE.prune_dominated_incomplete_prefixes(
+                [short, complete], pen_up_touches_sibling=True
+            ),
+            [short, complete],
+        )
+
+    def test_route_reuse_detects_reverse_centerline_retracing(self):
+        vertical = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[10.0, 0.0], [10.0, 100.0]]),
+            frozenset((10, index) for index in range(101)),
+            1,
+            0.0,
+            {},
+        )
+        reverse_segment = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[10.5, 90.0], [10.5, 30.0]]),
+            frozenset((11, index) for index in range(30, 91)),
+            1,
+            0.0,
+            {},
+        )
+        crossing = MODULE.RouteCandidate(
+            4,
+            5,
+            np.asarray([[0.0, 50.0], [20.0, 50.0]]),
+            frozenset((index, 50) for index in range(21)),
+            1,
+            0.0,
+            {},
+        )
+        self.assertGreater(MODULE.route_reuse_ratio(vertical, reverse_segment), 0.9)
+        self.assertLess(MODULE.route_reuse_ratio(vertical, crossing), 0.25)
+        self.assertGreater(
+            MODULE.centerline_retrace_length(vertical.points, reverse_segment.points),
+            40.0,
+        )
+        self.assertLess(
+            MODULE.centerline_retrace_length(vertical.points, crossing.points),
+            8.0,
+        )
+
+    def test_stable_centerline_retrace_is_not_a_fallback_universe(self):
+        first_points = np.asarray([[0.0, 0.0], [20.0, 0.0]])
+        strokes = [
+            {"componentId": 1, "occurrence": 0, "points": first_points},
+            {
+                "componentId": 2,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 5.0], [20.0, 5.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0, 1, first_points, frozenset((x, 0) for x in range(21)), 1, 0.0, {}
+        )
+        retrace = MODULE.RouteCandidate(
+            0,
+            1,
+            first_points[::-1].copy(),
+            frozenset((x, 1) for x in range(21)),
+            1,
+            -100.0,
+            {},
+        )
+        clean = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[0.0, 5.0], [20.0, 5.0]]),
+            frozenset((x, 5) for x in range(21)),
+            1,
+            0.0,
+            {},
+        )
+        routes, _decision = MODULE.choose_routes(
+            strokes, [[first], [retrace, clean]], total_skeleton_pixels=42
+        )
+        self.assertIs(routes[1], clean)
+
+    def test_candidate_proven_first_stroke_must_reach_leaf_front(self):
+        strokes = [
+            {"points": np.asarray([[0.0, 0.0], [2.0, 2.0]])},
+            {"points": np.asarray([[6.0, 1.0], [8.0, 3.0]])},
+            {"points": np.asarray([[1.0, 6.0], [8.0, 6.0]])},
+        ]
+
+        def route(points):
+            points = np.asarray(points, dtype=float)
+            return MODULE.RouteCandidate(0, 1, points, frozenset(), 1, 0.0, {})
+
+        correct = [
+            route([[10.0, 10.0], [12.0, 13.0]]),
+            route([[16.0, 11.0], [18.0, 14.0]]),
+            route([[10.0, 17.0], [18.0, 17.0]]),
+        ]
+        wrong = [
+            route([[15.0, 15.0], [18.0, 18.0]]),
+            route([[16.0, 11.0], [18.0, 14.0]]),
+            route([[10.0, 12.0], [18.0, 12.0]]),
+        ]
+        _cost, evidence = MODULE.leaf_first_stroke_front_cost(strokes, correct)
+        self.assertTrue(evidence["candidateProvesFront"])
+        self.assertFalse(evidence["hardViolation"])
+        _cost, evidence = MODULE.leaf_first_stroke_front_cost(strokes, wrong)
+        self.assertTrue(evidence["hardViolation"])
+
+    def test_contact_route_skips_an_already_owned_shared_prefix(self):
+        previous = np.asarray([[0.0, 0.0], [0.0, 20.0]])
+        merged_then_branches = np.asarray(
+            [[0.5, 0.0], [0.5, 5.0], [0.5, 10.0], [4.0, 14.0], [9.0, 18.0]]
+        )
+        trimmed, hidden_length = MODULE.trim_contact_retrace_prefix(
+            merged_then_branches,
+            previous,
+        )
+        self.assertGreaterEqual(hidden_length, 8.0)
+        self.assertGreater(trimmed[0, 0], 1.0)
+
+        crossing = np.asarray([[-5.0, 10.0], [0.0, 10.0], [5.0, 10.0]])
+        unchanged, hidden_length = MODULE.trim_contact_retrace_prefix(
+            crossing,
+            previous,
+        )
+        self.assertEqual(hidden_length, 0.0)
+        np.testing.assert_array_equal(unchanged, crossing)
+
+    def test_contact_retrace_variant_is_available_to_global_search(self):
+        strokes = [
+            {"points": np.asarray([[0.0, 0.0], [0.0, 20.0]])},
+            {"points": np.asarray([[0.0, 0.0], [9.0, 18.0]])},
+        ]
+        previous = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [0.0, 20.0]]),
+            frozenset((0, y) for y in range(21)),
+            1,
+            0.0,
+            {},
+        )
+        merged = MODULE.RouteCandidate(
+            0,
+            2,
+            np.asarray(
+                [[0.5, 0.0], [0.5, 5.0], [0.5, 10.0], [4.0, 14.0], [9.0, 18.0]]
+            ),
+            frozenset(),
+            1,
+            0.0,
+            {},
+        )
+        augmented = MODULE.augment_contact_retrace_variants(
+            strokes, [[previous], [merged]]
+        )
+        variants = [
+            option
+            for option in augmented[1]
+            if option.evidence.get("trimmedOwnedContactPrefix")
+        ]
+        self.assertTrue(variants)
+        self.assertGreater(variants[0].points[0, 0], 1.0)
+
+    def test_proven_leaf_front_prevents_later_strokes_from_forcing_bad_first_route(self):
+        strokes = [
+            {
+                "componentId": 9,
+                "occurrence": 0,
+                "points": np.asarray([[0.0, 0.0], [2.0, 2.0]]),
+            },
+            {
+                "componentId": 9,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 1.0], [7.0, 3.0]]),
+            },
+            {
+                "componentId": 9,
+                "occurrence": 0,
+                "points": np.asarray([[1.0, 6.0], [7.0, 6.0]]),
+            },
+        ]
+
+        def option(points, score, pixels):
+            return MODULE.RouteCandidate(
+                0, 1, np.asarray(points, dtype=float), frozenset(pixels), 1, score, {}
+            )
+
+        good_first = option([[0.0, 0.0], [2.0, 2.0]], 0.2, {(0, 0), (1, 1)})
+        globally_tempting_bad_first = option(
+            [[8.0, 8.0], [10.0, 10.0]],
+            1.0,
+            {(x, 8) for x in range(30)},
+        )
+        second = option([[5.0, 1.0], [7.0, 3.0]], 0.0, {(5, 1), (7, 3)})
+        third = option([[1.0, 6.0], [7.0, 6.0]], 0.0, {(1, 6), (7, 6)})
+        routes, _decision = MODULE.choose_routes(
+            strokes,
+            [[good_first, globally_tempting_bad_first], [second], [third]],
+            total_skeleton_pixels=40,
+        )
+        self.assertIs(routes[0], good_first)
+
+    def test_pen_down_contact_can_create_a_virtual_degree_two_start(self):
+        skeleton = np.zeros((12, 12), dtype=bool)
+        skeleton[1, 1:11] = True
+        skeleton[1:11, 1] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        horizontal = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[1.0, 1.0], [10.0, 1.0]]),
+            frozenset((x, 1) for x in range(1, 11)),
+            1,
+            0.0,
+            {"strokeOrderExpectedSector": "E"},
+        )
+        vertical_suffix = MODULE.RouteCandidate(
+            2,
+            3,
+            np.asarray([[1.0, 5.0], [1.0, 10.0]]),
+            frozenset((1, y) for y in range(5, 11)),
+            1,
+            0.0,
+            {
+                "strokeOrderExpectedSector": "S",
+                "candidateLengthFraction": 0.7,
+                "routeLengthFraction": 0.35,
+                "candidatePenDownTouchesSibling": True,
+                "candidatePenUpTouchesSibling": False,
+            },
+        )
+        strokes = [
+            {
+                "feature": "横",
+                "points": np.asarray([[0.0, 0.0], [10.0, 0.0]]),
+            },
+            {
+                "feature": "竖",
+                "points": np.asarray([[0.0, 0.0], [0.0, 10.0]]),
+            },
+        ]
+        augmented = MODULE.augment_pen_down_contact_routes(
+            strokes,
+            [[horizontal], [vertical_suffix]],
+            graph,
+        )
+        full = [
+            option
+            for option in augmented[1]
+            if option.evidence.get("contactSeededVirtualStart")
+        ]
+        self.assertTrue(full)
+        self.assertTrue(np.allclose(full[0].points[0], [1.0, 1.0]))
+        self.assertTrue(np.allclose(full[0].points[-1], [1.0, 10.0]))
 
     def test_open_leaf_beam_keeps_each_first_stroke_universe(self):
         states = []
@@ -406,6 +797,50 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertTrue(
             MODULE.semantic_direction_compatible("撇", "SW", falling_from_pen_down)
         )
+
+    def test_diagonal_dot_requires_material_progress_on_both_axes(self):
+        nearly_vertical = np.asarray([[10.0, 0.0], [11.0, 30.0]])
+        falling_right = np.asarray([[10.0, 0.0], [18.0, 24.0]])
+        self.assertFalse(
+            MODULE.semantic_direction_compatible("点", "SE", nearly_vertical)
+        )
+        self.assertTrue(
+            MODULE.semantic_direction_compatible("点", "SE", falling_right)
+        )
+
+    def test_vertical_turn_rejects_a_straight_diagonal_road(self):
+        stroke = {
+            "componentId": 1,
+            "occurrence": 0,
+            "feature": "竖折",
+            "bendFractions": [0.5],
+            "points": np.asarray(
+                [[0.0, 0.0], [0.0, 10.0], [10.0, 10.0]]
+            ),
+        }
+        diagonal = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [5.0, 10.0]]),
+            frozenset((index, index) for index in range(6)),
+            1,
+            0.0,
+            {},
+        )
+        vertical_turn = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [0.0, 10.0], [8.0, 10.0]]),
+            frozenset({(0, 0), (0, 10), (8, 10)}),
+            1,
+            1.0,
+            {},
+        )
+        guarded, _audit = MODULE.apply_stroke_order_guard(
+            [stroke], [[diagonal, vertical_turn]], source="G", codepoint=0x4E00
+        )
+        self.assertEqual(len(guarded[0]), 1)
+        np.testing.assert_array_equal(guarded[0][0].points, vertical_turn.points)
 
     def test_order_guard_trims_a_calligraphic_cap_before_a_falling_left_trunk(self):
         points = np.asarray(
@@ -1127,6 +1562,31 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertIs(routes[0], complete)
         self.assertFalse(decision["steps"][0]["hardIncompleteStroke"])
 
+    def test_less_than_half_length_route_is_still_severely_incomplete(self):
+        stroke = {"points": np.asarray([[0.0, 0.0], [10.0, 0.0]])}
+        short = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 0.0], [4.9, 0.0]]),
+            frozenset((x, 0) for x in range(5)),
+            1,
+            -20.0,
+            {"candidateLengthFraction": 0.5, "routeLengthFraction": 0.245},
+        )
+        complete = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[0.0, 1.0], [9.0, 1.0]]),
+            frozenset((x, 1) for x in range(10)),
+            1,
+            0.0,
+            {"candidateLengthFraction": 0.5, "routeLengthFraction": 0.48},
+        )
+        routes, _decision = MODULE.choose_routes(
+            [stroke], [[short, complete]], total_skeleton_pixels=15
+        )
+        self.assertIs(routes[0], complete)
+
     def test_large_unexplained_skeleton_forces_review(self):
         stroke = {"points": np.asarray([[0.0, 0.0], [1.0, 0.0]])}
         route = MODULE.RouteCandidate(
@@ -1416,6 +1876,39 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         )
         self.assertIs(routes[1], correct_below)
 
+    def test_adjacent_ids_children_prefer_candidate_declared_boundary_contact(self):
+        upper = {
+            "componentId": 10,
+            "occurrence": 0,
+            "hierarchy": [{"id": 10}, {"id": 100, "label": "⿱"}],
+            "points": np.asarray([[5.0, 0.0], [5.0, 5.0]]),
+        }
+        lower = {
+            "componentId": 20,
+            "occurrence": 0,
+            "hierarchy": [{"id": 20}, {"id": 100, "label": "⿱"}],
+            "points": np.asarray([[5.0, 5.0], [5.0, 10.0]]),
+        }
+        fixed_upper = MODULE.RouteCandidate(
+            0, 1, upper["points"], frozenset((5, y) for y in range(6)),
+            1, 0.0, {},
+        )
+        cheap_but_detached = MODULE.RouteCandidate(
+            2, 3, np.asarray([[10.0, 7.0], [10.0, 12.0]]),
+            frozenset((10, y) for y in range(7, 13)), 1, 0.0, {},
+        )
+        attached_boundary = MODULE.RouteCandidate(
+            4, 5, np.asarray([[5.0, 5.0], [5.0, 11.0]]),
+            frozenset((5, y) for y in range(5, 12)), 1, 0.1, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            [upper, lower],
+            [[fixed_upper], [cheap_but_detached, attached_boundary]],
+            total_skeleton_pixels=18,
+        )
+        self.assertIs(routes[1], attached_boundary)
+        self.assertNotIn("same-leaf-contact-fallback", decision["reviewReasons"])
+
     def test_left_right_root_forces_first_leaf_onto_left_scan_front(self):
         strokes = [
             {
@@ -1532,6 +2025,106 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         self.assertTrue(nested["enabled"])
         self.assertEqual(nested["parentId"], 4274)
         self.assertEqual(nested["operator"], "⿹")
+
+    def test_enclosed_contents_cannot_put_pen_down_outside_upper_left_cover(self):
+        strokes = [
+            {
+                "componentId": 71,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": [
+                    {"id": 71, "label": "末级部件"},
+                    {"id": 5384, "label": "⿸"},
+                ],
+                "points": np.asarray([[20.0, 20.0], [80.0, 20.0]]),
+            },
+            {
+                "componentId": 934,
+                "occurrence": 0,
+                "feature": "点",
+                "hierarchy": [
+                    {"id": 934, "label": "末级部件"},
+                    {"id": 5384, "label": "⿸"},
+                ],
+                "points": np.asarray([[45.0, 40.0], [50.0, 50.0]]),
+            },
+        ]
+        cover = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[20.0, 20.0], [80.0, 20.0]]),
+            frozenset({(20, 20), (50, 20), (80, 20)}),
+            1,
+            0.0,
+            {},
+        )
+        wrong_above = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[45.0, 8.0], [50.0, 16.0]]),
+            frozenset({(45, 8), (48, 12), (50, 16)}),
+            1,
+            -5.0,
+            {},
+        )
+        correct_inside = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[45.0, 40.0], [50.0, 50.0]]),
+            frozenset({(45, 40), (48, 45), (50, 50)}),
+            1,
+            0.0,
+            {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[cover], [wrong_above, correct_inside]],
+            total_skeleton_pixels=6,
+        )
+        self.assertIs(routes[1], correct_inside)
+        domain = decision["steps"][1]["enclosureContentDomain"]
+        self.assertTrue(domain["enabled"])
+        self.assertEqual(domain["parentId"], 5384)
+        self.assertFalse(domain["hardViolation"])
+
+    def test_enclosure_scope_coexists_with_contact_union_groups(self):
+        hierarchy = lambda component: [
+            {"id": component, "label": "末级部件"},
+            {"id": 5384, "label": "⿸"},
+        ]
+        strokes = [
+            {
+                "componentId": 71,
+                "occurrence": 0,
+                "feature": "横",
+                "hierarchy": hierarchy(71),
+                "points": np.asarray([[20.0, 20.0], [80.0, 20.0]]),
+            },
+            {
+                "componentId": 71,
+                "occurrence": 0,
+                "feature": "撇",
+                "hierarchy": hierarchy(71),
+                "points": np.asarray([[20.0, 20.0], [15.0, 80.0]]),
+            },
+            {
+                "componentId": 934,
+                "occurrence": 0,
+                "feature": "点",
+                "hierarchy": hierarchy(934),
+                "points": np.asarray([[45.0, 40.0], [50.0, 50.0]]),
+            },
+        ]
+        routes = [
+            MODULE.RouteCandidate(
+                0, 1, stroke["points"], frozenset({tuple(stroke["points"][0].astype(int)), tuple(stroke["points"][-1].astype(int))}), 1, 0.0, {}
+            )
+            for stroke in strokes
+        ]
+        selected, _decision = MODULE.choose_routes(
+            strokes, [[route] for route in routes], total_skeleton_pixels=6
+        )
+        self.assertEqual(selected, routes)
 
     def test_nested_vertical_structure_rejects_lower_child_above_upper_child(self):
         strokes = [

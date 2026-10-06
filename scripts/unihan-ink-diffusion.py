@@ -23,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 
 
@@ -156,6 +156,156 @@ def build_skeleton_graph(skeleton: np.ndarray) -> SkeletonGraph:
         crossing,
         tuple(scan_seeds),
     )
+
+
+def completed_leaf_residual_closure(
+    strokes: list[dict],
+    routes: list[RouteCandidate],
+    graph: SkeletonGraph,
+    candidate_join_tolerance: float = 2.0,
+    pdf_join_tolerance: float = 4.0,
+    maximum_absolute_pixels: int = 28,
+    maximum_leaf_fraction: float = 0.12,
+) -> frozenset[tuple[int, int]]:
+    """Claim bounded terminal ink after every semantic stroke of a leaf exists.
+
+    Two conservative cases are accepted.  A branch immediately behind a
+    pen-down shared by two strokes is a calligraphic cap/butt when candidate
+    and PDF topology both prove that joint.  More generally, once a whole leaf
+    is complete, a short terminal residual attached only a few times and
+    contained in the leaf's own bounds is width/detail ink rather than a new
+    centreline.  Large, non-terminal, or out-of-bounds residual roads remain
+    available to later leaves.
+    """
+    if len(strokes) < 2 or len(strokes) != len(routes):
+        return frozenset()
+    selected_nodes = {
+        index
+        for route in routes
+        for x, y in route.pixels
+        if (index := graph.point_index.get((int(y), int(x)))) is not None
+    }
+    if not selected_nodes:
+        return frozenset()
+    keep = np.ones(len(graph.points), dtype=bool)
+    keep[list(selected_nodes)] = False
+    remaining_nodes = np.flatnonzero(keep)
+    if not len(remaining_nodes):
+        return frozenset()
+    _count, labels = connected_components(
+        graph.matrix[keep][:, keep], directed=False
+    )
+    original_to_label = {
+        int(original): int(labels[position])
+        for position, original in enumerate(remaining_nodes)
+    }
+    selected_count = len(selected_nodes)
+    maximum_pixels = max(
+        6,
+        min(
+            maximum_absolute_pixels,
+            int(math.ceil(maximum_leaf_fraction * selected_count)),
+        ),
+    )
+    claimed: set[tuple[int, int]] = set()
+    adjacency = graph_adjacency(graph.matrix)
+    for left in range(len(strokes)):
+        for right in range(left):
+            candidate_left = np.asarray(strokes[left]["points"], dtype=float)[0]
+            candidate_right = np.asarray(strokes[right]["points"], dtype=float)[0]
+            if np.linalg.norm(candidate_left - candidate_right) > candidate_join_tolerance:
+                continue
+            pdf_left = np.asarray(routes[left].points, dtype=float)[0]
+            pdf_right = np.asarray(routes[right].points, dtype=float)[0]
+            if np.linalg.norm(pdf_left - pdf_right) > pdf_join_tolerance:
+                continue
+            joint = (pdf_left + pdf_right) / 2.0
+            joint_neighbours = []
+            for selected in selected_nodes:
+                y, x = graph.points[selected]
+                if np.linalg.norm(np.asarray([x, y], dtype=float) - joint) > pdf_join_tolerance:
+                    continue
+                joint_neighbours.extend(
+                    neighbour
+                    for neighbour, _step in adjacency[selected]
+                    if neighbour not in selected_nodes
+                )
+            candidate_labels = {
+                original_to_label[neighbour]
+                for neighbour in joint_neighbours
+                if neighbour in original_to_label
+            }
+            for label in candidate_labels:
+                members = remaining_nodes[labels == label]
+                if not len(members) or len(members) > maximum_pixels:
+                    continue
+                member_set = set(map(int, members))
+                if not any(
+                    graph.crossing[tuple(graph.points[member])] == 1
+                    for member in member_set
+                ):
+                    continue
+                attachment_nodes = {
+                    selected
+                    for member in member_set
+                    for selected, _step in adjacency[member]
+                    if selected in selected_nodes
+                }
+                if not attachment_nodes:
+                    continue
+                # A cap is attached only at the proved shared pen-down.  A
+                # residual that reconnects elsewhere is a real unassigned
+                # road and must remain available to later strokes.
+                if any(
+                    np.linalg.norm(
+                        graph.points[selected][::-1].astype(float) - joint
+                    )
+                    > pdf_join_tolerance
+                    for selected in attachment_nodes
+                ):
+                    continue
+                claimed.update(
+                    (int(graph.points[member][1]), int(graph.points[member][0]))
+                    for member in member_set
+                )
+
+    selected_xy = graph.points[np.asarray(sorted(selected_nodes), dtype=int)][:, ::-1]
+    lower = selected_xy.min(axis=0).astype(float)
+    upper = selected_xy.max(axis=0).astype(float)
+    diagonal = float(np.linalg.norm(upper - lower))
+    margin = max(4.0, min(10.0, 0.05 * diagonal))
+    adjacent_labels = {
+        original_to_label[neighbour]
+        for selected in selected_nodes
+        for neighbour, _step in adjacency[selected]
+        if neighbour in original_to_label
+    }
+    for label in adjacent_labels:
+        members = remaining_nodes[labels == label]
+        if not len(members) or len(members) > maximum_pixels:
+            continue
+        member_set = set(map(int, members))
+        if not any(
+            graph.crossing[tuple(graph.points[member])] == 1
+            for member in member_set
+        ):
+            continue
+        attachment_nodes = {
+            selected
+            for member in member_set
+            for selected, _step in adjacency[member]
+            if selected in selected_nodes
+        }
+        if not 1 <= len(attachment_nodes) <= 4:
+            continue
+        member_xy = graph.points[members][:, ::-1].astype(float)
+        if np.any(member_xy < lower - margin) or np.any(member_xy > upper + margin):
+            continue
+        claimed.update(
+            (int(graph.points[member][1]), int(graph.points[member][0]))
+            for member in member_set
+        )
+    return frozenset(claimed)
 
 
 def reconstruct_path(
@@ -309,6 +459,22 @@ def semantic_direction_compatible(
     if not order.sector_compatible(expected_sector, observed):
         return False
     points = np.asarray(points, dtype=float)
+    if expected_sector in {"NE", "NW", "SE", "SW"} and len(points) >= 2:
+        displacement = points[-1] - points[0]
+        length = float(np.linalg.norm(displacement))
+        if length <= 1e-6:
+            return False
+        expected_x = 1.0 if "E" in expected_sector else -1.0
+        expected_y = 1.0 if "S" in expected_sector else -1.0
+        # A short calligraphic cap may perturb the pen-down tangent, but a
+        # semantic diagonal cannot collapse into a vertical/horizontal road.
+        # Judge its complete directed trunk and require both signed axes to
+        # contribute materially.
+        if (
+            expected_x * float(displacement[0]) < 0.12 * length
+            or expected_y * float(displacement[1]) < 0.12 * length
+        ):
+            return False
     if feature != "撇" or len(points) < 2:
         return True
     # The whole route may eventually travel left and down even after taking an
@@ -339,6 +505,47 @@ def semantic_direction_compatible(
         and float(displacement[0]) < -0.12 * length
         and float(displacement[1]) > 0.12 * length
     )
+
+
+def compound_terminal_direction_compatible(
+    stroke: dict,
+    points: np.ndarray,
+    tolerance_degrees: float = 40.0,
+) -> bool:
+    """Require a compound road to finish in the candidate's final direction.
+
+    Absolute candidate geometry is untrusted, but a named fold's directed
+    sequence is semantic: 竖折 must eventually turn from down to right, for
+    example.  Initial-sector checking alone lets a straight diagonal steal
+    such a stroke because adjacent octants are deliberately tolerated.
+    """
+    if not stroke.get("bendFractions"):
+        return True
+    expected = resample(np.asarray(stroke["points"], dtype=float), 24)
+    observed = resample(np.asarray(points, dtype=float), 24)
+    expected_tail = expected[-1] - expected[-6]
+    observed_tail = observed[-1] - observed[-6]
+    expected_length = float(np.linalg.norm(expected_tail))
+    observed_length = float(np.linalg.norm(observed_tail))
+    if expected_length <= 1e-6 or observed_length <= 1e-6:
+        return False
+    # A compound's last semantic segment must preserve every material signed
+    # axis of the candidate.  Angle tolerance alone lets 横撇 collapse into
+    # 横折竖: a vertical tail is only ~20 degrees away from a steep 撇, yet it
+    # has lost the decisive leftward motion.  Ignore axes that are genuinely
+    # tiny in the candidate so ordinary font variation remains free.
+    for axis in (0, 1):
+        expected_axis = float(expected_tail[axis])
+        if abs(expected_axis) < 0.20 * expected_length:
+            continue
+        observed_axis = float(observed_tail[axis])
+        if math.copysign(1.0, expected_axis) * observed_axis < 0.08 * observed_length:
+            return False
+    alignment = float(
+        np.dot(expected_tail, observed_tail)
+        / (expected_length * observed_length)
+    )
+    return alignment >= math.cos(math.radians(tolerance_degrees))
 
 
 def allows_diagonal_seed_route(
@@ -535,7 +742,20 @@ def stroke_contact_matrix(strokes: list[dict], threshold: float = 3.0) -> np.nda
     matrix = np.zeros((size, size), dtype=bool)
     for left in range(size):
         for right in range(left):
-            contact = polyline_distance(strokes[left]["points"], strokes[right]["points"]) <= threshold
+            left_fraction, right_fraction, distance = contact_signature(
+                strokes[left]["points"], strokes[right]["points"]
+            )
+            # Stroke-width tolerance may make two nearby roads look optically
+            # adjacent, but two distinct pen-up endpoints separated by air do
+            # not form a topological contact.  This matters for 点/撇 pairs:
+            # their ends may be close without either stroke continuing into
+            # the other.  Exact pen-up joins (折/竖, for example) remain valid.
+            separated_pen_ups = (
+                distance > 0.75
+                and left_fraction >= 0.88
+                and right_fraction >= 0.88
+            )
+            contact = distance <= threshold and not separated_pen_ups
             matrix[left, right] = matrix[right, left] = contact
     return matrix
 
@@ -1371,6 +1591,10 @@ def rank_routes(
             options,
             candidate_start_is_contact[stroke_index],
         )
+        options = prune_dominated_incomplete_prefixes(
+            options,
+            candidate_end_is_contact[stroke_index],
+        )
         if not options:
             ranked.append([])
             continue
@@ -1506,6 +1730,9 @@ def apply_stroke_order_guard(
                 expectation.feature,
                 expectation.expected_sector,
                 option.points,
+            ) and compound_terminal_direction_compatible(
+                strokes[expectation.stroke_index],
+                option.points,
             ):
                 evidence = {
                     **option.evidence,
@@ -1595,6 +1822,44 @@ def normalize_selected_pen_paths(
         route = trim_selected_vertical_medial_spur(route, expectation.expected_sector)
         route = normalize_hook_terminal_branch(route, graph, str(stroke.get("feature", "")))
         normalized.append(route)
+    return normalized
+
+
+def normalize_ranked_pen_paths(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    graph: SkeletonGraph,
+    source: str,
+    codepoint: int,
+    normative_catalog=None,
+) -> list[list[RouteCandidate]]:
+    """Expose final centreline topology to whole-character route selection.
+
+    Hook/cap normalization changes only a route's directed centreline, not its
+    owned ink.  Nevertheless that centreline is exactly what contact and
+    co-tracing constraints reason about.  Delaying normalization until after
+    beam search can therefore create a conflict that the search never saw.
+    """
+    expectations = RESIDUAL_DECODER.ORDER.compile_stroke_expectations(
+        strokes,
+        source,
+        codepoint,
+        normative_catalog,
+    )
+    normalized = []
+    for stroke, options, expectation in zip(strokes, ranked, expectations):
+        normalized.append(
+            [
+                normalize_hook_terminal_branch(
+                    trim_selected_vertical_medial_spur(
+                        option, expectation.expected_sector
+                    ),
+                    graph,
+                    str(stroke.get("feature", "")),
+                )
+                for option in options
+            ]
+        )
     return normalized
 
 
@@ -1918,6 +2183,306 @@ def apply_stroke_topology_guard(
     return guarded, audit
 
 
+def augment_pen_down_contact_routes(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    graph: SkeletonGraph,
+    previous_option_limit: int = 24,
+    current_option_limit: int = 24,
+) -> list[list[RouteCandidate]]:
+    """Create routes whose semantic pen-down is a degree-two contact point.
+
+    Static skeleton enumeration starts roads at endpoints, junction clusters,
+    and scan fronts.  A genuine stroke can instead start where it touches the
+    middle of an earlier stroke; in the merged whole-glyph skeleton that L
+    contact may have degree two and is therefore invisible as a critical node.
+    Candidate contact fractions tell us where to add that virtual start.  The
+    resulting road is still found entirely on the PDF skeleton.
+    """
+    if len(strokes) != len(ranked) or not graph.points.size:
+        return ranked
+    expected_contact = stroke_contact_matrix(strokes)
+    adjacency = graph_adjacency(graph.matrix)
+    graph_xy = graph.points[:, ::-1].astype(float)
+    graph_tree = cKDTree(graph_xy)
+    target_min = graph_xy.min(axis=0)
+    target_max = graph_xy.max(axis=0)
+    target_diagonal = max(1.0, float(np.linalg.norm(target_max - target_min)))
+    candidate_points = np.vstack(
+        [np.asarray(stroke["points"], dtype=float) for stroke in strokes]
+    )
+    candidate_min = candidate_points.min(axis=0)
+    candidate_max = candidate_points.max(axis=0)
+    output = [list(options) for options in ranked]
+    path_cache: dict[tuple[int, int], tuple[list[int] | None, float]] = {}
+
+    for current_index, current_options in enumerate(ranked):
+        for previous_index in range(current_index):
+            if not expected_contact[current_index, previous_index]:
+                continue
+            current_fraction, previous_fraction, _distance = contact_signature(
+                np.asarray(strokes[current_index]["points"], dtype=float),
+                np.asarray(strokes[previous_index]["points"], dtype=float),
+            )
+            # This mechanism supplies a missing pen-down only.  Mid-stroke and
+            # pen-up contacts are already represented by ordinary graph roads.
+            if current_fraction > 0.16:
+                continue
+            previous_options = ranked[previous_index][:previous_option_limit]
+            suffix_options = current_options[:current_option_limit]
+            generated = []
+            seen_seed_end: set[tuple[int, int]] = set()
+            for previous in previous_options:
+                seed_samples = resample(previous.points, 101)
+                seed_point = seed_samples[
+                    min(100, max(0, int(round(previous_fraction * 100))))
+                ]
+                _seed_distance, seed_node = graph_tree.query(seed_point)
+                seed_node = int(seed_node)
+                for suffix in suffix_options:
+                    _end_distance, end_node = graph_tree.query(suffix.points[-1])
+                    end_node = int(end_node)
+                    seed_end = (seed_node, end_node)
+                    if seed_end in seen_seed_end:
+                        continue
+                    seen_seed_end.add(seed_end)
+                    if seed_end not in path_cache:
+                        path_cache[seed_end] = shortest_indices(
+                            adjacency, seed_node, end_node
+                        )
+                    indices, _length = path_cache[seed_end]
+                    if not indices or len(indices) < 3:
+                        continue
+                    points = graph_xy[np.asarray(indices, dtype=int)]
+                    displacement = points[-1] - points[0]
+                    feature = str(strokes[current_index].get("feature", ""))
+                    # A PDF 撇 may begin vertically at 厂-like contacts before
+                    # bending down-left.  Require its whole directed road to
+                    # retain that semantic progress, without imposing the
+                    # candidate's exact initial tangent.
+                    if feature == "撇" and not (
+                        float(displacement[0]) < -2.0
+                        and float(displacement[1]) > 2.0
+                    ):
+                        continue
+                    direction = direction_dtw(
+                        np.asarray(strokes[current_index]["points"], dtype=float),
+                        points,
+                    )
+                    turn = abs(
+                        total_turn(points)
+                        - total_turn(
+                            np.asarray(strokes[current_index]["points"], dtype=float)
+                        )
+                    ) / math.pi
+                    route_start = normalized_point(
+                        points[0], (target_min, target_max)
+                    )
+                    expected_start = normalized_point(
+                        np.asarray(strokes[current_index]["points"], dtype=float)[0],
+                        (candidate_min, candidate_max),
+                    )
+                    ordinal = float(np.linalg.norm(route_start - expected_start))
+                    route_length = float(
+                        np.linalg.norm(np.diff(points, axis=0), axis=1).sum()
+                    )
+                    evidence = {
+                        **suffix.evidence,
+                        "directionGrammar": round(direction, 5),
+                        "turnGrammar": round(turn, 5),
+                        "ordinalTieBreak": round(ordinal, 5),
+                        "routeLengthFraction": round(
+                            route_length / target_diagonal, 5
+                        ),
+                        "contactSeededVirtualStart": True,
+                        "contactSeedPreviousStroke": previous_index + 1,
+                        "contactSeedPreviousFraction": round(previous_fraction, 5),
+                        "candidatePenDownTouchesSibling": True,
+                        "routePenDownRole": point_topology_role(graph, points[0]),
+                        "routePenUpRole": point_topology_role(graph, points[-1]),
+                        "completeStrokeTopology": True,
+                    }
+                    generated.append(
+                        RouteCandidate(
+                            start_node=seed_node,
+                            end_node=end_node,
+                            points=points,
+                            pixels=frozenset(
+                                (int(round(float(x))), int(round(float(y))))
+                                for x, y in points
+                            ),
+                            component=int(
+                                graph.components[
+                                    int(round(float(points[0, 1]))),
+                                    int(round(float(points[0, 0]))),
+                                ]
+                            ),
+                            score=(
+                                5.0 * direction
+                                + 0.8 * turn
+                                + 0.12 * ordinal
+                            ),
+                            evidence=evidence,
+                        )
+                    )
+            if generated:
+                output[current_index].extend(generated)
+                output[current_index].sort(key=lambda option: option.score)
+    return output
+
+
+def augment_contact_retrace_variants(
+    strokes: list[dict],
+    ranked: list[list[RouteCandidate]],
+    previous_option_limit: int = 24,
+    generated_limit: int = 24,
+) -> list[list[RouteCandidate]]:
+    """Add non-redrawing variants for merged pen-down contact stems.
+
+    The original full road remains available for hypotheses where no earlier
+    selected stroke owns the stem.  A trimmed variant lets whole-character
+    search pair the same semantic continuation with an earlier owner without
+    ever colouring the shared centreline twice.
+    """
+    if len(strokes) != len(ranked):
+        return ranked
+    expected_contact = stroke_contact_matrix(strokes)
+    output = [list(options) for options in ranked]
+    group_members: dict[tuple[int, int], list[int]] = {}
+    for index, stroke in enumerate(strokes):
+        key = (int(stroke.get("componentId", -1)), int(stroke.get("occurrence", 0)))
+        group_members.setdefault(key, []).append(index)
+    representative_points = [
+        options[0].points for options in ranked if options and len(options[0].points)
+    ]
+    if representative_points:
+        route_points = np.vstack(representative_points)
+        route_diagonal = float(
+            np.linalg.norm(route_points.max(axis=0) - route_points.min(axis=0))
+        )
+    else:
+        route_diagonal = 0.0
+    broad_ink_radius = max(6.0, min(12.0, route_diagonal * 0.035))
+    for current_index, current_options in enumerate(ranked):
+        contact_predecessors = []
+        for previous_index in range(current_index):
+            if not expected_contact[current_index, previous_index]:
+                continue
+            current_fraction, _previous_fraction, _distance = contact_signature(
+                np.asarray(strokes[current_index]["points"], dtype=float),
+                np.asarray(strokes[previous_index]["points"], dtype=float),
+            )
+            if current_fraction <= 0.16:
+                contact_predecessors.append(previous_index)
+        if not contact_predecessors:
+            continue
+        generated = []
+        seen: set[tuple[tuple[int, int], ...]] = set()
+        for current in current_options:
+            for previous_index in contact_predecessors:
+                for previous in ranked[previous_index][:previous_option_limit]:
+                    trimmed, hidden_length = trim_contact_retrace_prefix(
+                        current.points,
+                        previous.points,
+                    )
+                    if hidden_length <= 0.0 or len(trimmed) < 2:
+                        continue
+                    key = tuple(
+                        (int(round(float(x))), int(round(float(y))))
+                        for x, y in trimmed
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    generated.append(
+                        RouteCandidate(
+                            start_node=current.start_node,
+                            end_node=current.end_node,
+                            points=trimmed,
+                            pixels=frozenset(key),
+                            component=current.component,
+                            # Removing an already-owned prefix is strictly
+                            # preferable to redrawing it, all else equal.
+                            score=current.score - 0.01,
+                            evidence={
+                                **current.evidence,
+                                "trimmedOwnedContactPrefix": True,
+                                "trimmedOwnedContactPreviousStroke": previous_index + 1,
+                                "trimmedOwnedContactLength": round(hidden_length, 5),
+                            },
+                        )
+                    )
+                    if len(generated) >= generated_limit:
+                        break
+                if len(generated) >= generated_limit:
+                    break
+            if len(generated) >= generated_limit:
+                break
+        if generated:
+            output[current_index].extend(generated)
+            output[current_index].sort(key=lambda option: option.score)
+
+        current_key = (
+            int(strokes[current_index].get("componentId", -1)),
+            int(strokes[current_index].get("occurrence", 0)),
+        )
+        members = group_members[current_key]
+        is_contacting_human_leaf = (
+            len(members) == 2
+            and members[0] == current_index
+            and [str(strokes[index].get("feature") or "") for index in members]
+            == ["撇", "捺"]
+            and current_index > 0
+            and expected_contact[current_index, current_index - 1]
+        )
+        if not is_contacting_human_leaf:
+            continue
+        previous_index = current_index - 1
+        broad_variants = []
+        broad_seen: set[tuple[tuple[int, int], ...]] = set()
+        for current in current_options:
+            for previous in ranked[previous_index][:previous_option_limit]:
+                trimmed, hidden_length = trim_broad_ink_contact_prefix(
+                    current.points,
+                    previous.points,
+                    broad_ink_radius,
+                )
+                if hidden_length <= 0.0 or len(trimmed) < 2:
+                    continue
+                key = tuple(
+                    (int(round(float(x))), int(round(float(y))))
+                    for x, y in trimmed
+                )
+                if key in broad_seen:
+                    continue
+                broad_seen.add(key)
+                broad_variants.append(
+                    RouteCandidate(
+                        start_node=current.start_node,
+                        end_node=current.end_node,
+                        points=trimmed,
+                        pixels=frozenset(key),
+                        component=current.component,
+                        score=current.score - 0.02,
+                        evidence={
+                            **current.evidence,
+                            "trimmedBroadInkContactPrefix": True,
+                            "trimmedBroadInkContactPreviousStroke": previous_index + 1,
+                            "trimmedBroadInkContactLength": round(hidden_length, 5),
+                            "broadInkRadius": round(broad_ink_radius, 5),
+                        },
+                    )
+                )
+                if len(broad_variants) >= generated_limit:
+                    break
+            if len(broad_variants) >= generated_limit:
+                break
+        if broad_variants:
+            output[current_index].extend(broad_variants)
+            output[current_index].sort(key=lambda option: option.score)
+    return output
+
+
 def compact_route_hypotheses(
     ranked: list[list[RouteCandidate]],
     global_limit: int = 24,
@@ -2034,11 +2599,184 @@ def violates_strong_relative_axis_order(
     return False
 
 
+def centerline_retrace_ratio(
+    first: np.ndarray,
+    second: np.ndarray,
+    distance_threshold: float = 2.2,
+    parallel_threshold_degrees: float = 30.0,
+) -> float:
+    """Fraction of the shorter directed road that co-traces the other road.
+
+    Ink ownership is intentionally exclusive, so two strokes that traverse
+    the same skeleton can have disjoint owned-pixel sets.  Measure the actual
+    centrelines as well: nearby *parallel or anti-parallel* tangents are a
+    retrace, while an ordinary transverse intersection is not.
+    """
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    if len(first) < 2 or len(second) < 2:
+        return 0.0
+    first_length = float(np.linalg.norm(np.diff(first, axis=0), axis=1).sum())
+    second_length = float(np.linalg.norm(np.diff(second, axis=0), axis=1).sum())
+    short, long = (first, second) if first_length <= second_length else (second, first)
+    short_length = min(first_length, second_length)
+    long_length = max(first_length, second_length)
+    short_count = min(240, max(24, int(math.ceil(short_length)) + 1))
+    long_count = min(320, max(32, int(math.ceil(long_length)) + 1))
+    short_samples = resample(short, short_count)
+    long_samples = resample(long, long_count)
+    distances, nearest = cKDTree(long_samples).query(short_samples)
+
+    def unit_tangents(points: np.ndarray) -> np.ndarray:
+        vectors = np.gradient(points, axis=0)
+        lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+        return vectors / np.maximum(lengths, 1e-9)
+
+    short_tangents = unit_tangents(short_samples)
+    long_tangents = unit_tangents(long_samples)
+    alignment = np.abs(
+        np.sum(short_tangents * long_tangents[np.asarray(nearest, dtype=int)], axis=1)
+    )
+    parallel = alignment >= math.cos(math.radians(parallel_threshold_degrees))
+    return float(np.mean((distances <= distance_threshold) & parallel))
+
+
+def centerline_retrace_length(first: np.ndarray, second: np.ndarray) -> float:
+    """Approximate stable length of shared centreline, excluding point crossings."""
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    if len(first) < 2 or len(second) < 2:
+        return 0.0
+    shorter = min(
+        float(np.linalg.norm(np.diff(first, axis=0), axis=1).sum()),
+        float(np.linalg.norm(np.diff(second, axis=0), axis=1).sum()),
+    )
+    return shorter * centerline_retrace_ratio(first, second)
+
+
+def trim_contact_retrace_prefix(
+    current: np.ndarray,
+    previous: np.ndarray,
+    minimum_hidden_length: float = 8.0,
+    distance_threshold: float = 2.2,
+    parallel_threshold_degrees: float = 30.0,
+) -> tuple[np.ndarray, float]:
+    """Skip a merged skeleton stem already owned by an earlier stroke.
+
+    A broad calligraphic contact can collapse two genuinely distinct stroke
+    centrelines into one medial-axis prefix.  The later pen must not redraw
+    that shared edge.  When (and only when) co-tracing begins at its pen-down
+    and persists for a stable length, return the road from the first genuine
+    divergence.  A transverse point crossing is left unchanged.
+    """
+    current = np.asarray(current, dtype=float)
+    previous = np.asarray(previous, dtype=float)
+    if len(current) < 2 or len(previous) < 2:
+        return current, 0.0
+    current_length = float(np.linalg.norm(np.diff(current, axis=0), axis=1).sum())
+    previous_length = float(np.linalg.norm(np.diff(previous, axis=0), axis=1).sum())
+    if current_length <= minimum_hidden_length or previous_length <= 1e-6:
+        return current, 0.0
+    current_samples = resample(
+        current, min(320, max(32, int(math.ceil(current_length)) + 1))
+    )
+    previous_samples = resample(
+        previous, min(320, max(32, int(math.ceil(previous_length)) + 1))
+    )
+
+    def unit_tangents(points: np.ndarray) -> np.ndarray:
+        vectors = np.gradient(points, axis=0)
+        lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+        return vectors / np.maximum(lengths, 1e-9)
+
+    distances, nearest = cKDTree(previous_samples).query(current_samples)
+    alignment = np.abs(
+        np.sum(
+            unit_tangents(current_samples)
+            * unit_tangents(previous_samples)[np.asarray(nearest, dtype=int)],
+            axis=1,
+        )
+    )
+    shared = (distances <= distance_threshold) & (
+        alignment >= math.cos(math.radians(parallel_threshold_degrees))
+    )
+    # This operation is only for a shared *prefix*.  A later crossing or a
+    # nearby parallel road must not move the semantic pen-down.
+    if not bool(shared[0]):
+        return current, 0.0
+    last_shared = 0
+    gap = 0
+    divergence = 1
+    for index in range(1, len(shared)):
+        if bool(shared[index]):
+            last_shared = index
+            gap = 0
+            continue
+        gap += 1
+        if gap > 2:
+            divergence = index
+            break
+    lengths = np.linalg.norm(np.diff(current_samples, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(lengths)]
+    hidden_length = float(cumulative[last_shared])
+    if hidden_length < minimum_hidden_length or last_shared >= len(current_samples) - 2:
+        return current, 0.0
+    divergence = min(len(current_samples) - 2, max(divergence, last_shared + 1))
+    return current_samples[divergence:].copy(), hidden_length
+
+
+def trim_broad_ink_contact_prefix(
+    current: np.ndarray,
+    previous: np.ndarray,
+    ink_radius: float,
+    minimum_hidden_length: float = 4.0,
+) -> tuple[np.ndarray, float]:
+    """Start a child stroke where it exits the preceding stroke's broad ink.
+
+    Candidate paths are centrelines, while a PDF glyph contains thick ink.
+    For a semantic 撇＋捺 leaf such as 人, its first stroke may be generated
+    from inside the previous stroke's ink although its own visible centreline
+    starts only at the ink boundary.  Return that suffix without asserting
+    that the two centrelines themselves must meet.
+    """
+    current = np.asarray(current, dtype=float)
+    previous = np.asarray(previous, dtype=float)
+    if len(current) < 3 or len(previous) < 2 or ink_radius <= 0:
+        return current, 0.0
+    current_length = float(np.linalg.norm(np.diff(current, axis=0), axis=1).sum())
+    if current_length <= minimum_hidden_length:
+        return current, 0.0
+    samples = resample(
+        current, min(320, max(32, int(math.ceil(current_length)) + 1))
+    )
+    previous_length = float(np.linalg.norm(np.diff(previous, axis=0), axis=1).sum())
+    previous_samples = resample(
+        previous, min(320, max(32, int(math.ceil(previous_length)) + 1))
+    )
+    distances = cKDTree(previous_samples).query(samples)[0]
+    # This is an exit-from-ink operation, never a generic mid-stroke trim.
+    if float(distances[0]) > ink_radius * 0.35:
+        return current, 0.0
+    exit_index = None
+    for index in range(1, len(samples) - 2):
+        if np.all(distances[index : index + 3] >= ink_radius):
+            exit_index = index
+            break
+    if exit_index is None:
+        return current, 0.0
+    lengths = np.linalg.norm(np.diff(samples, axis=0), axis=1)
+    hidden_length = float(lengths[:exit_index].sum())
+    if hidden_length < minimum_hidden_length:
+        return current, 0.0
+    return samples[exit_index:].copy(), hidden_length
+
+
 def route_reuse_ratio(first: RouteCandidate, second: RouteCandidate) -> float:
-    """Fraction of the shorter centreline already consumed by another pen."""
-    return len(first.pixels & second.pixels) / max(
+    """Fraction of a shorter ink region or centreline reused by another pen."""
+    pixel_reuse = len(first.pixels & second.pixels) / max(
         1, min(len(first.pixels), len(second.pixels))
     )
+    return max(pixel_reuse, centerline_retrace_ratio(first.points, second.points))
 
 
 def route_completion_ratio(option: RouteCandidate) -> float | None:
@@ -2080,6 +2818,51 @@ def prune_dominated_contact_start_suffixes(
             and float(np.linalg.norm(long.points[-1] - short.points[-1])) <= 2.5
             and len(long.pixels & short.pixels) / short_length
             >= minimum_suffix_overlap
+            for long in options
+        )
+        if not dominated:
+            kept.append(short)
+    return kept or options
+
+
+def prune_dominated_incomplete_prefixes(
+    options: list[RouteCandidate],
+    pen_up_touches_sibling: bool,
+    maximum_incomplete_ratio: float = 0.72,
+    minimum_complete_ratio: float = 0.82,
+    maximum_complete_ratio: float = 1.65,
+    minimum_prefix_overlap: float = 0.88,
+    maximum_score_regret: float = 0.60,
+) -> list[RouteCandidate]:
+    """Remove a free pen-up that stops halfway along the same centreline.
+
+    Skeleton junctions created by touching components can make a half stroke
+    locally cheap: its direction looks right and it ends at a legal graph
+    node.  If another route starts at the same pen-down, contains essentially
+    that whole prefix, and reaches a candidate-scale completion, the short
+    route is not an alternative writing universe; it is premature convergence.
+
+    Contact pen-ups are excluded because ending at a sibling junction can be
+    semantic.  A bounded score regret and completion window keep an arbitrary
+    excursion through neighbouring ink from masquerading as the extension.
+    """
+    if pen_up_touches_sibling or len(options) < 2:
+        return options
+    kept = []
+    for short in options:
+        short_completion = route_completion_ratio(short)
+        if short_completion is None or short_completion > maximum_incomplete_ratio:
+            kept.append(short)
+            continue
+        short_length = max(1, len(short.pixels))
+        dominated = any(
+            long is not short
+            and long.score <= short.score + maximum_score_regret
+            and float(np.linalg.norm(long.points[0] - short.points[0])) <= 2.5
+            and len(long.pixels & short.pixels) / short_length
+            >= minimum_prefix_overlap
+            and (long_completion := route_completion_ratio(long)) is not None
+            and minimum_complete_ratio <= long_completion <= maximum_complete_ratio
             for long in options
         )
         if not dominated:
@@ -2152,6 +2935,63 @@ def leaf_centroid_order_cost(
             for point in centroids
         ],
         "mismatch": mismatch,
+    }
+
+
+def leaf_first_stroke_front_cost(
+    strokes: list[dict],
+    routes: list[RouteCandidate],
+    proof_margin: float = 0.14,
+    hard_margin: float = 0.18,
+) -> tuple[float, dict]:
+    """Transfer only a proven leaf-internal first-stroke ordering relation.
+
+    Candidate scale/placement is ignored.  If its first stroke lies on the
+    normalized upper-left front of the complete leaf, the PDF hypothesis must
+    preserve that ordinal fact.  This implements the adaptive diagonal scan
+    inside the already known leaf scope rather than across the whole glyph.
+    """
+    if not strokes or len(strokes) != len(routes):
+        return 0.0, {"enabled": False, "reason": "incomplete-leaf"}
+    if len(strokes) < 3:
+        return 0.0, {
+            "enabled": False,
+            "reason": "insufficient-multi-stroke-context",
+        }
+
+    def normalized_fronts(items: list[np.ndarray]) -> list[float]:
+        combined = np.vstack(items)
+        minimum = combined.min(axis=0)
+        span = np.maximum(combined.max(axis=0) - minimum, 1.0)
+        return [
+            float(np.min((np.asarray(points, dtype=float) - minimum) / span @ np.ones(2)))
+            for points in items
+        ]
+
+    candidate_fronts = normalized_fronts(
+        [np.asarray(stroke["points"], dtype=float) for stroke in strokes]
+    )
+    candidate_gap = candidate_fronts[0] - min(candidate_fronts)
+    candidate_proves_front = candidate_gap <= proof_margin
+    if not candidate_proves_front:
+        return 0.0, {
+            "enabled": False,
+            "reason": "candidate-first-stroke-not-on-front",
+            "candidateGap": round(candidate_gap, 5),
+            "candidateProvesFront": False,
+        }
+    observed_fronts = normalized_fronts([route.points for route in routes])
+    observed_gap = observed_fronts[0] - min(observed_fronts)
+    hard = observed_gap > hard_margin
+    return 6.0 * max(0.0, observed_gap - proof_margin), {
+        "enabled": True,
+        "candidateProvesFront": True,
+        "candidateGap": round(candidate_gap, 5),
+        "observedGap": round(observed_gap, 5),
+        "hardLimit": hard_margin,
+        "hardViolation": hard,
+        "candidateFronts": [round(value, 5) for value in candidate_fronts],
+        "observedFronts": [round(value, 5) for value in observed_fronts],
     }
 
 
@@ -2244,7 +3084,10 @@ def choose_routes(
     total_skeleton_pixels: int,
     coverage_weight: float = 12.0,
     leaf_centroid_weight: float = 0.25,
+    beam_width: int = 350,
+    graph: SkeletonGraph | None = None,
 ) -> tuple[list[RouteCandidate], dict]:
+    minimum_hard_completion_ratio = 0.50
     expected_contact = stroke_contact_matrix(strokes)
     parent = list(range(len(strokes)))
 
@@ -2266,6 +3109,29 @@ def choose_routes(
     group_members: dict[tuple[int, int], list[int]] = {}
     for index, key in enumerate(group_keys):
         group_members.setdefault(key, []).append(index)
+    first_stroke_priority_limits: dict[int, float] = {}
+    for indices in group_members.values():
+        if len(indices) < 3:
+            continue
+        member_strokes = [strokes[index] for index in indices]
+        dummy_routes = [
+            RouteCandidate(
+                0,
+                0,
+                np.asarray(stroke["points"], dtype=float),
+                frozenset(),
+                0,
+                0.0,
+                {},
+            )
+            for stroke in member_strokes
+        ]
+        _cost, proof = leaf_first_stroke_front_cost(member_strokes, dummy_routes)
+        first_index = indices[0]
+        if proof.get("candidateProvesFront") and ranked[first_index]:
+            first_stroke_priority_limits[first_index] = (
+                min(option.score for option in ranked[first_index]) + 0.50
+            )
     group_last_index = {key: indices[-1] for key, indices in group_members.items()}
     diagonal_seed_leaves = diagonal_front_leaf_keys(strokes, expected_contact)
     group_centres = {
@@ -2373,6 +3239,7 @@ def choose_routes(
         axis = 0 if operator in {"⿰", "⿲"} else 1
         for child_index, token in enumerate(ordered_tokens[1:], start=1):
             child_keys = children[token]
+            immediate_predecessor_keys = children[ordered_tokens[child_index - 1]]
             predecessor_keys = [
                 key
                 for previous_token in ordered_tokens[:child_index]
@@ -2388,7 +3255,65 @@ def choose_routes(
                         "operator": operator,
                         "axis": axis,
                         "predecessorKeys": predecessor_keys,
+                        "immediatePredecessorKeys": immediate_predecessor_keys,
                         "childKeys": child_keys,
+                    }
+                )
+    enclosure_axes = {
+        "⿸": ("upper", "left"),
+        "⿹": ("upper", "right"),
+        "⿺": ("lower", "left"),
+        "⿵": ("upper",),
+        "⿶": ("lower",),
+        "⿷": ("left",),
+        "⿼": ("right",),
+        "⿴": ("upper", "lower", "left", "right"),
+    }
+    enclosure_children: dict[
+        tuple[int, str], dict[tuple, list[tuple[int, int]]]
+    ] = {}
+    for key, indices in group_members.items():
+        hierarchy = strokes[indices[0]].get("hierarchy") or []
+        for position in range(1, len(hierarchy)):
+            parent_item = hierarchy[position]
+            operator = str(parent_item.get("label", ""))
+            if operator not in enclosure_axes:
+                continue
+            child = hierarchy[position - 1]
+            token = (
+                ("leaf", key)
+                if position == 1
+                else (
+                    "node",
+                    int(child["id"]),
+                    str(child.get("familyKey", child["id"])),
+                )
+            )
+            bucket = enclosure_children.setdefault(
+                (int(parent_item["id"]), operator), {}
+            )
+            if key not in bucket.setdefault(token, []):
+                bucket[token].append(key)
+    enclosure_first_stroke_specs: dict[int, list[dict]] = {}
+    for (parent_id, operator), children in enclosure_children.items():
+        ordered_tokens = sorted(
+            children,
+            key=lambda token: min(
+                group_members[key][0] for key in children[token]
+            ),
+        )
+        if len(ordered_tokens) < 2:
+            continue
+        cover_keys = children[ordered_tokens[0]]
+        for content_token in ordered_tokens[1:]:
+            for content_key in children[content_token]:
+                first_index = group_members[content_key][0]
+                enclosure_first_stroke_specs.setdefault(first_index, []).append(
+                    {
+                        "parentId": parent_id,
+                        "operator": operator,
+                        "coverKeys": cover_keys,
+                        "boundaries": enclosure_axes[operator],
                     }
                 )
     for left in range(len(strokes)):
@@ -2435,6 +3360,22 @@ def choose_routes(
                         continue
                     observed = observed_contact(current_option, previous_option)
                     same_leaf = same_leaf_pair
+                    current_key = group_keys[current_index]
+                    previous_key = group_keys[previous_index]
+                    structural_boundary_contact = (
+                        expected
+                        and current_index == group_members[current_key][0]
+                        and previous_index == group_last_index[previous_key]
+                        and any(
+                            previous_key in spec["immediatePredecessorKeys"]
+                            for spec in recursive_sibling_specs.get(current_key, [])
+                        )
+                    )
+                    # Cross-leaf candidate contact is a strong preference, not
+                    # a centreline identity.  Thick source ink can make two
+                    # adjacent IDS children touch even when their medial axes
+                    # remain separated (欠 is a concrete example).  Only the
+                    # contact grammar *inside one semantic leaf* is hard.
                     hard_contact_violation = same_leaf and expected != observed
                     hard_relative_order_violation = False
                     if expected and not observed:
@@ -2442,6 +3383,11 @@ def choose_routes(
                         notes.append(f"missing-contact-{previous_index + 1}")
                         if same_leaf:
                             notes.append(f"required-contact-{previous_index + 1}")
+                        if structural_boundary_contact:
+                            relation_cost += 0.50
+                            notes.append(
+                                f"preferred-structural-boundary-contact-{previous_index + 1}"
+                            )
                         if (
                             group_keys[current_index] == group_keys[previous_index]
                             and current_option.evidence.get("learnedScoringEnabled")
@@ -2546,6 +3492,39 @@ def choose_routes(
             "usedHardStructureFallback": False,
         }
     ]
+    route_reuse_cache: dict[tuple[int, int], float] = {}
+    route_retrace_cache: dict[tuple[int, int], tuple[float, float]] = {}
+    leaf_closure_cache: dict[
+        tuple[tuple[int, int], tuple[int, ...]],
+        frozenset[tuple[int, int]],
+    ] = {}
+
+    def cached_route_reuse(
+        first: RouteCandidate, second: RouteCandidate
+    ) -> float:
+        key = tuple(sorted((id(first), id(second))))
+        if key not in route_reuse_cache:
+            route_reuse_cache[key] = route_reuse_ratio(first, second)
+        return route_reuse_cache[key]
+
+    def cached_route_retrace(
+        first: RouteCandidate, second: RouteCandidate
+    ) -> tuple[float, float]:
+        key = tuple(sorted((id(first), id(second))))
+        if key not in route_retrace_cache:
+            ratio = centerline_retrace_ratio(first.points, second.points)
+            shorter = min(
+                float(np.linalg.norm(np.diff(first.points, axis=0), axis=1).sum()),
+                float(np.linalg.norm(np.diff(second.points, axis=0), axis=1).sum()),
+            )
+            route_retrace_cache[key] = (ratio, ratio * shorter)
+        return route_retrace_cache[key]
+
+    def has_illegal_retrace(
+        first: RouteCandidate, second: RouteCandidate
+    ) -> bool:
+        ratio, length = cached_route_retrace(first, second)
+        return ratio >= 0.10 and length >= 8.0
 
     def remaining_routes_feasible(
         next_index: int,
@@ -2565,10 +3544,14 @@ def choose_routes(
             has_legal_option = False
             for future_option in ranked[future_index]:
                 future_completion = route_completion_ratio(future_option)
-                if future_completion is not None and future_completion < 0.42:
+                if (
+                    future_completion is not None
+                    and future_completion < minimum_hard_completion_ratio
+                ):
                     continue
                 illegal = any(
-                    route_reuse_ratio(future_option, previous_route) >= 0.72
+                    has_illegal_retrace(future_option, previous_route)
+                    or cached_route_reuse(future_option, previous_route) >= 0.72
                     for previous_route in selected_routes
                 )
                 if illegal:
@@ -2625,7 +3608,7 @@ def choose_routes(
                 compatible_fronts = []
                 for candidate_option in options:
                     if any(
-                        route_reuse_ratio(candidate_option, previous_route) >= 0.72
+                        cached_route_reuse(candidate_option, previous_route) >= 0.72
                         for previous_route in state["routes"]
                     ):
                         continue
@@ -2638,6 +3621,9 @@ def choose_routes(
                 if compatible_fronts:
                     diagonal_front = min(compatible_fronts)
             for option_rank, option in enumerate(options):
+                priority_limit = first_stroke_priority_limits.get(index)
+                if priority_limit is not None and option.score > priority_limit:
+                    continue
                 # Coarse connected-island membership is deliberately applied
                 # only at whole-universe selection time.  Applying it during
                 # local ranking can prune a semantically correct road before
@@ -2692,6 +3678,78 @@ def choose_routes(
                             relation_notes.append(
                                 f"sibling-order-{predecessor_key[0]}:{violation:.2f}"
                             )
+                enclosure_domain_cost = 0.0
+                hard_enclosure_domain_violation = False
+                enclosure_domain_evidence = {
+                    "enabled": False,
+                    "reason": "not-first-stroke-of-enclosed-content",
+                }
+                enclosure_audits = []
+                for spec in enclosure_first_stroke_specs.get(index, []):
+                    cover_indices = [
+                        member_index
+                        for cover_key in spec["coverKeys"]
+                        for member_index in group_members[cover_key]
+                        if member_index < index
+                    ]
+                    if not cover_indices:
+                        continue
+                    cover_points = np.vstack(
+                        [
+                            state["routes"][member_index].points
+                            for member_index in cover_indices
+                        ]
+                    )
+                    pen_down = np.asarray(option.points[0], dtype=float)
+                    violations = {}
+                    for boundary in spec["boundaries"]:
+                        if boundary == "upper":
+                            raw = float(cover_points[:, 1].min() - pen_down[1])
+                            axis = 1
+                        elif boundary == "lower":
+                            raw = float(pen_down[1] - cover_points[:, 1].max())
+                            axis = 1
+                        elif boundary == "left":
+                            raw = float(cover_points[:, 0].min() - pen_down[0])
+                            axis = 0
+                        else:  # right
+                            raw = float(pen_down[0] - cover_points[:, 0].max())
+                            axis = 0
+                        violations[boundary] = max(
+                            0.0, raw / float(route_spans[axis])
+                        )
+                    maximum_violation = max(violations.values(), default=0.0)
+                    hard = maximum_violation > 0.03
+                    enclosure_domain_cost += 16.0 * maximum_violation
+                    hard_enclosure_domain_violation = (
+                        hard_enclosure_domain_violation or hard
+                    )
+                    enclosure_audits.append(
+                        {
+                            "parentId": spec["parentId"],
+                            "operator": spec["operator"],
+                            "boundaries": list(spec["boundaries"]),
+                            "penDown": [round(float(value), 3) for value in pen_down],
+                            "normalizedViolations": {
+                                key: round(value, 5)
+                                for key, value in violations.items()
+                            },
+                            "maximumViolation": round(maximum_violation, 5),
+                            "hardLimit": 0.03,
+                            "hardViolation": hard,
+                        }
+                    )
+                    if maximum_violation > 0.01:
+                        relation_notes.append(
+                            "enclosure-content-domain:"
+                            f"{spec['parentId']}:{maximum_violation:.2f}"
+                        )
+                if enclosure_audits:
+                    enclosure_domain_evidence = {
+                        "enabled": True,
+                        **enclosure_audits[0],
+                        "constraints": enclosure_audits,
+                    }
                 diagonal_front_cost = 0.0
                 if diagonal_front is not None:
                     residual_pixels = option.pixels - state["occupied"]
@@ -2712,6 +3770,11 @@ def choose_routes(
                     "enabled": False,
                     "reason": "leaf-not-complete",
                 }
+                leaf_front_cost = 0.0
+                leaf_front_evidence = {
+                    "enabled": False,
+                    "reason": "leaf-not-complete",
+                }
                 if group_last_index[group_keys[index]] == index:
                     member_indices = group_members[group_keys[index]]
                     member_routes = [
@@ -2728,6 +3791,22 @@ def choose_routes(
                         relation_notes.append(
                             "leaf-centroid-first-stroke:"
                             f"{leaf_centroid_evidence['preferredStroke']}"
+                        )
+                    leaf_front_cost, leaf_front_evidence = leaf_first_stroke_front_cost(
+                        member_strokes,
+                        member_routes,
+                    )
+                    if leaf_front_evidence.get("hardViolation"):
+                        # Candidate grammar has proved which stroke is first
+                        # on this leaf's own front.  A completed hypothesis
+                        # that puts it deep inside the leaf is not a fallback
+                        # universe; it has assigned the front ink to a later
+                        # stroke and violates ordered residual ownership.
+                        continue
+                    if leaf_front_cost > 0.08:
+                        relation_notes.append(
+                            "leaf-first-stroke-front:"
+                            f"{leaf_front_evidence['observedGap']:.2f}"
                         )
                 root_structure_scan_cost = 0.0
                 hard_root_structure_violation = False
@@ -2956,8 +4035,18 @@ def choose_routes(
                                 f"{sibling_audits[0]['normalizedSeparation']:.2f}"
                             )
                 reuse_cost = max(0, shared - 2) / max(8, len(option.pixels)) * 7.0
+                hard_retrace_violation = any(
+                    has_illegal_retrace(option, previous_route)
+                    for previous_route in state["routes"]
+                )
+                # A point crossing/contact is legal, but a stable shared edge
+                # would mean drawing on already-owned ink.  This invariant is
+                # non-negotiable: unlike uncertain candidate contact or IDS
+                # evidence, it must never enter the fallback beam.
+                if hard_retrace_violation:
+                    continue
                 hard_reuse_violation = any(
-                    route_reuse_ratio(option, previous_route)
+                    cached_route_reuse(option, previous_route)
                     >= (
                         0.40
                         if group_keys[previous_index] == group_keys[index]
@@ -2974,7 +4063,8 @@ def choose_routes(
                     else 4.0 * max(0.0, 0.82 - completion_ratio)
                 )
                 hard_incomplete_stroke = (
-                    completion_ratio is not None and completion_ratio < 0.42
+                    completion_ratio is not None
+                    and completion_ratio < minimum_hard_completion_ratio
                 )
                 if hard_incomplete_stroke:
                     relation_notes.append(
@@ -2992,8 +4082,10 @@ def choose_routes(
                     + contact_role_cost
                     + relative_position_cost
                     + structural_order_cost
+                    + enclosure_domain_cost
                     + diagonal_front_cost
                     + leaf_centroid_cost
+                    + leaf_front_cost
                     + root_structure_scan_cost
                     + recursive_structure_scan_cost
                     + recursive_sibling_order_cost
@@ -3005,6 +4097,52 @@ def choose_routes(
                     relation_notes.append("same-leaf-contact-fallback")
                 selected_routes = state["routes"] + [option]
                 selected_ranks = state["routeRanks"] + [option_rank]
+                leaf_closure_pixels: frozenset[tuple[int, int]] = frozenset()
+                if (
+                    graph is not None
+                    and group_last_index[group_keys[index]] == index
+                ):
+                    member_indices = group_members[group_keys[index]]
+                    member_strokes = [
+                        strokes[member_index] for member_index in member_indices
+                    ]
+                    member_routes = [
+                        selected_routes[member_index]
+                        for member_index in member_indices
+                    ]
+                    closure_key = (
+                        group_keys[index],
+                        tuple(id(route) for route in member_routes),
+                    )
+                    if closure_key not in leaf_closure_cache:
+                        leaf_closure_cache[closure_key] = (
+                            completed_leaf_residual_closure(
+                                member_strokes,
+                                member_routes,
+                                graph,
+                            )
+                        )
+                    leaf_closure_pixels = leaf_closure_cache[closure_key]
+                    if leaf_closure_pixels:
+                        anchor_index = member_indices[0]
+                        anchor = selected_routes[anchor_index]
+                        selected_routes[anchor_index] = RouteCandidate(
+                            anchor.start_node,
+                            anchor.end_node,
+                            anchor.points,
+                            anchor.pixels | leaf_closure_pixels,
+                            anchor.component,
+                            anchor.score,
+                            {
+                                **anchor.evidence,
+                                "completedLeafClosurePixels": len(
+                                    leaf_closure_pixels
+                                ),
+                            },
+                        )
+                        relation_notes.append(
+                            f"completed-leaf-closure:{len(leaf_closure_pixels)}"
+                        )
                 future_feasible = remaining_routes_feasible(
                     index + 1,
                     selected_routes,
@@ -3022,6 +4160,7 @@ def choose_routes(
                     or hard_root_structure_violation
                     or hard_recursive_structure_violation
                     or hard_recursive_sibling_violation
+                    or hard_enclosure_domain_violation
                     or not future_feasible
                 )
                 destination = hard_fallback_beam if hard_violation else next_beam
@@ -3031,6 +4170,7 @@ def choose_routes(
                     + (1000.0 if hard_root_structure_violation else 0.0)
                     + (1000.0 if hard_recursive_structure_violation else 0.0)
                     + (1000.0 if hard_recursive_sibling_violation else 0.0)
+                    + (1000.0 if hard_enclosure_domain_violation else 0.0)
                     + (1000.0 if not future_feasible else 0.0)
                 )
                 destination.append(
@@ -3038,7 +4178,11 @@ def choose_routes(
                         "score": score + fallback_penalty,
                         "routes": selected_routes,
                         "routeRanks": selected_ranks,
-                        "occupied": state["occupied"] | option.pixels,
+                        "occupied": (
+                            state["occupied"]
+                            | option.pixels
+                            | leaf_closure_pixels
+                        ),
                         "usedHardContactFallback": state["usedHardContactFallback"]
                         or hard_contact_violation,
                         "usedHardGeometryFallback": state[
@@ -3054,7 +4198,8 @@ def choose_routes(
                         ]
                         or hard_root_structure_violation
                         or hard_recursive_structure_violation
-                        or hard_recursive_sibling_violation,
+                        or hard_recursive_sibling_violation
+                        or hard_enclosure_domain_violation,
                         "steps": state["steps"]
                         + [
                             {
@@ -3065,9 +4210,15 @@ def choose_routes(
                                 "contactRoleCost": round(contact_role_cost, 5),
                                 "relativePositionCost": round(relative_position_cost, 5),
                                 "structuralOrderCost": round(structural_order_cost, 5),
+                                "enclosureContentDomainCost": round(
+                                    enclosure_domain_cost, 5
+                                ),
+                                "enclosureContentDomain": enclosure_domain_evidence,
                                 "diagonalFrontCost": round(diagonal_front_cost, 5),
                                 "leafCentroidOrderCost": round(leaf_centroid_cost, 5),
                                 "leafCentroidOrder": leaf_centroid_evidence,
+                                "leafFirstStrokeFrontCost": round(leaf_front_cost, 5),
+                                "leafFirstStrokeFront": leaf_front_evidence,
                                 "rootStructureScanCost": round(root_structure_scan_cost, 5),
                                 "rootStructureScan": root_structure_scan_evidence,
                                 "recursiveStructureScanCost": round(
@@ -3090,6 +4241,9 @@ def choose_routes(
                                 "hardIncompleteStroke": hard_incomplete_stroke,
                                 "newCoverage": round(new_coverage, 5),
                                 "newSkeletonPixels": new_pixels,
+                                "completedLeafClosurePixels": len(
+                                    leaf_closure_pixels
+                                ),
                                 "coverageReward": round(coverage_reward, 5),
                                 "remainingRoutesFeasible": future_feasible,
                                 "notes": relation_notes,
@@ -3161,7 +4315,7 @@ def choose_routes(
         )
         beam = prune_open_leaf_beam(
             next_beam,
-            width=350,
+            width=beam_width,
             first_stroke_index=open_leaf_first,
         )
     best = beam[0]
@@ -3197,7 +4351,7 @@ def choose_routes(
     )
     return best["routes"], {
         "score": round(best["score"], 6),
-        "beamWidth": 350,
+        "beamWidth": beam_width,
         "coverageWeight": coverage_weight,
         "leafCentroidWeight": leaf_centroid_weight,
         "rootStructureScan": root_scan_step,
@@ -4237,6 +5391,7 @@ def main():
             ranked,
             graph,
         )
+        ranked = augment_pen_down_contact_routes(candidate, ranked, graph)
         ranked = compact_route_hypotheses(ranked)
     if any(not options for options in ranked):
         missing = [
@@ -4273,9 +5428,26 @@ def main():
         owner = residual_result.ledger.visible_owner
         decision = residual_decision_payload(residual_result, target)
     else:
+        choice_ranked = (
+            normalize_ranked_pen_paths(
+                candidate,
+                ranked,
+                graph,
+                source=args.source,
+                codepoint=codepoint,
+                normative_catalog=normative_catalog,
+            )
+            if args.decoder == "hybrid"
+            else ranked
+        )
+        if args.decoder == "hybrid":
+            choice_ranked = augment_contact_retrace_variants(
+                candidate,
+                choice_ranked,
+            )
         grass_keys = broken_grass_head_keys(candidate)
         baseline_ranked = []
-        for stroke, options in zip(candidate, ranked):
+        for stroke, options in zip(candidate, choice_ranked):
             key = (
                 int(stroke.get("componentId", -1)),
                 int(stroke.get("occurrence", 0)),
@@ -4295,6 +5467,8 @@ def main():
             int(skeleton.sum()),
             coverage_weight=args.coverage_weight,
             leaf_centroid_weight=args.leaf_centroid_weight,
+            beam_width=args.beam_width,
+            graph=graph,
         )
         grass_recovery_keys = (
             grass_diagonal_recovery_needed(candidate, routes)
@@ -4305,10 +5479,12 @@ def main():
             baseline_score = decision["score"]
             routes, decision = choose_routes(
                 candidate,
-                ranked,
+                choice_ranked,
                 int(skeleton.sum()),
                 coverage_weight=args.coverage_weight,
                 leaf_centroid_weight=args.leaf_centroid_weight,
+                beam_width=args.beam_width,
+                graph=graph,
             )
             decision["grassDiagonalFrontRecovery"] = {
                 "triggered": True,
@@ -4368,7 +5544,7 @@ def main():
             "candidateGeometryUsedForTargetMask": False,
             "candidateGeometryUsedForComponentIslandLock": False,
             "candidateOrdinalTieBreakWeight": args.ordinal_weight,
-            "beamWidth": args.beam_width if args.decoder == "residual" else None,
+            "beamWidth": args.beam_width,
             "criticalNodeCount": len(graph.critical),
             "routeHypothesisCount": len(raw_routes),
             "learnedRules": {
