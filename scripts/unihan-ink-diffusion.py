@@ -308,6 +308,106 @@ def completed_leaf_residual_closure(
     return frozenset(claimed)
 
 
+def completed_stroke_residual_reservation(
+    route: RouteCandidate,
+    graph: SkeletonGraph,
+    maximum_absolute_pixels: int = 28,
+    maximum_stroke_fraction: float = 0.30,
+) -> frozenset[tuple[int, int]]:
+    """Reserve high-confidence uncoloured detail belonging to a finished stroke.
+
+    This does not colour the residual.  It only prevents a later pen-down from
+    treating a short terminal cap/tuft as a fresh stroke start before width
+    restoration or whole-leaf closure has claimed it.  A large road, a region
+    without a real endpoint, or a region with many attachments is deliberately
+    left unreserved.
+    """
+    selected_nodes = {
+        index
+        for x, y in route.pixels
+        if (index := graph.point_index.get((int(y), int(x)))) is not None
+    }
+    if not selected_nodes:
+        return frozenset()
+    keep = np.ones(len(graph.points), dtype=bool)
+    keep[list(selected_nodes)] = False
+    remaining_nodes = np.flatnonzero(keep)
+    if not len(remaining_nodes):
+        return frozenset()
+    _count, labels = connected_components(
+        graph.matrix[keep][:, keep], directed=False
+    )
+    original_to_label = {
+        int(original): int(labels[position])
+        for position, original in enumerate(remaining_nodes)
+    }
+    maximum_pixels = max(
+        4,
+        min(
+            maximum_absolute_pixels,
+            int(math.ceil(maximum_stroke_fraction * len(selected_nodes))),
+        ),
+    )
+    adjacency = graph_adjacency(graph.matrix)
+    adjacent_labels = {
+        original_to_label[neighbour]
+        for selected in selected_nodes
+        for neighbour, _step in adjacency[selected]
+        if neighbour in original_to_label
+    }
+    selected_xy = graph.points[np.asarray(sorted(selected_nodes), dtype=int)][:, ::-1]
+    lower = selected_xy.min(axis=0).astype(float)
+    upper = selected_xy.max(axis=0).astype(float)
+    diagonal = float(np.linalg.norm(upper - lower))
+    # A calligraphic bend/terminal can protrude materially beyond the
+    # centreline box (U+6485-J strokes 9/10: roughly 16px and 14px).  Scale
+    # the admissible halo with the stroke trunk, but never beyond the same
+    # bounded-detail budget used for the residual itself.
+    margin = max(6.0, min(float(maximum_pixels), 0.35 * diagonal))
+    reserved: set[tuple[int, int]] = set()
+    for label in adjacent_labels:
+        members = remaining_nodes[labels == label]
+        if not len(members) or len(members) > maximum_pixels:
+            continue
+        member_set = set(map(int, members))
+        if not any(
+            graph.crossing[tuple(graph.points[member])] == 1
+            for member in member_set
+        ):
+            continue
+        attachment_nodes = {
+            selected
+            for member in member_set
+            for selected, _step in adjacency[member]
+            if selected in selected_nodes
+        }
+        if not 1 <= len(attachment_nodes) <= 4:
+            continue
+        member_xy = graph.points[members][:, ::-1].astype(float)
+        if np.any(member_xy < lower - margin) or np.any(member_xy > upper + margin):
+            continue
+        reserved.update(
+            (int(graph.points[member][1]), int(graph.points[member][0]))
+            for member in member_set
+        )
+    return frozenset(reserved)
+
+
+def pen_down_hits_reservation(
+    points: np.ndarray,
+    reservation: frozenset[tuple[int, int]],
+    tolerance: float = 1.5,
+) -> bool:
+    """Whether a logical pen-down falls in protected completed-stroke detail."""
+    if not reservation or not len(points):
+        return False
+    start = np.asarray(points, dtype=float)[0]
+    return any(
+        float(np.linalg.norm(start - np.asarray(pixel, dtype=float))) <= tolerance
+        for pixel in reservation
+    )
+
+
 def reconstruct_path(
     points: np.ndarray, predecessors: np.ndarray, source: int, target: int
 ) -> np.ndarray | None:
@@ -3086,6 +3186,7 @@ def choose_routes(
     leaf_centroid_weight: float = 0.25,
     beam_width: int = 350,
     graph: SkeletonGraph | None = None,
+    protect_completed_stroke_residuals: bool = True,
 ) -> tuple[list[RouteCandidate], dict]:
     minimum_hard_completion_ratio = 0.50
     expected_contact = stroke_contact_matrix(strokes)
@@ -3327,6 +3428,12 @@ def choose_routes(
                 expected_signatures[current, previous] = contact_signature(
                     strokes[current]["points"], strokes[previous]["points"]
                 )[:2]
+    candidate_pen_down_contact_strokes = {
+        current
+        for (current, _previous), (current_fraction, _previous_fraction)
+        in expected_signatures.items()
+        if current_fraction <= 0.16
+    }
     relation_cache: dict[
         tuple[int, int, int, int],
         tuple[float, float, float, list[str], bool, bool],
@@ -3485,16 +3592,23 @@ def choose_routes(
             "routes": [],
             "routeRanks": [],
             "occupied": frozenset(),
+            "reservedPenDown": frozenset(),
             "steps": [],
             "usedHardContactFallback": False,
             "usedHardGeometryFallback": False,
             "usedFutureFeasibilityFallback": False,
             "usedHardStructureFallback": False,
+            "usedReservedPenDownConflict": False,
         }
     ]
     route_reuse_cache: dict[tuple[int, int], float] = {}
     route_retrace_cache: dict[tuple[int, int], tuple[float, float]] = {}
     leaf_closure_cache: dict[
+        tuple[tuple[int, int], tuple[int, ...]],
+        frozenset[tuple[int, int]],
+    ] = {}
+    stroke_reservation_cache: dict[int, frozenset[tuple[int, int]]] = {}
+    partial_leaf_reservation_cache: dict[
         tuple[tuple[int, int], tuple[int, ...]],
         frozenset[tuple[int, int]],
     ] = {}
@@ -3624,6 +3738,32 @@ def choose_routes(
                 priority_limit = first_stroke_priority_limits.get(index)
                 if priority_limit is not None and option.score > priority_limit:
                     continue
+                # A short terminal residual can confidently belong to an
+                # already finished stroke even before width restoration has
+                # coloured it.  Strongly discourage a later hypothesis from
+                # reinterpreting that protected detail as a fresh pen-down.
+                reserved_pen_down_hit = (
+                    protect_completed_stroke_residuals
+                    and pen_down_hits_reservation(
+                        option.points, state["reservedPenDown"]
+                    )
+                )
+                reserved_pen_down_contact_exception = (
+                    reserved_pen_down_hit
+                    and index in candidate_pen_down_contact_strokes
+                )
+                reserved_pen_down_violation = (
+                    reserved_pen_down_hit
+                    and not reserved_pen_down_contact_exception
+                )
+                # Treat this as a near-hard constraint while retaining a
+                # deliberately expensive diagnostic escape hatch.  A finite
+                # cost keeps the beam debuggable when a future unseen glyph
+                # contradicts our residual proof, instead of turning the
+                # entire character into a no-solution failure.
+                reserved_pen_down_cost = (
+                    12.0 if reserved_pen_down_violation else 0.0
+                )
                 # Coarse connected-island membership is deliberately applied
                 # only at whole-universe selection time.  Applying it during
                 # local ranking can prune a semantically correct road before
@@ -3639,6 +3779,12 @@ def choose_routes(
                 contact_role_cost = 0.0
                 relative_position_cost = 0.0
                 relation_notes = []
+                if reserved_pen_down_contact_exception:
+                    relation_notes.append(
+                        "reserved-pen-down-allowed-by-candidate-contact"
+                    )
+                elif reserved_pen_down_violation:
+                    relation_notes.append("reserved-pen-down-conflict")
                 hard_contact_violation = False
                 hard_relative_order_violation = False
                 for previous_index, previous_rank in enumerate(state["routeRanks"]):
@@ -4091,12 +4237,106 @@ def choose_routes(
                     + recursive_sibling_order_cost
                     + reuse_cost
                     + incomplete_stroke_cost
+                    + reserved_pen_down_cost
                     - coverage_reward
                 )
                 if hard_contact_violation:
                     relation_notes.append("same-leaf-contact-fallback")
                 selected_routes = state["routes"] + [option]
                 selected_ranks = state["routeRanks"] + [option_rank]
+                stroke_reserved_pixels: frozenset[tuple[int, int]] = frozenset()
+                single_stroke_reserved_pixels: frozenset[tuple[int, int]] = frozenset()
+                partial_leaf_reserved_pixels: frozenset[tuple[int, int]] = frozenset()
+                reservation_suppressed_by_future_same_leaf = False
+                future_same_leaf_pen_down_exemption_pixels = 0
+                if graph is not None and protect_completed_stroke_residuals:
+                    reservation_key = id(option)
+                    if reservation_key not in stroke_reservation_cache:
+                        stroke_reservation_cache[reservation_key] = (
+                            completed_stroke_residual_reservation(option, graph)
+                        )
+                    single_stroke_reserved_pixels = stroke_reservation_cache[
+                        reservation_key
+                    ]
+                    partial_member_indices = [
+                        member_index
+                        for member_index in group_members[group_keys[index]]
+                        if member_index <= index
+                    ]
+                    if len(partial_member_indices) >= 2:
+                        partial_routes = [
+                            selected_routes[member_index]
+                            for member_index in partial_member_indices
+                        ]
+                        partial_key = (
+                            group_keys[index],
+                            tuple(id(route) for route in partial_routes),
+                        )
+                        if partial_key not in partial_leaf_reservation_cache:
+                            partial_leaf_reservation_cache[partial_key] = (
+                                completed_leaf_residual_closure(
+                                    [
+                                        strokes[member_index]
+                                        for member_index in partial_member_indices
+                                    ],
+                                    partial_routes,
+                                    graph,
+                                )
+                            )
+                        partial_leaf_reserved_pixels = partial_leaf_reservation_cache[
+                            partial_key
+                        ]
+                    future_same_leaf_indices = [
+                        member_index
+                        for member_index in group_members[group_keys[index]]
+                        if member_index > index
+                    ]
+                    if future_same_leaf_indices:
+                        # A completed stroke can already prove ownership of a
+                        # short terminal residual; waiting for the whole leaf
+                        # would leave exactly that detail stealable.  Future
+                        # strokes of the same leaf still get an explicit
+                        # pen-down exemption below, so 艹's unwritten verticals
+                        # are not confused with a finished horizontal's cap.
+                        stroke_reserved_pixels = single_stroke_reserved_pixels
+                    else:
+                        stroke_reserved_pixels = (
+                            single_stroke_reserved_pixels
+                            | partial_leaf_reserved_pixels
+                        )
+                    # Do not globally discard a sound reservation merely
+                    # because one future pen-down touches it.  Exempt only the
+                    # pixels around plausible (top-ranked) future pen-downs;
+                    # the remaining residual stays protected.  Subsequent
+                    # selected routes remove their own pixels from the ledger.
+                    future_starts = [
+                        np.asarray(future_option.points, dtype=float)[0]
+                        for future_index in future_same_leaf_indices
+                        for future_option in ranked[future_index][:12]
+                        if len(future_option.points)
+                    ]
+                    exempted_pixels = frozenset(
+                        pixel
+                        for pixel in stroke_reserved_pixels
+                        if any(
+                            float(
+                                np.linalg.norm(
+                                    np.asarray(pixel, dtype=float) - future_start
+                                )
+                            )
+                            <= 1.5
+                            for future_start in future_starts
+                        )
+                    )
+                    future_same_leaf_pen_down_exemption_pixels = len(
+                        exempted_pixels
+                    )
+                    reservation_suppressed_by_future_same_leaf = bool(
+                        exempted_pixels
+                    )
+                    stroke_reserved_pixels = (
+                        stroke_reserved_pixels - exempted_pixels
+                    )
                 leaf_closure_pixels: frozenset[tuple[int, int]] = frozenset()
                 if (
                     graph is not None
@@ -4183,6 +4423,14 @@ def choose_routes(
                             | option.pixels
                             | leaf_closure_pixels
                         ),
+                        "reservedPenDown": (
+                            state["reservedPenDown"] | stroke_reserved_pixels
+                        )
+                        - (
+                            state["occupied"]
+                            | option.pixels
+                            | leaf_closure_pixels
+                        ),
                         "usedHardContactFallback": state["usedHardContactFallback"]
                         or hard_contact_violation,
                         "usedHardGeometryFallback": state[
@@ -4200,6 +4448,10 @@ def choose_routes(
                         or hard_recursive_structure_violation
                         or hard_recursive_sibling_violation
                         or hard_enclosure_domain_violation,
+                        "usedReservedPenDownConflict": state[
+                            "usedReservedPenDownConflict"
+                        ]
+                        or reserved_pen_down_violation,
                         "steps": state["steps"]
                         + [
                             {
@@ -4244,6 +4496,39 @@ def choose_routes(
                                 "completedLeafClosurePixels": len(
                                     leaf_closure_pixels
                                 ),
+                                "reservedCompletedStrokePixels": len(
+                                    stroke_reserved_pixels
+                                ),
+                                "singleStrokeReservationPixels": len(
+                                    single_stroke_reserved_pixels
+                                ),
+                                "partialLeafReservationPixels": len(
+                                    partial_leaf_reserved_pixels
+                                ),
+                                "reservationSuppressedByFutureSameLeafStart": (
+                                    reservation_suppressed_by_future_same_leaf
+                                ),
+                                "futureSameLeafPenDownExemptionPixels": (
+                                    future_same_leaf_pen_down_exemption_pixels
+                                ),
+                                "totalReservedPenDownPixels": len(
+                                    (
+                                        state["reservedPenDown"]
+                                        | stroke_reserved_pixels
+                                    )
+                                    - (
+                                        state["occupied"]
+                                        | option.pixels
+                                        | leaf_closure_pixels
+                                    )
+                                ),
+                                "reservedPenDownContactException": (
+                                    reserved_pen_down_contact_exception
+                                ),
+                                "reservedPenDownViolation": (
+                                    reserved_pen_down_violation
+                                ),
+                                "reservedPenDownCost": reserved_pen_down_cost,
                                 "coverageReward": round(coverage_reward, 5),
                                 "remainingRoutesFeasible": future_feasible,
                                 "notes": relation_notes,
@@ -4337,6 +4622,8 @@ def choose_routes(
         review_reasons.append("future-feasibility-fallback")
     if best["usedHardStructureFallback"]:
         review_reasons.append("root-structure-scan-fallback")
+    if best["usedReservedPenDownConflict"]:
+        review_reasons.append("reserved-pen-down-conflict")
     root_scan_step = next(
         (
             step["rootStructureScan"]
@@ -4354,6 +4641,7 @@ def choose_routes(
         "beamWidth": beam_width,
         "coverageWeight": coverage_weight,
         "leafCentroidWeight": leaf_centroid_weight,
+        "completedStrokeResidualProtection": protect_completed_stroke_residuals,
         "rootStructureScan": root_scan_step,
         "unexplainedSkeletonPixels": unexplained_pixels,
         "unexplainedSkeletonRatio": round(unexplained_ratio, 6),
@@ -5302,6 +5590,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learned-rules", type=Path)
     parser.add_argument("--stroke-order-catalog", type=Path)
     parser.add_argument("--beam-width", type=int, default=350)
+    parser.add_argument(
+        "--disable-completed-stroke-reservation",
+        action="store_true",
+        help="A/B audit only: allow later pen-downs in protected residual detail",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit-output", type=Path)
     return parser
@@ -5469,6 +5762,9 @@ def main():
             leaf_centroid_weight=args.leaf_centroid_weight,
             beam_width=args.beam_width,
             graph=graph,
+            protect_completed_stroke_residuals=(
+                not args.disable_completed_stroke_reservation
+            ),
         )
         grass_recovery_keys = (
             grass_diagonal_recovery_needed(candidate, routes)
@@ -5485,6 +5781,9 @@ def main():
                 leaf_centroid_weight=args.leaf_centroid_weight,
                 beam_width=args.beam_width,
                 graph=graph,
+                protect_completed_stroke_residuals=(
+                    not args.disable_completed_stroke_reservation
+                ),
             )
             decision["grassDiagonalFrontRecovery"] = {
                 "triggered": True,

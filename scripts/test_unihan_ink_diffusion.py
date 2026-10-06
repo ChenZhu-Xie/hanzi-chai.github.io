@@ -87,6 +87,225 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         closure = MODULE.completed_leaf_residual_closure(strokes, routes, graph)
         self.assertTrue(frozenset((8, y) for y in range(4, 9)) <= closure)
 
+    def test_finished_stroke_reserves_short_uncoloured_terminal_detail(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[5, 5:11] = True
+        skeleton[2, 2] = True
+        skeleton[3, 3] = True
+        skeleton[4, 4] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        route = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[5.0, 5.0], [10.0, 5.0]]),
+            frozenset((x, 5) for x in range(5, 11)),
+            1,
+            0.0,
+            {},
+        )
+        reservation = MODULE.completed_stroke_residual_reservation(route, graph)
+        self.assertEqual(reservation, frozenset({(2, 2), (3, 3), (4, 4)}))
+        self.assertTrue(
+            MODULE.pen_down_hits_reservation(
+                np.asarray([[3.0, 3.0], [2.0, 2.0]]), reservation
+            )
+        )
+
+    def test_finished_long_stroke_reserves_a_scaled_terminal_protrusion(self):
+        skeleton = np.zeros((80, 32), dtype=bool)
+        skeleton[10:71, 5] = True
+        skeleton[50, 6:22] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        route = MODULE.RouteCandidate(
+            0,
+            1,
+            np.asarray([[5.0, 10.0], [5.0, 70.0]]),
+            frozenset((5, y) for y in range(10, 71)),
+            1,
+            0.0,
+            {},
+        )
+        reservation = MODULE.completed_stroke_residual_reservation(route, graph)
+        self.assertTrue(frozenset((x, 50) for x in range(6, 22)) <= reservation)
+
+    def test_later_pen_down_prefers_not_to_steal_reserved_completed_stroke_detail(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[5, 5:11] = True
+        skeleton[2, 2] = True
+        skeleton[3, 3] = True
+        skeleton[4, 4] = True
+        skeleton[12, 12:15] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {
+                "componentId": 10,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 20,
+                "occurrence": 0,
+                "points": np.asarray([[12.0, 12.0], [14.0, 12.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0, 1, strokes[0]["points"],
+            frozenset((x, 5) for x in range(5, 11)), 1, 0.0, {},
+        )
+        steals_reserved = MODULE.RouteCandidate(
+            2, 3, np.asarray([[3.0, 3.0], [2.0, 2.0]]),
+            frozenset({(3, 3), (2, 2)}), 1, -10.0, {},
+        )
+        safe = MODULE.RouteCandidate(
+            4, 5, strokes[1]["points"],
+            frozenset({(12, 12), (13, 12), (14, 12)}), 2, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[first], [steals_reserved, safe]],
+            total_skeleton_pixels=int(skeleton.sum()),
+            graph=graph,
+        )
+        self.assertIs(routes[1], safe)
+        self.assertGreater(
+            decision["steps"][0]["reservedCompletedStrokePixels"], 0
+        )
+
+    def test_candidate_declared_pen_down_contact_may_enter_a_reservation(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[5, 5:11] = True
+        skeleton[2, 2] = True
+        skeleton[3, 3] = True
+        skeleton[4, 4] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {
+                "componentId": 10,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 20,
+                "occurrence": 0,
+                # The candidate explicitly puts this pen-down at the first
+                # stroke's ink boundary; it is not an accidental theft.
+                "points": np.asarray([[4.0, 4.0], [2.0, 2.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0, 1, strokes[0]["points"],
+            frozenset((x, 5) for x in range(5, 11)), 1, 0.0, {},
+        )
+        declared_contact = MODULE.RouteCandidate(
+            2, 3, np.asarray([[3.0, 3.0], [2.0, 2.0]]),
+            frozenset({(3, 3), (2, 2)}), 1, -2.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[first], [declared_contact]],
+            total_skeleton_pixels=int(skeleton.sum()),
+            graph=graph,
+        )
+        self.assertIs(routes[1], declared_contact)
+        self.assertTrue(
+            decision["steps"][1]["reservedPenDownContactException"]
+        )
+
+    def test_future_same_leaf_pen_down_is_exempted_from_reservation(self):
+        skeleton = np.zeros((16, 16), dtype=bool)
+        skeleton[5, 5:11] = True
+        skeleton[2, 2] = True
+        skeleton[3, 3] = True
+        skeleton[4, 4] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {
+                "componentId": 30,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 5.0], [10.0, 5.0]]),
+            },
+            {
+                "componentId": 30,
+                "occurrence": 0,
+                "points": np.asarray([[3.0, 3.0], [2.0, 2.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0, 1, strokes[0]["points"],
+            frozenset((x, 5) for x in range(5, 11)), 1, 0.0, {},
+        )
+        future_leaf_stroke = MODULE.RouteCandidate(
+            2, 3, strokes[1]["points"],
+            frozenset({(3, 3), (2, 2)}), 1, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[first], [future_leaf_stroke]],
+            total_skeleton_pixels=int(skeleton.sum()),
+            graph=graph,
+        )
+        self.assertEqual(len(routes), 2)
+        np.testing.assert_allclose(routes[0].points, first.points)
+        np.testing.assert_allclose(routes[1].points, future_leaf_stroke.points)
+        self.assertGreater(
+            decision["steps"][0]["singleStrokeReservationPixels"], 0
+        )
+        self.assertEqual(
+            decision["steps"][0]["partialLeafReservationPixels"], 0
+        )
+        self.assertTrue(
+            decision["steps"][0][
+                "reservationSuppressedByFutureSameLeafStart"
+            ]
+        )
+        self.assertGreater(
+            decision["steps"][0]["futureSameLeafPenDownExemptionPixels"], 0
+        )
+
+    def test_future_same_leaf_keeps_unrelated_terminal_reservation(self):
+        skeleton = np.zeros((20, 20), dtype=bool)
+        skeleton[8, 5:12] = True
+        skeleton[5, 2] = True
+        skeleton[6, 3] = True
+        skeleton[7, 4] = True
+        skeleton[15, 15:19] = True
+        graph = MODULE.build_skeleton_graph(skeleton)
+        strokes = [
+            {
+                "componentId": 30,
+                "occurrence": 0,
+                "points": np.asarray([[5.0, 8.0], [11.0, 8.0]]),
+            },
+            {
+                "componentId": 30,
+                "occurrence": 0,
+                "points": np.asarray([[15.0, 15.0], [18.0, 15.0]]),
+            },
+        ]
+        first = MODULE.RouteCandidate(
+            0, 1, strokes[0]["points"],
+            frozenset((x, 8) for x in range(5, 12)), 1, 0.0, {},
+        )
+        future_leaf_stroke = MODULE.RouteCandidate(
+            2, 3, strokes[1]["points"],
+            frozenset((x, 15) for x in range(15, 19)), 2, 0.0, {},
+        )
+        routes, decision = MODULE.choose_routes(
+            strokes,
+            [[first], [future_leaf_stroke]],
+            total_skeleton_pixels=int(skeleton.sum()),
+            graph=graph,
+        )
+        self.assertEqual(len(routes), 2)
+        np.testing.assert_allclose(routes[0].points, first.points)
+        np.testing.assert_allclose(routes[1].points, future_leaf_stroke.points)
+        self.assertGreater(
+            decision["steps"][0]["reservedCompletedStrokePixels"], 0
+        )
+        self.assertEqual(
+            decision["steps"][0]["futureSameLeafPenDownExemptionPixels"], 0
+        )
+
     def test_scan_seed_can_reach_a_distant_terminal_in_the_same_ink_island(self):
         points = np.asarray([[0, index] for index in range(10)], dtype=int)
         rows = []
