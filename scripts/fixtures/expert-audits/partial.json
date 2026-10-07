@@ -1,0 +1,19 @@
+{
+  "unicode": "U+0000",
+  "source": "T",
+  "glyphId": 1,
+  "decision": {
+    "model": "head-v4",
+    "status": "needs-review",
+    "partialPrediction": true,
+    "failedStroke": {"stroke": 2, "reason": "no-feasible-route"},
+    "reviewReasons": ["no-feasible-route"],
+    "steps": [{"stroke": 1, "selectedRoute": 1}]
+  },
+  "evaluation": {
+    "truthReadAfterPrediction": true,
+    "strokeMacroIoU": 1.0,
+    "componentMacroIoU": 1.0,
+    "perStrokeIoU": [1.0, 0.0]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "unicode": "U+65E8",
+  "character": "旨",
+  "source": "T",
+  "glyphId": 127685,
+  "output": "old-output.html",
+  "decision": {
+    "model": "classic-v1",
+    "status": "safe-candidate",
+    "score": 10.0,
+    "reviewReasons": [],
+    "routeHypothesisCount": 12,
+    "unexplainedSkeletonRatio": 0.02,
+    "steps": [
+      {"stroke": 1, "selectedRoute": 3},
+      {"stroke": 2, "selectedRoute": 8}
+    ]
+  },
+  "evaluation": null
+}

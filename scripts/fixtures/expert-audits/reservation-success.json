@@ -1,0 +1,27 @@
+{
+  "unicode": "U+6726",
+  "character": "朦",
+  "source": "J",
+  "glyphId": 18691,
+  "decision": {
+    "model": "reservation-v3",
+    "status": "needs-review",
+    "score": 12.0,
+    "reviewReasons": ["close-runner-up"],
+    "routeHypothesisCount": 30,
+    "unexplainedSkeletonRatio": 0.04,
+    "steps": [
+      {"stroke": 1, "selectedHalfEdges": [1, 2]},
+      {"stroke": 2, "selectedHalfEdges": [3]}
+    ]
+  },
+  "residualReview": {
+    "visibleOwner": [0, 0, 1],
+    "residualLayers": [{"stroke": 1}, {"stroke": 2}]
+  },
+  "strokes": [
+    {"stroke": 1, "feature": "横", "componentId": 122},
+    {"stroke": 2, "feature": "竖", "componentId": 122}
+  ],
+  "evaluation": null
+}

@@ -1,0 +1,28 @@
+{
+  "unicode": "U+64EC",
+  "character": "擬",
+  "source": "T",
+  "glyphId": 900021,
+  "output": "centroid.html",
+  "decision": {
+    "model": "centroid-v2",
+    "status": "safe-candidate",
+    "score": 11.0,
+    "reviewReasons": [],
+    "routeHypothesisCount": 18,
+    "unexplainedSkeletonRatio": 0.01,
+    "steps": [
+      {"stroke": 1, "selectedRoute": 2},
+      {"stroke": 2, "selectedRoute": 5}
+    ]
+  },
+  "evaluation": {
+    "truthReadAfterPrediction": true,
+    "strokeMacroIoU": 0.91,
+    "componentMacroIoU": 0.95,
+    "meanDirectedSequenceDtwPercent": 1.2,
+    "meanStartErrorPercent": 2.1,
+    "meanEndErrorPercent": 1.8,
+    "perStrokeIoU": [0.9, 0.92]
+  }
+}
