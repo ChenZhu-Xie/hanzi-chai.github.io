@@ -21,6 +21,7 @@ from unihan_experts.registry import (
     validate_expert_registry,
 )
 from unihan_experts.runner import CellSpec, run_cell
+from unihan_experts.report import generate_reports
 from unihan_experts.worktrees import (
     ensure_expert_worktree,
     resolve_commit,
@@ -218,6 +219,35 @@ def command_run(args) -> int:
     return 0 if all(item["status"] not in {"process-error", "timeout"} for item in results) else 1
 
 
+def command_report(args) -> int:
+    repo = args.repo.resolve()
+    runs_root = repo / ".local" / "ink-experts" / "runs"
+    run_id = args.run
+    if run_id == "latest":
+        latest = runs_root / "latest.txt"
+        if not latest.is_file():
+            raise FileNotFoundError("no latest expert benchmark run is recorded")
+        run_id = latest.read_text(encoding="utf-8").strip()
+    matrix_path = runs_root / run_id / "matrix.json"
+    cells = json.loads(matrix_path.read_text(encoding="utf-8"))
+    if not isinstance(cells, list):
+        raise ValueError(f"run matrix is not a list: {matrix_path}")
+    experts = load_expert_registry(EXPERTS_PATH)
+    declared = {
+        expert.expert_id: expert.declared_capabilities for expert in experts
+    }
+    output_root = repo / ".local" / "ink-experts" / "reports" / run_id
+    outputs = generate_reports(
+        cells,
+        output_root,
+        run_id=run_id,
+        declared_capabilities=declared,
+    )
+    for name, path in outputs.items():
+        print(f"{name}={path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=REPO_ROOT)
@@ -238,6 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--run-id")
             command.add_argument("--resume", action="store_true")
+    report = subparsers.add_parser("report")
+    report.set_defaults(function=command_report)
+    report.add_argument("--run", default="latest")
     return parser
 
 
