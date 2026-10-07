@@ -14,6 +14,7 @@ COMMON_CONFIG = frozenset(
     {"canvas", "ordinalWeight", "coverageWeight", "beamWidth"}
 )
 ADAPTER_CONFIG = {
+    "learned-v0": COMMON_CONFIG - {"beamWidth"},
     "classic-v1": COMMON_CONFIG,
     "centroid-v2": COMMON_CONFIG | {"leafCentroidWeight"},
     "reservation-v3": COMMON_CONFIG
@@ -87,7 +88,8 @@ def _base_command(context: RunContext) -> list[str]:
     for key, flag in config_flags:
         if key in context.expert.config:
             _append_option(argv, flag, context.expert.config[key])
-    _append_option(argv, "--decoder", context.expert.decoder)
+    if context.expert.adapter != "learned-v0":
+        _append_option(argv, "--decoder", context.expert.decoder)
 
     for artifact in context.expert.rule_artifacts:
         flag = RULE_FLAGS.get(artifact.alias)

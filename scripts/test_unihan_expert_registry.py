@@ -44,6 +44,7 @@ class ExpertRegistryTests(unittest.TestCase):
             {expert.expert_id for expert in experts},
             {
                 "classic-15c",
+                "learned-414",
                 "junction-23b",
                 "scan-front-7fc",
                 "grass-005",

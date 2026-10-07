@@ -48,6 +48,8 @@ class AdapterTests(unittest.TestCase):
         )
         self.output = root / "review.html"
         self.audit = root / "audit.json"
+        self.rules = root / "rules.json"
+        self.rules.write_text("{}", encoding="utf-8")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -59,7 +61,9 @@ class AdapterTests(unittest.TestCase):
             "expert": expert,
             "case": self.case,
             "shared_artifacts": self.paths,
-            "resolved_rule_artifacts": {},
+            "resolved_rule_artifacts": {
+                artifact.alias: self.rules for artifact in expert.rule_artifacts
+            },
             "output_path": self.output,
             "audit_path": self.audit,
         }
@@ -74,8 +78,15 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotIn("--annotations", argv)
                 for flag in ("--pdf", "--bbox-cache", "--candidates", "--output", "--audit-output"):
                     self.assertTrue(Path(flag_value(argv, flag)).is_absolute())
-                self.assertEqual(flag_value(argv, "--decoder"), expert.decoder)
-                self.assertEqual(flag_value(argv, "--beam-width"), "350")
+                if expert.adapter == "learned-v0":
+                    self.assertNotIn("--decoder", argv)
+                    self.assertNotIn("--beam-width", argv)
+                    self.assertEqual(
+                        flag_value(argv, "--learned-rules"), str(self.rules.resolve())
+                    )
+                else:
+                    self.assertEqual(flag_value(argv, "--decoder"), expert.decoder)
+                    self.assertEqual(flag_value(argv, "--beam-width"), "350")
 
     def test_adapter_generations_do_not_receive_newer_flags(self):
         experts = {

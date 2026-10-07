@@ -2,6 +2,24 @@
   "schemaVersion": 1,
   "experts": [
     {
+      "expertId": "learned-414",
+      "schemaVersion": 1,
+      "commit": "4140eea",
+      "adapter": "learned-v0",
+      "decoder": "learned",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0},
+      "ruleArtifacts": [
+        {
+          "alias": "learnedRules",
+          "path": ".local/ink-rule-training/rules.json",
+          "sha256": "20b22765fd13d114a266b378ae616de7172e4c9c514fe03ba19248129340beab"
+        }
+      ],
+      "parents": [],
+      "declaredCapabilities": ["learned-route-prior"],
+      "resourceClass": "medium"
+    },
+    {
       "expertId": "classic-15c",
       "schemaVersion": 1,
       "commit": "15c2b04",

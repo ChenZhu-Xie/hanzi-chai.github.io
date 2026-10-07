@@ -11,6 +11,7 @@ from .models import ArtifactRef, CaseManifest, ExpertManifest
 
 SUPPORTED_SCHEMA_VERSION = 1
 ADAPTER_DECODERS = {
+    "learned-v0": frozenset({"learned"}),
     "classic-v1": frozenset({"hybrid", "legacy", "residual"}),
     "centroid-v2": frozenset({"hybrid", "legacy", "residual"}),
     "reservation-v3": frozenset({"hybrid", "legacy", "residual"}),
