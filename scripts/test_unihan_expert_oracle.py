@@ -50,9 +50,24 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(select_oracle_winner([partial, complete])["expertId"], "complete")
 
     def test_fewer_hard_reasons_beat_metric_before_iou(self):
-        brittle = cell("brittle", reasons=("hard-failure",), stroke=0.99)
+        brittle = cell(
+            "brittle", reasons=("hard-geometry-fallback",), stroke=0.99
+        )
         stable = cell("stable", reasons=(), stroke=0.7)
         self.assertEqual(select_oracle_winner([brittle, stable])["expertId"], "stable")
+
+    def test_soft_review_reason_count_does_not_outrank_truth_metric(self):
+        weak = cell(
+            "weak",
+            reasons=("large-unexplained-skeleton",),
+            stroke=0.057634,
+        )
+        strong = cell(
+            "strong",
+            reasons=("large-unexplained-skeleton", "same-leaf-contact-fallback"),
+            stroke=0.648445,
+        )
+        self.assertEqual(select_oracle_winner([weak, strong])["expertId"], "strong")
 
     def test_metrics_follow_declared_priority(self):
         lower_stroke = cell("component", stroke=0.8, component=1.0)

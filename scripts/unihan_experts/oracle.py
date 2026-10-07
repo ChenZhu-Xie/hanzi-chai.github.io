@@ -17,6 +17,19 @@ INELIGIBLE_STATUSES = frozenset(
     }
 )
 
+# These reasons mean that the decoder had to violate or abandon a structural
+# constraint.  Other reasons (for example a close runner-up or unexplained
+# residual ink) remain visible in the report, but are quality signals already
+# measured by the post-truth metrics and must not outrank those metrics merely
+# because one expert emits fewer diagnostics.
+HARD_REVIEW_REASONS = frozenset(
+    {
+        "candidate-stroke-grammar-mismatch",
+        "future-feasibility-fallback",
+        "hard-geometry-fallback",
+    }
+)
+
 
 def _metrics(cell: Mapping[str, object]) -> Mapping[str, object]:
     evaluation = cell.get("evaluation")
@@ -44,6 +57,12 @@ def _review_reasons(cell: Mapping[str, object]) -> list[object]:
     return []
 
 
+def _hard_review_count(cell: Mapping[str, object]) -> int:
+    return sum(
+        str(reason) in HARD_REVIEW_REASONS for reason in _review_reasons(cell)
+    )
+
+
 def oracle_sort_key(cell: Mapping[str, object]) -> tuple[object, ...]:
     status = str(cell.get("status"))
     invalid = status in INELIGIBLE_STATUSES
@@ -52,7 +71,7 @@ def oracle_sort_key(cell: Mapping[str, object]) -> tuple[object, ...]:
     return (
         invalid,
         incomplete,
-        len(_review_reasons(cell)),
+        _hard_review_count(cell),
         -_number(metrics.get("strokeMacroIoU"), -math.inf),
         -_number(metrics.get("componentMacroIoU"), -math.inf),
         _number(metrics.get("meanDirectedSequenceDtwPercent"), math.inf),
@@ -87,7 +106,7 @@ def select_oracle_winner(
         "rankContract": [
             "valid",
             "complete",
-            "fewer-review-reasons",
+            "fewer-hard-review-reasons",
             "stroke-macro-iou",
             "component-macro-iou",
             "directed-sequence-error",
