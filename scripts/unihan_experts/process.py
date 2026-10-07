@@ -81,9 +81,9 @@ def run_command(
                 cpu, memory = _sample_process_tree(observed)
                 observed_cpu = max(observed_cpu or 0.0, cpu)
                 peak_memory = max(peak_memory or 0, memory)
-            except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
-                if observed_cpu is None and peak_memory is None:
-                    resource_reason = f"resource sampling unavailable: {error}"
+            except (psutil.Error, OSError) as error:
+                resource_reason = f"resource sampling unavailable: {error}"
+                observed = None
 
         remaining = timeout_seconds - (time.monotonic() - started)
         if remaining <= 0:

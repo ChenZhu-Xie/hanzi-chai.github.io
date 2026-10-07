@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -137,6 +138,19 @@ class WorktreeTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_resource_sampler_os_error_does_not_abort_command(self):
+        with mock.patch(
+            "unihan_experts.process._sample_process_tree",
+            side_effect=OSError("resource pressure"),
+        ):
+            result = run_command(
+                [sys.executable, "-c", "print('still-runs')"],
+                timeout_seconds=5,
+            )
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("still-runs", result.stdout)
+        self.assertIn("resource sampling unavailable", result.resource_unavailable_reason)
+
     def test_nonzero_command_retains_stdout_stderr(self):
         result = run_command(
             [
