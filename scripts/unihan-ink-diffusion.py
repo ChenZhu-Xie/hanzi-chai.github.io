@@ -4666,6 +4666,96 @@ def choose_routes(
     }
 
 
+EXPERT_HARD_REVIEW_REASONS = frozenset(
+    {
+        "candidate-stroke-grammar-mismatch",
+        "same-leaf-contact-fallback",
+        "hard-geometry-fallback",
+        "future-feasibility-fallback",
+        "root-structure-scan-fallback",
+        "reserved-pen-down-conflict",
+        "no-feasible-route",
+    }
+)
+EXPERT_FALLBACK_REASONS = frozenset(
+    {
+        "candidate-stroke-grammar-mismatch",
+        "hard-geometry-fallback",
+        "future-feasibility-fallback",
+        "root-structure-scan-fallback",
+        "reserved-pen-down-conflict",
+        "no-feasible-route",
+    }
+)
+
+
+def route_expert_summary(result: dict, expected_strokes: int) -> dict:
+    """Truth-free whole-universe evidence used to compare route experts."""
+    decision = result["decision"]
+    routes = result["routes"]
+    reasons = list(decision.get("reviewReasons", []))
+    missing = max(0, expected_strokes - len(routes))
+    hard_reasons = [
+        reason for reason in reasons if reason in EXPERT_HARD_REVIEW_REASONS
+    ]
+    return {
+        "name": result["name"],
+        "complete": missing == 0,
+        "predictedStrokeCount": len(routes),
+        "expectedStrokeCount": expected_strokes,
+        "missingStrokeCount": missing,
+        "hardReviewReasons": hard_reasons,
+        "hardReviewCount": len(hard_reasons),
+        "unexplainedSkeletonRatio": float(
+            decision.get("unexplainedSkeletonRatio", 1.0)
+        ),
+        "score": float(decision.get("score", math.inf)),
+        "reviewReasons": reasons,
+    }
+
+
+def route_expert_selection_key(summary: dict) -> tuple:
+    """Prefer complete, structurally coherent universes without using truth."""
+    preferred_on_tie = 0 if summary["name"] == "contact-retrace" else 1
+    return (
+        summary["missingStrokeCount"],
+        summary["hardReviewCount"],
+        summary["unexplainedSkeletonRatio"],
+        summary["score"],
+        preferred_on_tie,
+    )
+
+
+def select_route_expert(
+    results: list[dict], expected_strokes: int
+) -> tuple[dict, list[dict]]:
+    if not results:
+        raise ValueError("at least one route expert result is required")
+    summaries = [
+        route_expert_summary(result, expected_strokes) for result in results
+    ]
+    winner_index = min(
+        range(len(results)),
+        key=lambda index: route_expert_selection_key(summaries[index]),
+    )
+    return results[winner_index], summaries
+
+
+def route_expert_fallback_needed(
+    routes: list[RouteCandidate], decision: dict, expected_strokes: int
+) -> tuple[bool, list[str]]:
+    reasons = []
+    if len(routes) < expected_strokes:
+        reasons.append("partial-prediction")
+    review_reasons = set(decision.get("reviewReasons", []))
+    reasons.extend(sorted(review_reasons & EXPERT_FALLBACK_REASONS))
+    if float(decision.get("unexplainedSkeletonRatio", 1.0)) >= 0.15:
+        reasons.append("large-unexplained-skeleton")
+    if float(decision.get("score", 0.0)) >= 3000.0:
+        reasons.append("large-global-penalty")
+    return bool(reasons), list(dict.fromkeys(reasons))
+
+
 def geodesic_owners(
     target: np.ndarray,
     graph: SkeletonGraph,
@@ -5598,8 +5688,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leaf-centroid-weight", type=float, default=0.25)
     parser.add_argument(
         "--decoder",
-        choices=("hybrid", "legacy", "residual"),
-        default="hybrid",
+        choices=("ensemble", "hybrid", "legacy", "residual"),
+        default="ensemble",
+    )
+    parser.add_argument(
+        "--expert-fallback-route-budget",
+        type=int,
+        default=800,
+        help=(
+            "maximum raw route hypotheses allowed before the ensemble skips "
+            "its expensive baseline fallback"
+        ),
     )
     parser.add_argument("--learned-rules", type=Path)
     parser.add_argument("--stroke-order-catalog", type=Path)
@@ -5671,7 +5770,7 @@ def main():
         else None
     )
     excluded_training_case = f"U+{codepoint:04X}-{args.source}"
-    ranked = rank_routes(
+    base_ranked = rank_routes(
         candidate,
         graph,
         raw_routes,
@@ -5690,22 +5789,26 @@ def main():
     )
     order_guard_audit = None
     topology_guard_audit = None
-    if args.decoder == "hybrid":
-        ranked, order_guard_audit = apply_stroke_order_guard(
+    contact_ranked = None
+    if args.decoder in {"ensemble", "hybrid"}:
+        contact_ranked, order_guard_audit = apply_stroke_order_guard(
             candidate,
-            ranked,
+            base_ranked,
             source=args.source,
             codepoint=codepoint,
             normative_catalog=normative_catalog,
         )
-        ranked, topology_guard_audit = apply_stroke_topology_guard(
+        contact_ranked, topology_guard_audit = apply_stroke_topology_guard(
             candidate,
-            ranked,
+            contact_ranked,
             graph,
         )
-        ranked = augment_pen_down_contact_routes(candidate, ranked, graph)
-        ranked = compact_route_hypotheses(ranked)
-    if any(not options for options in ranked):
+        contact_ranked = augment_pen_down_contact_routes(
+            candidate, contact_ranked, graph
+        )
+        contact_ranked = compact_route_hypotheses(contact_ranked)
+    active_ranked = contact_ranked if contact_ranked is not None else base_ranked
+    if any(not options for options in active_ranked):
         missing = [
             {
                 "stroke": index + 1,
@@ -5716,20 +5819,25 @@ def main():
                     topology_guard_audit[index] if topology_guard_audit else None
                 ),
             }
-            for index, options in enumerate(ranked)
+            for index, options in enumerate(active_ranked)
             if not options
         ]
-        raise RuntimeError(
-            "candidate strokes have no feasible PDF route: "
-            + json.dumps(missing, ensure_ascii=False)
-        )
+        if args.decoder != "ensemble" or any(
+            not options for options in base_ranked
+        ):
+            raise RuntimeError(
+                "candidate strokes have no feasible PDF route: "
+                + json.dumps(missing, ensure_ascii=False)
+            )
+        contact_ranked = None
+        active_ranked = base_ranked
     residual_result = None
     if args.decoder == "residual":
         residual_result = RESIDUAL_DECODER.decode_residual_routes(
             target,
             graph,
             candidate,
-            ranked,
+            base_ranked,
             source=args.source,
             codepoint=codepoint,
             learned_model=learned_model,
@@ -5739,63 +5847,47 @@ def main():
         routes = list(residual_result.routes)
         owner = residual_result.ledger.visible_owner
         decision = residual_decision_payload(residual_result, target)
+        ranked = base_ranked
     else:
-        choice_ranked = (
-            normalize_ranked_pen_paths(
+        def solve_expert(
+            name: str,
+            expert_ranked: list[list[RouteCandidate]],
+            *,
+            contact_retrace: bool,
+        ) -> dict:
+            choice_ranked = expert_ranked
+            if contact_retrace:
+                choice_ranked = normalize_ranked_pen_paths(
+                    candidate,
+                    choice_ranked,
+                    graph,
+                    source=args.source,
+                    codepoint=codepoint,
+                    normative_catalog=normative_catalog,
+                )
+                choice_ranked = augment_contact_retrace_variants(
+                    candidate,
+                    choice_ranked,
+                )
+            grass_keys = broken_grass_head_keys(candidate) if contact_retrace else set()
+            first_pass_ranked = []
+            for stroke, options in zip(candidate, choice_ranked):
+                key = (
+                    int(stroke.get("componentId", -1)),
+                    int(stroke.get("occurrence", 0)),
+                )
+                if key in grass_keys:
+                    without_scan_seed = [
+                        option
+                        for option in options
+                        if not option.evidence.get("diagonalFrontSeedRoute")
+                    ]
+                    first_pass_ranked.append(without_scan_seed or options)
+                else:
+                    first_pass_ranked.append(options)
+            expert_routes, expert_decision = choose_routes(
                 candidate,
-                ranked,
-                graph,
-                source=args.source,
-                codepoint=codepoint,
-                normative_catalog=normative_catalog,
-            )
-            if args.decoder == "hybrid"
-            else ranked
-        )
-        if args.decoder == "hybrid":
-            choice_ranked = augment_contact_retrace_variants(
-                candidate,
-                choice_ranked,
-            )
-        grass_keys = broken_grass_head_keys(candidate)
-        baseline_ranked = []
-        for stroke, options in zip(candidate, choice_ranked):
-            key = (
-                int(stroke.get("componentId", -1)),
-                int(stroke.get("occurrence", 0)),
-            )
-            if args.decoder == "hybrid" and key in grass_keys:
-                without_scan_seed = [
-                    option
-                    for option in options
-                    if not option.evidence.get("diagonalFrontSeedRoute")
-                ]
-                baseline_ranked.append(without_scan_seed or options)
-            else:
-                baseline_ranked.append(options)
-        routes, decision = choose_routes(
-            candidate,
-            baseline_ranked,
-            int(skeleton.sum()),
-            coverage_weight=args.coverage_weight,
-            leaf_centroid_weight=args.leaf_centroid_weight,
-            beam_width=args.beam_width,
-            graph=graph,
-            protect_completed_stroke_residuals=(
-                not args.disable_completed_stroke_reservation
-            ),
-            allow_partial=args.allow_partial,
-        )
-        grass_recovery_keys = (
-            grass_diagonal_recovery_needed(candidate, routes)
-            if args.decoder == "hybrid"
-            else []
-        )
-        if grass_recovery_keys and len(routes) == len(candidate):
-            baseline_score = decision["score"]
-            routes, decision = choose_routes(
-                candidate,
-                choice_ranked,
+                first_pass_ranked,
                 int(skeleton.sum()),
                 coverage_weight=args.coverage_weight,
                 leaf_centroid_weight=args.leaf_centroid_weight,
@@ -5804,34 +5896,128 @@ def main():
                 protect_completed_stroke_residuals=(
                     not args.disable_completed_stroke_reservation
                 ),
-                allow_partial=args.allow_partial,
+                allow_partial=args.allow_partial or args.decoder == "ensemble",
             )
-            decision["grassDiagonalFrontRecovery"] = {
-                "triggered": True,
-                "leafKeys": [list(key) for key in grass_recovery_keys],
-                "baselineScore": baseline_score,
-                "reason": "completed-grass-head-centroid-order-mismatch",
+            grass_recovery_keys = (
+                grass_diagonal_recovery_needed(candidate, expert_routes)
+                if contact_retrace and len(expert_routes) == len(candidate)
+                else []
+            )
+            if grass_recovery_keys:
+                baseline_score = expert_decision["score"]
+                expert_routes, expert_decision = choose_routes(
+                    candidate,
+                    choice_ranked,
+                    int(skeleton.sum()),
+                    coverage_weight=args.coverage_weight,
+                    leaf_centroid_weight=args.leaf_centroid_weight,
+                    beam_width=args.beam_width,
+                    graph=graph,
+                    protect_completed_stroke_residuals=(
+                        not args.disable_completed_stroke_reservation
+                    ),
+                    allow_partial=args.allow_partial or args.decoder == "ensemble",
+                )
+                expert_decision["grassDiagonalFrontRecovery"] = {
+                    "triggered": True,
+                    "leafKeys": [list(key) for key in grass_recovery_keys],
+                    "baselineScore": baseline_score,
+                    "reason": "completed-grass-head-centroid-order-mismatch",
+                }
+            else:
+                expert_decision["grassDiagonalFrontRecovery"] = {
+                    "triggered": False,
+                    "leafKeys": [],
+                }
+            if contact_retrace:
+                expert_routes = normalize_selected_pen_paths(
+                    candidate,
+                    expert_routes,
+                    graph,
+                    source=args.source,
+                    codepoint=codepoint,
+                    normative_catalog=normative_catalog,
+                )
+                if order_guard_audit is not None:
+                    expert_decision["strokeOrderGuard"] = order_guard_audit
+                if topology_guard_audit is not None:
+                    expert_decision["strokeTopologyGuard"] = topology_guard_audit
+            expert_decision["routeExpert"] = name
+            return {
+                "name": name,
+                "routes": expert_routes,
+                "decision": expert_decision,
+                "ranked": choice_ranked,
             }
-        else:
-            decision["grassDiagonalFrontRecovery"] = {
-                "triggered": False,
-                "leafKeys": [],
+
+        expert_results = []
+        fallback_triggered = False
+        fallback_reasons: list[str] = []
+        baseline_budget_allowed = (
+            len(raw_routes) <= args.expert_fallback_route_budget
+        )
+        if args.decoder in {"ensemble", "hybrid"} and contact_ranked is not None:
+            contact_result = solve_expert(
+                "contact-retrace", contact_ranked, contact_retrace=True
+            )
+            expert_results.append(contact_result)
+            fallback_triggered, fallback_reasons = route_expert_fallback_needed(
+                contact_result["routes"],
+                contact_result["decision"],
+                len(candidate),
+            )
+        if (
+            args.decoder == "legacy"
+            or (args.decoder == "ensemble" and not expert_results)
+            or (
+                args.decoder == "ensemble"
+                and fallback_triggered
+                and baseline_budget_allowed
+            )
+        ):
+            expert_results.append(
+                solve_expert(
+                    "baseline-complete", base_ranked, contact_retrace=False
+                )
+            )
+        selected_result, expert_summaries = select_route_expert(
+            expert_results, len(candidate)
+        )
+        routes = selected_result["routes"]
+        decision = selected_result["decision"]
+        ranked = selected_result["ranked"]
+        decision["decoder"] = args.decoder
+        decision["expertSelection"] = {
+            "policy": "cascade",
+            "communication": "isolated-search-readonly-inputs",
+            "sharedMutableState": False,
+            "winner": selected_result["name"],
+            "fallbackTriggered": fallback_triggered,
+            "fallbackReasons": fallback_reasons,
+            "baselineRouteBudget": {
+                "limit": args.expert_fallback_route_budget,
+                "observed": len(raw_routes),
+                "allowed": baseline_budget_allowed,
+                "skipped": bool(
+                    args.decoder == "ensemble"
+                    and bool(expert_results)
+                    and fallback_triggered
+                    and not baseline_budget_allowed
+                ),
+            },
+            "candidates": expert_summaries,
+            "usesHumanTruth": False,
+        }
+        if len(routes) < len(candidate) and not args.allow_partial:
+            failed = decision.get("failedStroke") or {
+                "stroke": len(routes) + 1,
+                "reason": "no-globally-feasible-route-hypothesis",
             }
-        if args.decoder == "hybrid":
-            routes = normalize_selected_pen_paths(
-                candidate,
-                routes,
-                graph,
-                source=args.source,
-                codepoint=codepoint,
-                normative_catalog=normative_catalog,
+            raise RuntimeError(
+                "route experts found no complete universe: "
+                + json.dumps(failed, ensure_ascii=False)
             )
         owner, _owner_distance = geodesic_owners(target, graph, routes)
-        decision["decoder"] = args.decoder
-        if order_guard_audit is not None:
-            decision["strokeOrderGuard"] = order_guard_audit
-        if topology_guard_audit is not None:
-            decision["strokeTopologyGuard"] = topology_guard_audit
     arrival, events, maximum_time = diffusion_arrivals(target, owner, routes)
 
     # The prediction is now frozen. Only evaluation below may read target truth.
@@ -5856,9 +6042,13 @@ def main():
                 "sequential-directed-residual-ink-v1"
                 if args.decoder == "residual"
                 else (
-                    "classic-directed-skeleton-with-stroke-order-guard-v1"
-                    if args.decoder == "hybrid"
-                    else "directed-skeleton-front-plus-bounded-radial-wetting-v2"
+                    "route-expert-ensemble-v1"
+                    if args.decoder == "ensemble"
+                    else (
+                        "classic-directed-skeleton-with-stroke-order-guard-v1"
+                        if args.decoder == "hybrid"
+                        else "directed-skeleton-front-plus-bounded-radial-wetting-v2"
+                    )
                 )
             ),
             "candidateGeometryUsedForTargetMask": False,

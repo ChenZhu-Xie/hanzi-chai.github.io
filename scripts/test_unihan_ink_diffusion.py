@@ -15,6 +15,83 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DirectedInkDiffusionTests(unittest.TestCase):
+    def test_route_expert_never_prefers_partial_over_complete(self):
+        partial = {
+            "name": "contact-retrace",
+            "routes": [object()],
+            "decision": {
+                "score": -100.0,
+                "unexplainedSkeletonRatio": 0.01,
+                "reviewReasons": [],
+            },
+        }
+        complete = {
+            "name": "baseline-complete",
+            "routes": [object(), object()],
+            "decision": {
+                "score": 20.0,
+                "unexplainedSkeletonRatio": 0.12,
+                "reviewReasons": ["hard-geometry-fallback"],
+            },
+        }
+        winner, summaries = MODULE.select_route_expert(
+            [partial, complete], expected_strokes=2
+        )
+        self.assertIs(winner, complete)
+        self.assertFalse(summaries[0]["complete"])
+        self.assertTrue(summaries[1]["complete"])
+
+    def test_route_expert_prefers_fewer_hard_failures_before_residual_ratio(self):
+        brittle = {
+            "name": "contact-retrace",
+            "routes": [object()],
+            "decision": {
+                "score": 1.0,
+                "unexplainedSkeletonRatio": 0.01,
+                "reviewReasons": ["future-feasibility-fallback"],
+            },
+        }
+        stable = {
+            "name": "baseline-complete",
+            "routes": [object()],
+            "decision": {
+                "score": 4.0,
+                "unexplainedSkeletonRatio": 0.08,
+                "reviewReasons": [],
+            },
+        }
+        winner, _summaries = MODULE.select_route_expert(
+            [brittle, stable], expected_strokes=1
+        )
+        self.assertIs(winner, stable)
+
+    def test_partial_or_severe_hybrid_result_triggers_baseline_expert(self):
+        needed, reasons = MODULE.route_expert_fallback_needed(
+            [object()],
+            {
+                "score": 4001.0,
+                "unexplainedSkeletonRatio": 0.2,
+                "reviewReasons": ["future-feasibility-fallback"],
+            },
+            expected_strokes=2,
+        )
+        self.assertTrue(needed)
+        self.assertIn("partial-prediction", reasons)
+        self.assertIn("future-feasibility-fallback", reasons)
+
+    def test_complete_contact_only_review_does_not_trigger_baseline_expert(self):
+        needed, reasons = MODULE.route_expert_fallback_needed(
+            [object(), object()],
+            {
+                "score": 2020.0,
+                "unexplainedSkeletonRatio": 0.077,
+                "reviewReasons": ["same-leaf-contact-fallback"],
+            },
+            expected_strokes=2,
+        )
+        self.assertFalse(needed)
+        self.assertEqual(reasons, [])
+
     def test_review_mode_returns_best_prefix_when_later_stroke_has_no_route(self):
         strokes = [
             {
@@ -963,12 +1040,21 @@ class DirectedInkDiffusionTests(unittest.TestCase):
         final_owner = {tuple(pixel[:2]): pixel[2] for pixel in payload["visibleOwner"]}
         self.assertEqual(final_owner[(1, 1)], 1)
         self.assertEqual(len(payload["residualLayers"]), 2)
-    def test_cli_defaults_to_classic_search_with_order_guard(self):
+    def test_cli_defaults_to_route_expert_ensemble(self):
         self.assertTrue(hasattr(MODULE, "build_argument_parser"))
         parser = MODULE.build_argument_parser()
         decoder = next(action for action in parser._actions if action.dest == "decoder")
-        self.assertEqual(tuple(decoder.choices), ("hybrid", "legacy", "residual"))
-        self.assertEqual(decoder.default, "hybrid")
+        self.assertEqual(
+            tuple(decoder.choices),
+            ("ensemble", "hybrid", "legacy", "residual"),
+        )
+        self.assertEqual(decoder.default, "ensemble")
+        route_budget = next(
+            action
+            for action in parser._actions
+            if action.dest == "expert_fallback_route_budget"
+        )
+        self.assertEqual(route_budget.default, 800)
 
     def test_hybrid_order_guard_removes_opposite_pen_direction(self):
         def option(points, score):
