@@ -20,7 +20,7 @@ from unihan_experts.registry import (
     resolve_annotation,
     validate_expert_registry,
 )
-from unihan_experts.runner import CellSpec, run_cell
+from unihan_experts.runner import CellSpec, merge_matrix_records, run_cell
 from unihan_experts.report import generate_reports
 from unihan_experts.worktrees import (
     ensure_expert_worktree,
@@ -210,12 +210,20 @@ def command_run(args) -> int:
         )
         results.append(result)
         print(f"  -> {result['status']}", flush=True)
-    (run_root / "matrix.json").write_text(
-        json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    matrix_path = run_root / "matrix.json"
+    existing = []
+    if matrix_path.is_file():
+        loaded = json.loads(matrix_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list):
+            raise ValueError(f"existing run matrix is not a list: {matrix_path}")
+        existing = loaded
+    combined = merge_matrix_records(existing, results)
+    matrix_path.write_text(
+        json.dumps(combined, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(f"runId={run_id}")
-    print(f"matrix={run_root / 'matrix.json'}")
+    print(f"matrix={matrix_path}")
     return 0 if all(item["status"] not in {"process-error", "timeout"} for item in results) else 1
 
 

@@ -316,3 +316,16 @@ def run_matrix(
         run_cell(spec, annotation_resolver=annotation_resolver, resume=resume)
         for spec in ordered
     ]
+
+
+def merge_matrix_records(
+    existing: Sequence[Mapping[str, object]],
+    incoming: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for cell in [*existing, *incoming]:
+        key = (str(cell.get("expertId")), str(cell.get("caseId")))
+        if not all(key):
+            raise ValueError("matrix cell requires expertId and caseId")
+        merged[key] = dict(cell)
+    return [merged[key] for key in sorted(merged)]

@@ -10,7 +10,7 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from unihan_experts.models import CaseManifest, ExpertManifest
-from unihan_experts.runner import CellSpec, run_cell, run_matrix
+from unihan_experts.runner import CellSpec, merge_matrix_records, run_cell, run_matrix
 
 
 SHA_A = "a" * 64
@@ -131,6 +131,25 @@ class RunnerFixture:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_matrix_merge_replaces_same_cell_and_keeps_other_batches(self):
+        existing = [
+            {"expertId": "alpha", "caseId": "a", "status": "old"},
+            {"expertId": "beta", "caseId": "a", "status": "complete"},
+        ]
+        incoming = [
+            {"expertId": "alpha", "caseId": "a", "status": "complete"},
+            {"expertId": "alpha", "caseId": "b", "status": "complete"},
+        ]
+        merged = merge_matrix_records(existing, incoming)
+        self.assertEqual(
+            [(item["expertId"], item["caseId"], item["status"]) for item in merged],
+            [
+                ("alpha", "a", "complete"),
+                ("alpha", "b", "complete"),
+                ("beta", "a", "complete"),
+            ],
+        )
+
     def test_prediction_is_persisted_before_annotation_is_resolved(self):
         with RunnerFixture() as fixture:
             spec = fixture.spec()
