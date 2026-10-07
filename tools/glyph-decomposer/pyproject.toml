@@ -1,0 +1,32 @@
+[project]
+name = "glyph-decomposer"
+version = "0.1.0"
+description = "Deterministic vector glyph decomposition experiments for hanzi-chai"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy>=2.1",
+  "pydantic>=2.11",
+  "shapely>=2.1",
+  "svgpathtools>=1.7",
+]
+
+[project.scripts]
+glyph-decomposer = "glyph_decomposer.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4",
+  "ruff>=0.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
