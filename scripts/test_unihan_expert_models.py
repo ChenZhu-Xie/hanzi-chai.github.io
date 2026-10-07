@@ -20,6 +20,7 @@ from unihan_experts.models import (
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
+GIT_COMMIT = "d" * 40
 
 
 def make_expert(**overrides):
@@ -58,7 +59,7 @@ class CanonicalHashTests(unittest.TestCase):
         left = make_expert()
         right = make_expert(config={"beamWidth": 48, "coverageWeight": 12.0})
         identity_args = {
-            "resolved_commit": SHA_B,
+            "resolved_commit": GIT_COMMIT,
             "source_tree_hash": SHA_C,
             "interpreter_identity": {"executable": "python", "version": "3.13"},
         }
@@ -75,7 +76,7 @@ class CanonicalHashTests(unittest.TestCase):
             )
         )
         identity_args = {
-            "resolved_commit": SHA_B,
+            "resolved_commit": GIT_COMMIT,
             "source_tree_hash": SHA_C,
             "interpreter_identity": {"executable": "python", "version": "3.13"},
         }
@@ -83,6 +84,15 @@ class CanonicalHashTests(unittest.TestCase):
             expert_content_identity(left, **identity_args),
             expert_content_identity(right, **identity_args),
         )
+
+    def test_expert_identity_accepts_full_git_object_id(self):
+        identity = expert_content_identity(
+            make_expert(),
+            resolved_commit=GIT_COMMIT,
+            source_tree_hash=SHA_C,
+            interpreter_identity={"version": "3.13"},
+        )
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
 
 
 class ManifestValidationTests(unittest.TestCase):

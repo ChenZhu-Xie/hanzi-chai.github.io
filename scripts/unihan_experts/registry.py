@@ -134,6 +134,24 @@ def load_case_registry(path: Path) -> tuple[CaseManifest, ...]:
     return tuple(cases)
 
 
+def load_shared_artifacts(path: Path) -> dict[str, Path]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schemaVersion") != SUPPORTED_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported case registry schema: {payload.get('schemaVersion')!r}"
+        )
+    raw = payload.get("sharedArtifacts")
+    if not isinstance(raw, dict):
+        raise ValueError("case registry sharedArtifacts must be an object")
+    artifacts: dict[str, Path] = {}
+    for alias, value in raw.items():
+        artifact = Path(str(value))
+        if artifact.is_absolute():
+            raise ValueError(f"shared artifact {alias!r} must be repository-relative")
+        artifacts[str(alias)] = artifact
+    return artifacts
+
+
 def resolve_annotation(case: CaseManifest, roots: Iterable[Path]) -> Path:
     matches = [
         candidate.resolve()

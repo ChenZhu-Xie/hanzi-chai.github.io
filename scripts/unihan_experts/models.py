@@ -11,6 +11,7 @@ from .hashing import sha256_json
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _EXPERT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _CASE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _UNICODE = re.compile(r"^U\+[0-9A-F]{4,6}$")
@@ -19,6 +20,11 @@ _UNICODE = re.compile(r"^U\+[0-9A-F]{4,6}$")
 def _require_sha256(value: str, label: str) -> None:
     if not _SHA256.fullmatch(value):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+
+
+def _require_git_object_id(value: str, label: str) -> None:
+    if not _GIT_OBJECT_ID.fullmatch(value):
+        raise ValueError(f"{label} must be a full lowercase Git object ID")
 
 
 @dataclass(frozen=True)
@@ -159,7 +165,7 @@ def expert_content_identity(
 ) -> str:
     """Hash every semantic input that makes an expert independently runnable."""
 
-    _require_sha256(resolved_commit, "resolved commit")
+    _require_git_object_id(resolved_commit, "resolved commit")
     _require_sha256(source_tree_hash, "source tree hash")
     return sha256_json(
         {

@@ -3,7 +3,7 @@
   "sharedArtifacts": {
     "pdf": ".local/unicode/U4E00.pdf",
     "bbox": ".local/unicode/U4E00-bbox.html",
-    "candidates": ".local/reviewed-glyph-svg-candidates.json"
+    "candidates": ".local/reviewed-visual-benchmark-current.json"
   },
   "cases": [
     {"caseId": "u6418-g-17973", "unicode": "U+6418", "source": "G", "glyphId": 17973, "annotationBasename": "U+6418-G-17973-annotations.json"},

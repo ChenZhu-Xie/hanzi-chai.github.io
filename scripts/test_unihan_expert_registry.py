@@ -12,6 +12,7 @@ from unihan_experts.models import CaseManifest, ExpertManifest
 from unihan_experts.registry import (
     load_case_registry,
     load_expert_registry,
+    load_shared_artifacts,
     resolve_annotation,
     validate_expert_registry,
 )
@@ -87,6 +88,11 @@ class ExpertRegistryTests(unittest.TestCase):
 
 
 class CaseRegistryTests(unittest.TestCase):
+    def test_shared_artifacts_are_repo_relative(self):
+        artifacts = load_shared_artifacts(CASES_PATH)
+        self.assertEqual(set(artifacts), {"pdf", "bbox", "candidates"})
+        self.assertTrue(all(not path.is_absolute() for path in artifacts.values()))
+
     def test_tracked_registry_contains_twelve_cases_once(self):
         cases = load_case_registry(CASES_PATH)
         self.assertEqual(len(cases), 12)
