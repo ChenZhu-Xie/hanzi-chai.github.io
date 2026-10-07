@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "sharedArtifacts": {
+    "pdf": ".local/unicode/U4E00.pdf",
+    "bbox": ".local/unicode/U4E00-bbox.html",
+    "candidates": ".local/reviewed-glyph-svg-candidates.json"
+  },
+  "cases": [
+    {"caseId": "u6418-g-17973", "unicode": "U+6418", "source": "G", "glyphId": 17973, "annotationBasename": "U+6418-G-17973-annotations.json"},
+    {"caseId": "u6424-j-900005", "unicode": "U+6424", "source": "J", "glyphId": 900005, "annotationBasename": "U+6424-J-900005-annotations.json"},
+    {"caseId": "u6461-g-18049", "unicode": "U+6461", "source": "G", "glyphId": 18049, "annotationBasename": "U+6461-G-18049-annotations.json"},
+    {"caseId": "u6485-j-18088", "unicode": "U+6485", "source": "J", "glyphId": 18088, "annotationBasename": "U+6485-J-18088-annotations.json"},
+    {"caseId": "u64ce-t-900000", "unicode": "U+64CE", "source": "T", "glyphId": 900000, "annotationBasename": "U+64CE-T-900000-annotations.json"},
+    {"caseId": "u64cf-h-900001", "unicode": "U+64CF", "source": "H", "glyphId": 900001, "annotationBasename": "u64cf-h-annotations.json"},
+    {"caseId": "u64ec-t-900021", "unicode": "U+64EC", "source": "T", "glyphId": 900021, "annotationBasename": "U+64EC-T-900021-annotations.json"},
+    {"caseId": "u65e8-t-127685", "unicode": "U+65E8", "source": "T", "glyphId": 127685, "annotationBasename": "U+65E8-T-127685-annotations.json"},
+    {"caseId": "u66da-j-18633", "unicode": "U+66DA", "source": "J", "glyphId": 18633, "annotationBasename": "U+66DA-J-18633-annotations.json"},
+    {"caseId": "u66da-n-57149", "unicode": "U+66DA", "source": "N", "glyphId": 57149, "annotationBasename": "U+66DA-N-57149-annotations.json"},
+    {"caseId": "u6726-j-18691", "unicode": "U+6726", "source": "J", "glyphId": 18691, "annotationBasename": "U+6726-J-18691-annotations.json"},
+    {"caseId": "u808e-t-900013", "unicode": "U+808E", "source": "T", "glyphId": 900013, "annotationBasename": "U+808E-T-900013-annotations.json"}
+  ]
+}

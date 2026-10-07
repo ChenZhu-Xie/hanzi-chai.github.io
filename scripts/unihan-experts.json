@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "experts": [
+    {
+      "expertId": "classic-15c",
+      "schemaVersion": 1,
+      "commit": "15c2b04",
+      "adapter": "classic-v1",
+      "decoder": "legacy",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["classic-complete-stroke"],
+      "resourceClass": "small"
+    },
+    {
+      "expertId": "junction-23b",
+      "schemaVersion": 1,
+      "commit": "23b9179",
+      "adapter": "classic-v1",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["junction-topology"],
+      "resourceClass": "medium"
+    },
+    {
+      "expertId": "scan-front-7fc",
+      "schemaVersion": 1,
+      "commit": "7fc2c16",
+      "adapter": "classic-v1",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["closed-box", "scan-front"],
+      "resourceClass": "medium"
+    },
+    {
+      "expertId": "grass-005",
+      "schemaVersion": 1,
+      "commit": "0058190",
+      "adapter": "centroid-v2",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "leafCentroidWeight": 0.25, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["grass-head"],
+      "resourceClass": "medium"
+    },
+    {
+      "expertId": "recursive-ids-8c",
+      "schemaVersion": 1,
+      "commit": "8c585f2",
+      "adapter": "centroid-v2",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "leafCentroidWeight": 0.25, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["recursive-ids", "sibling-order"],
+      "resourceClass": "large"
+    },
+    {
+      "expertId": "complete-route-2272",
+      "schemaVersion": 1,
+      "commit": "2272a6d",
+      "adapter": "centroid-v2",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "leafCentroidWeight": 0.25, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["complete-directed-route"],
+      "resourceClass": "large"
+    },
+    {
+      "expertId": "contact-dd",
+      "schemaVersion": 1,
+      "commit": "dd1dd05",
+      "adapter": "centroid-v2",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "leafCentroidWeight": 0.25, "beamWidth": 24},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["contact-retrace"],
+      "resourceClass": "large"
+    },
+    {
+      "expertId": "reserved-dad",
+      "schemaVersion": 1,
+      "commit": "dad0107",
+      "adapter": "reservation-v3",
+      "decoder": "hybrid",
+      "config": {"canvas": 256, "ordinalWeight": 0.12, "coverageWeight": 12.0, "leafCentroidWeight": 0.25, "beamWidth": 24, "completedStrokeReservation": true},
+      "ruleArtifacts": [],
+      "parents": [],
+      "declaredCapabilities": ["completed-stroke-reservation"],
+      "resourceClass": "large"
+    }
+  ]
+}
