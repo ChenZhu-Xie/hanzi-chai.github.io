@@ -106,5 +106,28 @@ owned by different recursive IDS leaf occurrences share it, the node must be
 split between those owners. This represents contacts such as 口/句, 幺/下部,
 老/匕 and 扌/八 without pretending that the printed ink is disconnected.
 
+To collect human corrections without editing or retraining the inference
+pipeline, build the standalone skeleton editor:
+
+```powershell
+uv run glyph-decomposer skeleton-editor `
+  --pdf <U4E00.pdf> `
+  --bbox-cache <U4E00-bbox.html> `
+  --glyph-data <glyphs.json> `
+  --candidate-catalog <review-catalog.json> `
+  --annotations <annotation.json> [<annotation.json> ...] `
+  --output <skeleton-editor.html>
+```
+
+The annotation files contribute metadata only; their directed paths are not
+read when the editable skeleton and initial ownership proposal are built. The
+editor can trim a terminal branch, delete a maximal chain, place node or
+in-edge semantic cuts, and reassign a chain to a recursive IDS leaf. Every
+operation can carry its own comment, each glyph has a summary comment, and
+the exported JSON includes stable case fingerprints plus normalized cut
+coordinates so that a later learner can reproduce and interpret the choices.
+Browser local storage preserves work between reloads; use the JSON export for
+portable review data.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

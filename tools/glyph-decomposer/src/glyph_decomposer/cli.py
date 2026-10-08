@@ -13,6 +13,7 @@ from .pipeline import decompose_with_artifacts
 from .review import render_review_html
 from .route_cover import build_route_cover_audit, render_route_cover_audit
 from .skeleton import audit_annotations, render_skeleton_audit
+from .skeleton_editor import build_skeleton_editor_cases, render_skeleton_editor
 from .trajectory import (
     complete_historic_routes,
     load_historic_review,
@@ -56,11 +57,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     route.add_argument("request", type=Path)
     route.add_argument("--output", type=Path, required=True)
+    editor = subparsers.add_parser(
+        "skeleton-editor",
+        help="build a human editor for skeleton trims, cuts, and IDS leaf ownership",
+    )
+    editor.add_argument("--pdf", type=Path, required=True)
+    editor.add_argument("--bbox-cache", type=Path, required=True)
+    editor.add_argument("--glyph-data", type=Path, required=True)
+    editor.add_argument("--candidate-catalog", type=Path, required=True)
+    editor.add_argument("--annotations", type=Path, nargs="+", required=True)
+    editor.add_argument("--size", type=int, default=256)
+    editor.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "skeleton-editor":
+        cases = build_skeleton_editor_cases(
+            args.pdf,
+            args.bbox_cache,
+            args.glyph_data,
+            args.candidate_catalog,
+            args.annotations,
+            size=args.size,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(render_skeleton_editor(cases), encoding="utf-8")
+        return 0
     if args.command == "route-cover-audit":
         request = DecompositionRequest.model_validate_json(
             args.request.read_text(encoding="utf-8")
