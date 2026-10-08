@@ -11,8 +11,9 @@ The prototype performs independently testable operations:
    enumeration;
 4. try a constrained `⿸` partition, but stop with an explicit reason when a
    clean geometric boundary does not exist; then use directed candidate
-   centerlines to induce mutually exclusive vector Voronoi ink atoms, guarded
-   by truth-free alignment and non-degeneracy checks;
+   strokes to induce mutually exclusive vector Voronoi ink atoms, with local
+   junction ownership, within-stroke continuity and between-stroke
+   independence guarded by truth-free checks;
 5. evaluate root and recursive terminal regions against a human annotation
    that inference never reads.
 

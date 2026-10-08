@@ -15,6 +15,16 @@ from .recursive import terminal_nodes
 COLORS = ("#2563eb", "#f97316", "#16a34a", "#9333ea", "#db2777", "#0891b2")
 
 
+def _stroke_color(index: int) -> str:
+    return f"hsl({(index * 137.508 + 18) % 360:.1f} 72% 42%)"
+
+
+def _nodes(node):
+    yield node
+    for child in node.children:
+        yield from _nodes(child)
+
+
 def _polygons(geometry):
     if isinstance(geometry, Polygon):
         return (geometry,)
@@ -83,8 +93,13 @@ def render_review_html(
     )
     if result.partition.axis == "x":
         cut_line = f'<line x1="{result.partition.cut}" y1="0" x2="{result.partition.cut}" y2="100"/>'
-    else:
+    elif result.partition.axis == "y":
         cut_line = f'<line x1="0" y1="{result.partition.cut}" x2="100" y2="{result.partition.cut}"/>'
+    else:
+        cut_line = ""
+    cut_value = (
+        "无单一直线" if result.partition.cut is None else f"{result.partition.cut:g}"
+    )
     evaluation = result.evaluation
     metrics = "未提供人工真值"
     if evaluation:
@@ -102,29 +117,38 @@ def render_review_html(
             f"最低 IoU {result.recursive_evaluation.minimum_iou:.2%}。</p>"
         )
     atom_evidence = ""
-    atom_partitions = [
-        node.evidence.partition
-        for node in terminals
+    atom_nodes = [
+        node
+        for node in _nodes(artifacts.decomposition)
         if node.evidence.partition and node.evidence.partition.axis == "atoms"
     ]
-    if not atom_partitions:
-
-        def collect(node):
-            output = []
-            if node.evidence.partition and node.evidence.partition.axis == "atoms":
-                output.append(node.evidence.partition)
-            for child in node.children:
-                output.extend(collect(child))
-            return output
-
-        atom_partitions = collect(artifacts.decomposition)
+    atom_partitions = [node.evidence.partition for node in atom_nodes]
     if atom_partitions:
-        atom = atom_partitions[0]
-        atom_evidence = (
-            f"<p><strong>矢量原子：</strong>{atom.atom_count} 个互斥面；"
+        atom_evidence = "".join(
+            f"<p><strong>字形 {node.program.glyph_id} 笔画图：</strong>"
+            f"{atom.atom_count} 个互斥面；{atom.stroke_count} 笔；"
+            f"{atom.junction_count} 个交点；连续性 {atom.stroke_continuity:.2%}；"
+            f"独立性 {atom.stroke_independence:.2%}；"
             f"种子墨迹覆盖 {atom.seed_coverage:.2%}；"
-            f"无监督配准 IoU {atom.alignment_iou:.2%}；"
-            f"重构误差 {atom.reconstruction_error:.3g}。</p>"
+            f"配准 IoU {atom.alignment_iou:.2%}。</p>"
+            for node, atom in zip(atom_nodes, atom_partitions)
+        )
+    stroke_panels = ""
+    for node in atom_nodes:
+        paths = "".join(
+            f'<path d="{geometry_path_data(region)}" fill="{_stroke_color(index)}" '
+            f'fill-rule="evenodd"><title>{html.escape(label)}</title></path>'
+            for index, (region, label) in enumerate(
+                zip(node.stroke_regions, node.stroke_labels)
+            )
+        )
+        labels = " · ".join(
+            f'<span style="color:{_stroke_color(index)}">■</span> {html.escape(label)}'
+            for index, label in enumerate(node.stroke_labels)
+        )
+        stroke_panels += (
+            f'<section class="card"><h2>笔画身份 · {node.program.glyph_id}</h2>'
+            f'<svg viewBox="0 0 100 100">{paths}</svg><p>{labels}</p></section>'
         )
     truth = _truth_overlays(request.annotation_path)
     return f"""<!doctype html>
@@ -138,12 +162,13 @@ svg{{width:100%;aspect-ratio:1;border:1px solid #e2e8f0;background:white}}
 code{{font-size:13px}} ul{{margin:.35rem 0;padding-left:1.4rem}} .note{{color:#475569}}
 </style>
 <h1>{result.unicode} · {result.source} 源 · candidate {result.candidate_glyph_id}</h1>
-<p><strong>盲推证据：</strong>IDS 根算子 {result.program.operator}；{result.partition.axis}={result.partition.cut:g}；
+<p><strong>盲推证据：</strong>IDS 根算子 {result.program.operator}；{result.partition.axis}={cut_value}；
 跨切线墨迹 {result.partition.crossing_ratio:.3%}；重构误差 {result.partition.reconstruction_error:.3g}。</p>
 <div class="panels">
  <section class="card"><h2>PDF 原生矢量</h2><svg viewBox="0 0 100 100"><path d="{source_path}" fill="#111827" fill-rule="evenodd"/></svg></section>
  <section class="card"><h2>盲推 IDS 递归分区</h2><svg viewBox="0 0 100 100">{colored}<g class="cut">{cut_line}</g></svg><p>{legend}</p></section>
  <section class="card"><h2>事后人工真值轮廓</h2><svg viewBox="0 0 100 100"><path d="{source_path}" fill="#cbd5e1" fill-rule="evenodd"/>{truth}</svg></section>
+ {stroke_panels}
 </div>
 <section class="card"><h2>结果</h2><p><strong>根层：</strong>{metrics}</p>{recursive_metrics}{atom_evidence}<p class="note">人工标注只在盲推完成后用于评分和红色虚线叠加，不进入求解目标。</p></section>
 <section class="card"><h2>递归候选程序</h2><ul>{_program_tree(result.program)}</ul></section>

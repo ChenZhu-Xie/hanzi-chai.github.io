@@ -52,6 +52,10 @@ class PartitionEvidence(StrictModel):
     seed_coverage: float | None = Field(default=None, alias="seedCoverage")
     alignment_iou: float | None = Field(default=None, alias="alignmentIoU")
     atom_count: int | None = Field(default=None, alias="atomCount")
+    stroke_count: int | None = Field(default=None, alias="strokeCount")
+    junction_count: int | None = Field(default=None, alias="junctionCount")
+    stroke_continuity: float | None = Field(default=None, alias="strokeContinuity")
+    stroke_independence: float | None = Field(default=None, alias="strokeIndependence")
 
 
 class EvaluationEvidence(StrictModel):

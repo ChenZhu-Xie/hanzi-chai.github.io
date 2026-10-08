@@ -6,7 +6,7 @@ from collections import defaultdict
 from itertools import product
 
 from shapely import make_valid, voronoi_polygons
-from shapely.geometry import LineString, MultiPoint, box
+from shapely.geometry import LineString, MultiPoint, Point, box
 from shapely.ops import unary_union
 
 from .candidate import StrokeSeed
@@ -107,44 +107,102 @@ def _seed_owner(seed: StrokeSeed, child_leaf_groups) -> int:
     return matches[0]
 
 
+def _intersection_points(geometry):
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Point":
+        return [geometry]
+    if geometry.geom_type == "MultiPoint":
+        return list(geometry.geoms)
+    if geometry.geom_type in {"LineString", "LinearRing"}:
+        return [geometry.interpolate(0.5, normalized=True)]
+    return [point for part in geometry.geoms for point in _intersection_points(part)]
+
+
 def _partition_from_seeds(geometry, aligned, child_leaf_groups):
-    points = []
-    owners = []
-    seen = set()
-    for seed in aligned:
+    sites = {}
+    lines = [LineString(seed.points) for seed in aligned]
+    for stroke_index, seed in enumerate(aligned):
         owner = _seed_owner(seed, child_leaf_groups)
         for point in _sample_seed(seed):
             key = round(point.x, 4), round(point.y, 4)
-            if key in seen:
-                continue
-            seen.add(key)
-            points.append(point)
-            owners.append(owner)
-    if len(points) < 2 or len(set(owners)) != 2:
+            # Later strokes overwrite an exact duplicate site. This models
+            # calligraphic writing order without merging the two stroke IDs.
+            sites[key] = (point, stroke_index, owner)
+    junctions = []
+    for first_index, first in enumerate(lines):
+        for second_index in range(first_index + 1, len(lines)):
+            for point in _intersection_points(first.intersection(lines[second_index])):
+                key = round(point.x, 4), round(point.y, 4)
+                later = second_index
+                sites[key] = (
+                    Point(point.x, point.y),
+                    later,
+                    _seed_owner(aligned[later], child_leaf_groups),
+                )
+                junctions.append(point)
+    points = [site[0] for site in sites.values()]
+    stroke_owners = [site[1] for site in sites.values()]
+    child_owners = [site[2] for site in sites.values()]
+    if len(points) < 2 or len(set(child_owners)) != 2:
         raise ValueError("both children need distinct vector seed points")
 
     min_x, min_y, max_x, max_y = geometry.bounds
     extent = box(min_x - 10, min_y - 10, max_x + 10, max_y + 10)
     cells = voronoi_polygons(MultiPoint(points), extend_to=extent, ordered=True).geoms
-    by_owner = defaultdict(list)
-    for cell, owner in zip(cells, owners):
+    by_stroke = defaultdict(list)
+    for cell, stroke_owner in zip(cells, stroke_owners):
         atom = make_valid(cell).intersection(geometry)
         if not atom.is_empty:
-            by_owner[owner].append(atom)
-    children = tuple(unary_union(by_owner[index]) for index in range(2))
-    return children, points, cells
+            by_stroke[stroke_owner].append(atom)
+    stroke_regions = tuple(
+        unary_union(by_stroke[index]) for index in range(len(aligned))
+    )
+    children = tuple(
+        unary_union(
+            [
+                region
+                for seed, region in zip(aligned, stroke_regions)
+                if _seed_owner(seed, child_leaf_groups) == child_index
+            ]
+        )
+        for child_index in range(2)
+    )
+    return children, points, cells, stroke_regions, tuple(junctions)
+
+
+def _stroke_metrics(geometry, aligned, stroke_regions, junctions):
+    lines = [LineString(seed.points) for seed in aligned]
+    total_length = sum(line.length for line in lines)
+    junction_radius = min(7.0, max(1.0, geometry.area / max(2 * total_length, 1e-9)))
+    junction_area = unary_union([point.buffer(junction_radius) for point in junctions])
+    continuity_scores = []
+    for line, region in zip(lines, stroke_regions):
+        visible = line.intersection(geometry.buffer(1.0))
+        if visible.length <= 1e-9:
+            continuity_scores.append(0.0)
+            continue
+        allowed = region.buffer(1.0).union(junction_area)
+        continuity_scores.append(visible.intersection(allowed).length / visible.length)
+    overlap = 0.0
+    for index, region in enumerate(stroke_regions):
+        for other in stroke_regions[index + 1 :]:
+            overlap += region.intersection(other).area
+    return min(continuity_scores, default=0.0), max(0.0, 1 - overlap / geometry.area)
 
 
 def assign_vector_atoms(
     geometry,
     seeds: tuple[StrokeSeed, ...],
     child_leaf_groups: tuple[frozenset[int], frozenset[int]],
+    *,
+    minimum_seed_coverage: float = 0.75,
 ) -> RootPartition:
     if not seeds:
         raise ValueError("candidate contains no stroke seeds")
     initial = _align_seeds(seeds, geometry)
     alignment_iou, aligned = _optimize_alignment(geometry, initial)
-    children, points, cells = _partition_from_seeds(
+    children, points, cells, stroke_regions, junctions = _partition_from_seeds(
         geometry, aligned, child_leaf_groups
     )
     # One EM-like self-consistency pass: each child may adapt to the ink it
@@ -161,7 +219,7 @@ def assign_vector_atoms(
     if refined_iou > alignment_iou + 1e-6:
         aligned = refined
         alignment_iou = refined_iou
-        children, points, cells = _partition_from_seeds(
+        children, points, cells, stroke_regions, junctions = _partition_from_seeds(
             geometry, aligned, child_leaf_groups
         )
     if any(child.is_empty for child in children):
@@ -180,7 +238,7 @@ def assign_vector_atoms(
     )
     observed_ratios = tuple(child.area / geometry.area for child in children)
     minimum_expected = min(expected_ratio, 1 - expected_ratio) * 0.25
-    if seed_coverage < 0.75 or alignment_iou < 0.25:
+    if seed_coverage < minimum_seed_coverage or alignment_iou < 0.25:
         raise ValueError(
             "candidate centerlines do not align with enough PDF ink "
             f"(seed coverage {seed_coverage:.3%}, alignment IoU {alignment_iou:.3%})"
@@ -188,6 +246,9 @@ def assign_vector_atoms(
     if min(observed_ratios) < minimum_expected:
         raise ValueError("vector atom assignment collapses a real child program")
     balance_error = abs(children[0].area / geometry.area - expected_ratio)
+    stroke_continuity, stroke_independence = _stroke_metrics(
+        geometry, aligned, stroke_regions, junctions
+    )
     return RootPartition(
         evidence=PartitionEvidence(
             axis="atoms",
@@ -200,6 +261,15 @@ def assign_vector_atoms(
             seedCoverage=seed_coverage,
             alignmentIoU=alignment_iou,
             atomCount=len(cells),
+            strokeCount=len(aligned),
+            junctionCount=len(junctions),
+            strokeContinuity=stroke_continuity,
+            strokeIndependence=stroke_independence,
         ),
         children=children,
+        stroke_regions=stroke_regions,
+        stroke_labels=tuple(
+            f"{seed.leaf_id} · 第{index + 1}笔 · {seed.feature}"
+            for index, seed in enumerate(aligned)
+        ),
     )

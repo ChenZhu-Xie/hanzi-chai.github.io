@@ -1,4 +1,4 @@
-from shapely.geometry import box
+from shapely.geometry import Point, box
 from shapely.ops import unary_union
 
 from glyph_decomposer.atoms import assign_vector_atoms
@@ -25,3 +25,20 @@ def test_vector_atoms_cover_ink_once_and_preserve_leaf_ownership():
     assert result.evidence.seed_coverage is not None
     assert result.evidence.alignment_iou is not None
     assert result.evidence.atom_count > 0
+
+
+def test_crossing_strokes_keep_identity_and_later_stroke_owns_junction():
+    geometry = unary_union([box(5, 43, 95, 57), box(43, 5, 57, 95)])
+    seeds = (
+        StrokeSeed(1, 0, "横", ((5, 50), (95, 50))),
+        StrokeSeed(2, 0, "竖", ((50, 5), (50, 95))),
+    )
+
+    result = assign_vector_atoms(geometry, seeds, (frozenset({1}), frozenset({2})))
+
+    assert result.children[1].covers(Point(50, 50))
+    assert result.children[0].intersection(result.children[1]).area < 1e-6
+    assert result.evidence.stroke_count == 2
+    assert result.evidence.junction_count == 1
+    assert result.evidence.stroke_independence == 1
+    assert result.evidence.stroke_continuity > 0.95

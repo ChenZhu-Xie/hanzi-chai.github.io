@@ -14,6 +14,8 @@ from .geometry import clip_axis
 class RootPartition:
     evidence: PartitionEvidence
     children: tuple[object, object]
+    stroke_regions: tuple[object, ...] = ()
+    stroke_labels: tuple[str, ...] = ()
 
 
 def _axis_for(operator: str | None) -> str:

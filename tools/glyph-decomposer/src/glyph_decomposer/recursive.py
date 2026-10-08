@@ -19,6 +19,8 @@ class DecompositionNode:
     geometry: object
     evidence: DecompositionNodeEvidence
     children: tuple[DecompositionNode, ...] = ()
+    stroke_regions: tuple[object, ...] = ()
+    stroke_labels: tuple[str, ...] = ()
 
 
 def _local_search_bounds(geometry, operator: str) -> tuple[float, float, float]:
@@ -73,6 +75,25 @@ def decompose_recursive(
                 maximum=maximum,
                 step=step,
             )
+            if repository is not None and partition.evidence.crossing_ratio > 0.001:
+                try:
+                    seeds = compile_stroke_seeds(repository, program.glyph_id)
+                    groups = tuple(
+                        frozenset(child.leaf_ids()) for child in program.children
+                    )
+                    atom_partition = assign_vector_atoms(
+                        geometry,
+                        seeds,
+                        groups,
+                        minimum_seed_coverage=0.70,
+                    )
+                    if (
+                        atom_partition.evidence.stroke_continuity >= 0.95
+                        and atom_partition.evidence.stroke_independence >= 0.999999
+                    ):
+                        partition = atom_partition
+                except ValueError:
+                    pass
     except ValueError as error:
         evidence = DecompositionNodeEvidence(
             glyphId=program.glyph_id,
@@ -95,7 +116,14 @@ def decompose_recursive(
         partition=partition.evidence,
         children=tuple(child.evidence for child in children),
     )
-    return DecompositionNode(program, geometry, evidence, children)
+    return DecompositionNode(
+        program,
+        geometry,
+        evidence,
+        children,
+        partition.stroke_regions,
+        partition.stroke_labels,
+    )
 
 
 def terminal_nodes(node: DecompositionNode) -> tuple[DecompositionNode, ...]:

@@ -46,9 +46,37 @@ the intrinsic balance score but reduced held-out accuracy from 93.65% to
 93.27%. Stroke count is therefore not a reliable proxy for ink area and this
 regularizer is not part of the implementation.
 
+### Stroke-identity refinement
+
+Vector atoms are now owned first by directed candidate strokes and only then
+merged into leaf components. At exact intersections, writing order gives the
+junction point to the later stroke; the surrounding ink remains partitioned
+by local centerline distance. Two truth-free invariants guard acceptance:
+
+- each stroke's PDF-visible seed remains continuous through permitted junction
+  neighborhoods;
+- different strokes own mutually exclusive ink.
+
+For `U+6418-G`, this changes the root `⿰(220, 9313)` from a mechanical
+vertical cut to stroke-aware ownership because the best straight cut crosses
+real ink. Results:
+
+- root classified-ink accuracy: 98.90% (previously 97.17%);
+- recursive four-leaf accuracy: 95.60% (previously 93.65%);
+- mean leaf IoU: 84.09% (previously 81.31%);
+- minimum leaf IoU: 64.18% (previously 63.03%);
+- root: 331 atoms, 13 strokes and 13 junctions;
+- nested `4158`: 172 atoms, 6 strokes and 6 junctions;
+- measured continuity and independence: 100% for both atom partitions.
+
+This path is deliberately gated. A clean axis partition with no crossed ink
+keeps exact enumeration; forcing vector atoms on the clean `U+65E8` split
+reduced accuracy from 100% to 97.57%.
+
 ### Next unresolved layer
 
-The remaining errors are concentrated near intersections between `439` and
-`133`. Further progress requires a vector medial graph or equivalent local
-tangent-continuity evidence. It should decide which branch continues through a
-junction without using annotation truth or global ink-area voting.
+The remaining errors are concentrated inside the `439`/`133` surround. The
+stroke-identity layer now supplies local continuity and junction ownership;
+the next step is to infer each stroke's exact visible extent around serif and
+brush-detail contours without using annotation truth or global ink-area
+voting.

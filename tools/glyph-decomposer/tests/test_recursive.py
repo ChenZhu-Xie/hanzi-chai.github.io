@@ -2,6 +2,7 @@ from shapely.geometry import box
 from shapely.ops import unary_union
 
 from glyph_decomposer.domain import ComponentProgram
+from glyph_decomposer.grammar import GlyphRepository
 from glyph_decomposer.recursive import decompose_recursive, terminal_nodes
 
 
@@ -65,3 +66,86 @@ def test_recursive_partition_descends_through_upper_left_surround():
 
     assert [node.program.glyph_id for node in terminal_nodes(result)] == [1, 2]
     assert result.evidence.status == "partitioned"
+
+
+def test_crossing_axis_partition_uses_stroke_identity_when_repository_is_available():
+    records = [
+        {
+            "id": 1,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "竖",
+                    "start": [35, 5],
+                    "curveList": [{"command": "v", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 2,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "竖",
+                    "start": [65, 5],
+                    "curveList": [{"command": "v", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 3,
+            "type": "compound",
+            "operator": "⿰",
+            "references": [{"id": 1}, {"id": 2}],
+        },
+    ]
+    repository = GlyphRepository(records)
+    program = repository.compile(3)
+    geometry = unary_union([box(24, 4, 46, 96), box(44, 4, 76, 96)])
+
+    result = decompose_recursive(geometry, program, repository)
+
+    assert result.evidence.partition.solver_status == "VECTOR_VORONOI"
+    assert result.evidence.partition.stroke_continuity >= 0.95
+
+
+def test_clean_axis_partition_keeps_exact_enumeration_with_repository():
+    records = [
+        {
+            "id": 1,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "竖",
+                    "start": [25, 5],
+                    "curveList": [{"command": "v", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 2,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "竖",
+                    "start": [75, 5],
+                    "curveList": [{"command": "v", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 3,
+            "type": "compound",
+            "operator": "⿰",
+            "references": [{"id": 1}, {"id": 2}],
+        },
+    ]
+    repository = GlyphRepository(records)
+    program = repository.compile(3)
+    geometry = unary_union([box(15, 4, 35, 96), box(65, 4, 85, 96)])
+
+    result = decompose_recursive(geometry, program, repository)
+
+    assert result.evidence.partition.solver_status == "EXACT_ENUMERATION"
+    assert result.evidence.partition.crossing_ratio == 0
+    assert result.evidence.partition.stroke_count is None
