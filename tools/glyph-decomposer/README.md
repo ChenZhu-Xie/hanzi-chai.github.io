@@ -32,5 +32,24 @@ The report labels blind endpoint continuation separately from the
 teacher-forced skeleton target. The latter intentionally reads human landmarks
 and must never be reported as inference accuracy.
 
+To generate an annotation-independent, undirected centre skeleton directly
+from Unicode chart vector ink and then evaluate it against existing directed
+human strokes:
+
+```powershell
+uv run glyph-decomposer skeleton-audit `
+  --pdf <U4E00.pdf> `
+  --bbox-cache <U4E00-bbox.html> `
+  --annotations <annotation.json> [<annotation.json> ...] `
+  --output <review.html>
+```
+
+The command first extracts and freezes every PDF skeleton, and only then loads
+the annotation paths. It uses deterministic vector rasterisation followed by
+connectivity-preserving Zhang-Suen thinning; it performs no fitting or model
+training. This solves the undirected centreline problem. Stroke order,
+pen-down/pen-up direction and the correct continuation through an intersection
+remain a separate constrained graph-decomposition problem.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

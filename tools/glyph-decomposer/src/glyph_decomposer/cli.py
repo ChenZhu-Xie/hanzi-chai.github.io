@@ -8,6 +8,7 @@ from pathlib import Path
 from .domain import DecompositionRequest
 from .pipeline import decompose_with_artifacts
 from .review import render_review_html
+from .skeleton import audit_annotations, render_skeleton_audit
 from .trajectory import (
     complete_historic_routes,
     load_historic_review,
@@ -27,11 +28,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trajectory.add_argument("historic_review", type=Path)
     trajectory.add_argument("--output", type=Path, required=True)
+    skeleton = subparsers.add_parser(
+        "skeleton-audit", help="generate deterministic PDF skeletons before truth"
+    )
+    skeleton.add_argument("--pdf", type=Path, required=True)
+    skeleton.add_argument("--bbox-cache", type=Path, required=True)
+    skeleton.add_argument("--annotations", type=Path, nargs="+", required=True)
+    skeleton.add_argument("--size", type=int, default=256)
+    skeleton.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "skeleton-audit":
+        cases = audit_annotations(
+            args.pdf, args.bbox_cache, args.annotations, size=args.size
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(render_skeleton_audit(cases), encoding="utf-8")
+        return 0
     if args.command == "trajectory-audit":
         payload = load_historic_review(args.historic_review)
         completed, evidence = complete_historic_routes(payload)

@@ -129,3 +129,33 @@ stroke-identity layer now supplies local continuity and junction ownership;
 the next step is to infer each stroke's exact visible extent around serif and
 brush-detail contours without using annotation truth or global ink-area
 voting.
+
+## Annotation-independent PDF skeleton baseline
+
+Before attempting another directed-stroke predictor, the tool now isolates the
+part that can be solved by a small deterministic algorithm. It extracts the
+chart glyph as vector geometry, samples only PDF ink, and applies Zhang-Suen
+thinning. The historical annotation-canvas normalization is fixed at 8%
+padding; no annotation is available to generation or parameter selection.
+
+The generated skeleton is frozen before directed human paths are loaded for
+evaluation. On all six complete annotation files currently available (82
+directed strokes), using a 1.5/100 canvas-unit tolerance:
+
+- mean human-path coverage by the PDF skeleton: 97.15%;
+- mean PDF-skeleton coverage by human paths: 93.71%;
+- mean human endpoint distance to the skeleton: 0.59/100 canvas units;
+- best path coverage: 99.92% on `U+6418-G`;
+- lowest path coverage: 91.35% on `U+65E8-T`.
+
+Visual review confirms that the principal centreline topology is present for
+all six glyphs. Most remaining skeleton-only pixels are legitimate unannotated
+font details at stroke caps or small calligraphic spurs, while the human route
+sometimes deliberately stops short of them. Therefore these coverage numbers
+measure geometric agreement, not directed stroke-recognition accuracy.
+
+This establishes a useful boundary: a deterministic algorithm is sufficient
+for the undirected PDF skeleton, but it cannot uniquely recover stroke order,
+direction, or ownership at shared intersections. Those require candidate
+stroke/IDS constraints on top of this fixed graph; they should not be hidden
+inside skeleton generation.
