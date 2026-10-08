@@ -50,7 +50,11 @@ connectivity-preserving Zhang-Suen thinning; it performs no fitting or model
 training. It then losslessly contracts every maximal degree-two pixel chain
 between endpoint/junction clusters into a topology graph. Every skeleton pixel
 belongs to exactly one node cluster or chain, and the review can toggle and
-inspect chain/node IDs. This solves the undirected centreline problem. Stroke order,
+inspect chain/node IDs. A bounded-error polyline then reduces redundant chain
+samples while retaining the original pixels, and records normalized length,
+curvature, endpoint tangents, spatial bounds and terminal-shortness evidence.
+Each junction also exposes every possible through-pair ranked by angular
+continuity. This solves the undirected centreline problem. Stroke order,
 pen-down/pen-up direction and the correct continuation through an intersection
 remain a separate constrained graph-decomposition problem.
 

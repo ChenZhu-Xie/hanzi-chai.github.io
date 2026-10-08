@@ -176,3 +176,24 @@ stage: candidate strokes and recursive IDS constraints must first explain the
 valid through-routes, after which only unsupported terminal residue can be
 classified as decoration. This prevents a short but real hook or dot from
 being destroyed by a length-only heuristic.
+
+### Compact topology descriptors
+
+Each maximal chain now has a Ramer-Douglas-Peucker description with a fixed
+0.75-pixel deviation bound. The original chain pixels remain available for
+audit, while the compact layer records normalized length, chord ratio, total
+turn, endpoint tangents, normalized bounds, endpoint incidence and a
+continuous terminal-shortness feature. It does not classify or remove a
+branch.
+
+At each junction, outward branch tangents are converted into all possible
+through-pairs, ranked by deviation from a straight continuation. Candidate
+stroke type and IDS placement can therefore select among explicit local
+alternatives instead of searching raw pixels.
+
+Across the six real glyphs, chain paths shrink from 7,126 points to 1,047
+points (85.66% fewer) without changing nodes, edges or pixel ownership. The
+HTML can independently toggle the full skeleton, full chains, compact
+descriptors and post-generation human paths. This layer is the intended input
+to recursive candidate/IDS path coverage; raw evidence remains available when
+a compact decision is ambiguous.
