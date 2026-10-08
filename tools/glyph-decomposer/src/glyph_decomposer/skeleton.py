@@ -8,6 +8,7 @@ import math
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from shapely import contains_xy
@@ -17,6 +18,9 @@ from .pdf_svg import export_page_svg, extract_cell_geometry, find_cell, parse_ce
 from .topology import SkeletonTopology, compress_skeleton
 from .topology_certificate import TopologyCertificate, certify_skeleton
 from .topology_features import TopologyDescriptors, describe_topology
+
+if TYPE_CHECKING:
+    from .multiscale import MultiScaleCertificate
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class SkeletonCase:
     topology: SkeletonTopology
     descriptors: TopologyDescriptors
     certificate: TopologyCertificate
+    multiscale: MultiScaleCertificate
     truth_paths: tuple[np.ndarray, ...]
     metrics: dict
 
@@ -105,9 +110,13 @@ def _densify(points: np.ndarray, spacing: float = 0.5) -> np.ndarray:
     return np.asarray(output)
 
 
-def load_truth_paths(path: Path) -> tuple[dict, tuple[np.ndarray, ...]]:
+def load_annotation_metadata(path: Path) -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    metadata = payload.get("metadata") or {}
+    return payload.get("metadata") or {}
+
+
+def load_truth_paths(path: Path) -> tuple[np.ndarray, ...]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
     paths = []
     for annotation in payload.get("annotations", ()):  # lasso is component truth
         if annotation.get("type") not in {"line", "polyline", "bezier", "pen"}:
@@ -115,7 +124,7 @@ def load_truth_paths(path: Path) -> tuple[dict, tuple[np.ndarray, ...]]:
         points = annotation.get("fixedPoints") or annotation.get("points") or ()
         if len(points) >= 2:
             paths.append(_densify(np.asarray(points, dtype=float)))
-    return metadata, tuple(paths)
+    return tuple(paths)
 
 
 def _nearest_distances(first: np.ndarray, second: np.ndarray, chunk: int = 512):
@@ -163,11 +172,13 @@ def audit_annotations(
     *,
     size: int = 256,
 ) -> list[SkeletonCase]:
+    from .multiscale import certify_multiscale
+
     cells = parse_cells(bbox_path)
     pages: dict[int, str] = {}
     output = []
     for annotation_path in annotation_paths:
-        metadata, truth_paths = load_truth_paths(annotation_path)
+        metadata = load_annotation_metadata(annotation_path)
         if not metadata.get("unicode") or not metadata.get("source"):
             continue
         codepoint = int(metadata["unicode"].removeprefix("U+"), 16)
@@ -176,10 +187,13 @@ def audit_annotations(
         if cell.page not in pages:
             pages[cell.page] = export_page_svg(pdf_path, cell.page)
         geometry = extract_cell_geometry(pages[cell.page], cell)
+        multiscale = certify_multiscale(geometry)
         ink, skeleton = generate_skeleton(geometry, size)
         certificate = certify_skeleton(ink, skeleton)
         topology = compress_skeleton(skeleton)
         descriptors = describe_topology(topology, size)
+        # The generation objects are complete and frozen before this call.
+        truth_paths = load_truth_paths(annotation_path)
         metrics = evaluate_skeleton(skeleton, truth_paths)
         output.append(
             SkeletonCase(
@@ -190,6 +204,7 @@ def audit_annotations(
                 topology=topology,
                 descriptors=descriptors,
                 certificate=certificate,
+                multiscale=multiscale,
                 truth_paths=truth_paths,
                 metrics=metrics,
             )
@@ -281,6 +296,7 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
 {_topology_svg(case.topology, case.descriptors, case.skeleton.shape[0])}
 <g class="truth">{_truth_paths(case.truth_paths)}</g></svg>
 <p class="certificate {"pass" if case.certificate.certified else "fail"}">拓扑证书：{"通过" if case.certificate.certified else "失败"}；components {case.certificate.ink_components}→{case.certificate.skeleton_components}；holes {case.certificate.ink_holes}→{case.certificate.skeleton_holes}；Euler {case.certificate.ink_euler}→{case.certificate.skeleton_euler}；骨架位于墨迹内 {case.certificate.skeleton_inside_ink}</p>
+<p class="certificate {"pass" if case.multiscale.certified else "fail"}">多尺度证书：{"通过" if case.multiscale.certified else "失败"}；sizes {"/".join(str(scale.size) for scale in case.multiscale.scales)}；max p95 {case.multiscale.maximum_p95_distance:.2f}；min 双向覆盖 {case.multiscale.minimum_bidirectional_coverage:.2%}；拓扑签名一致 {case.multiscale.same_topology_signature}</p>
 <p>拓扑压缩：{len(case.topology.nodes)} nodes / {len(case.topology.edges)} chains；{case.topology.endpoint_count} endpoints / {case.topology.junction_count} junctions；像素守恒 {case.topology.skeleton_pixel_count}/{case.metrics["skeletonPixels"]}</p>
 <p>链描述降维：{case.descriptors.original_path_points} → {case.descriptors.simplified_path_points} points（减少 {case.descriptors.reduction_ratio:.1%}）</p>
 <p>人工路径→骨架：mean {case.metrics["truthMeanDistance"]:.2f} / p95 {case.metrics["truthP95Distance"]:.2f}；覆盖 {case.metrics["truthCoverage"]:.2%}</p>
@@ -301,6 +317,9 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
         ),
         "allSkeletonsTopologyCertified": all(
             case.certificate.certified for case in cases
+        ),
+        "allSkeletonsMultiscaleCertified": all(
+            case.multiscale.certified for case in cases
         ),
         "originalChainPathPoints": sum(
             case.descriptors.original_path_points for case in cases

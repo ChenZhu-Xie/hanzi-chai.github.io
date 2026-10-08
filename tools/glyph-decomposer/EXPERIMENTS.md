@@ -247,3 +247,35 @@ again only after a decision, when skeleton ownership is expanded back to
 filled ink for visualization or data entry. Certificate failure is a hard
 gate rather than an invitation to mix outline details back into the graph
 solver.
+
+### Multi-scale stability and initial cut hypotheses
+
+Skeletons are regenerated independently at 192, 256 and 384 pixels. Every
+scale must pass its own topology certificate, all topology signatures must
+agree, bidirectional centreline coverage within one canvas unit must remain at
+least 97%, and pairwise p95 displacement may not exceed 1.25/100 canvas units.
+All six real glyphs pass. Their minimum pairwise coverages range from 98.66%
+to 99.93%, and maximum p95 displacement ranges from 0.33 to 0.50.
+
+For root `⿰` and `⿱`, `H0` preserves the graph unchanged. `H1…Hn` split one
+junction's incident chains into the two IDS sides, including enumeration of
+ambiguous boundary-aligned branches. Each hypothesis is propagated through
+the remaining graph. If the two groups reconnect by another route, it does
+not actually separate the graph and receives zero structural gain. Otherwise
+the audit records downstream side purity and how strongly the affected
+connected component spans the expected IDS boundary.
+
+On `U+6418-G`, this rejected three visually tempting cuts inside `日`: the
+rectangle simply reconnects around its other sides. The remaining three local
+splits score only 0.159, 0.156 and 0.069 and remain unaccepted. This is an
+important negative result. The semantically relevant contact between the
+left-hand radical and a stroke belonging to the right IDS subtree occurs well
+inside the left spatial half, so a coordinate boundary cannot discover it.
+The next solver must first cover candidate strokes with skeleton routes and
+then propose cuts where matched routes from different IDS subtrees share a raw
+junction. Increasing the spatial boundary weight would merely overfit this
+case.
+
+For `U+65E8-T`, the two root `⿱` children are already distinct skeleton
+components, so no physical junction cut is proposed; `H0` is sufficient at
+that level.

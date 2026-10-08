@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from .candidate_graph import compile_candidate_graph, render_candidate_graph
+from .cut_hypotheses import build_cut_audit, render_cut_audit
 from .domain import DecompositionRequest
 from .grammar import GlyphRepository
 from .pipeline import decompose_with_artifacts
@@ -43,11 +44,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidate.add_argument("request", type=Path)
     candidate.add_argument("--output", type=Path, required=True)
+    cut = subparsers.add_parser(
+        "cut-audit", help="rank skeleton-only root IDS cut/no-cut hypotheses"
+    )
+    cut.add_argument("request", type=Path)
+    cut.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "cut-audit":
+        request = DecompositionRequest.model_validate_json(
+            args.request.read_text(encoding="utf-8")
+        )
+        audit = build_cut_audit(request)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(render_cut_audit(audit), encoding="utf-8")
+        return 0
     if args.command == "candidate-audit":
         request = DecompositionRequest.model_validate_json(
             args.request.read_text(encoding="utf-8")

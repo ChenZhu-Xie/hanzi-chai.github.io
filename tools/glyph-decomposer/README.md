@@ -81,5 +81,18 @@ or recursive decisions. They are retained only for audit and for propagating
 the final skeleton ownership back onto the original filled ink. A failed
 certificate stops that path and requires extraction/thinning review.
 
+The current next-stage diagnostic is:
+
+```powershell
+uv run glyph-decomposer cut-audit <request.json> --output <review.html>
+```
+
+It first requires topology and 192/256/384 multi-scale certificates. It then
+keeps `H0` (no logical cut) and enumerates root `⿰`/`⿱` junction splits on the
+skeleton alone. Each proposal is propagated through graph reachability: a
+split that reconnects through another route receives zero gain. These are
+structural priors only and are never auto-accepted before directed candidate
+strokes are covered by skeleton routes.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.
