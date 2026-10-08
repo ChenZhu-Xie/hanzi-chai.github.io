@@ -197,3 +197,28 @@ HTML can independently toggle the full skeleton, full chains, compact
 descriptors and post-generation human paths. This layer is the intended input
 to recursive candidate/IDS path coverage; raw evidence remains available when
 a compact decision is ambiguous.
+
+### Candidate constraint graph
+
+Repository candidates are now compiled into the same compact reasoning
+vocabulary before any PDF matching. Each directed stroke retains its order,
+feature, leaf ID, repeated-leaf occurrence and recursive IDS path. Every IDS
+node records its operator, expected scope, child hierarchy and descendant
+stroke indices. Pairwise stroke relations record exact contact or separation
+and the nearest normalized position along both directed strokes.
+
+On real repository data, candidate `17973` (`U+6418-G`) compiles to thirteen
+strokes, four leaf occurrences, 78 pairwise relations and thirteen exact
+contacts. Candidate `127685` (`U+65E8-T`) compiles to six strokes, two leaf
+occurrences, fifteen pairwise relations and six exact contacts. Neither audit
+reads PDF geometry or annotation truth.
+
+This is where joined left/right, upper/lower or surround components begin to
+receive evidence for separation, but no PDF skeleton is cut yet. The next
+stage must enumerate local logical-cut alternatives at compatible raw
+junctions and evaluate each complete future against an explicit no-cut
+baseline. A high local geometric score alone is insufficient: the selected
+hypothesis must improve whole-candidate route coverage, preserve required
+stroke contacts, satisfy recursive IDS placement and avoid unexplained long
+residue. Low-margin alternatives remain unresolved rather than being silently
+cut.

@@ -33,6 +33,7 @@ def test_compile_stroke_seeds_applies_recursive_ids_affines():
     assert seeds[0].points[-1] == pytest.approx((100, 50))
     assert seeds[1].points[0] == pytest.approx((40, 65))
     assert seeds[1].points[-1] == pytest.approx((90, 65))
+    assert [seed.component_path for seed in seeds] == [(0,), (1,)]
 
 
 def test_compile_stroke_seeds_samples_directed_cubic_curve():

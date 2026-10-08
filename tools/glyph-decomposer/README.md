@@ -21,6 +21,14 @@ The prototype performs independently testable operations:
 
 Run from this directory with `uv run glyph-decomposer --help`.
 
+To compile one repository candidate into recursive IDS scopes, directed
+leaf-owned strokes and pairwise stroke-contact evidence without reading PDF or
+human truth:
+
+```powershell
+uv run glyph-decomposer candidate-audit <request.json> --output <review.html>
+```
+
 To inspect the older directed decoder without any ink colouring, normalize its
 routes and the human trajectories onto the same PDF skeleton:
 
@@ -57,6 +65,12 @@ Each junction also exposes every possible through-pair ranked by angular
 continuity. This solves the undirected centreline problem. Stroke order,
 pen-down/pen-up direction and the correct continuation through an intersection
 remain a separate constrained graph-decomposition problem.
+
+The next matcher treats every proposed logical cut as an explicit hypothesis.
+The unchanged/no-cut graph is always retained as the baseline; a cut may be
+accepted automatically only when complete downstream stroke coverage improves
+by a sufficient absolute score and margin without violating IDS, continuity or
+exclusive ownership constraints.
 
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

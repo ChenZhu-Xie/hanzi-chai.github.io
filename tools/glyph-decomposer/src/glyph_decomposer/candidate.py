@@ -20,6 +20,7 @@ class StrokeSeed:
     occurrence: int
     feature: str
     points: tuple[tuple[float, float], ...]
+    component_path: tuple[int, ...] = ()
 
 
 def _point(transform, point):
@@ -93,7 +94,12 @@ def compile_stroke_seeds(
 ) -> tuple[StrokeSeed, ...]:
     occurrence_count: dict[int, int] = {}
 
-    def compile_one(identifier: int, transform, active: tuple[int, ...]):
+    def compile_one(
+        identifier: int,
+        transform,
+        active: tuple[int, ...],
+        component_path: tuple[int, ...],
+    ):
         if identifier in active:
             raise ValueError(f"cyclic glyph references through {identifier}")
         record = repository.record(identifier)
@@ -108,6 +114,7 @@ def compile_stroke_seeds(
                     points=tuple(
                         _point(transform, point) for point in _stroke_points(stroke)
                     ),
+                    component_path=component_path,
                 )
                 for stroke in record.get("strokes", ())
             ]
@@ -121,8 +128,9 @@ def compile_stroke_seeds(
                 int(reference["id"]),
                 _compose(transform, interval),
                 (*active, identifier),
+                (*component_path, index),
             )
-            for reference, interval in zip(references, intervals)
+            for index, (reference, interval) in enumerate(zip(references, intervals))
         ]
         selectors = record.get("strokes")
         if not selectors:
@@ -135,4 +143,4 @@ def compile_stroke_seeds(
             output.extend(part[start:end])
         return output
 
-    return tuple(compile_one(glyph_id, (1.0, 1.0, 0.0, 0.0), ()))
+    return tuple(compile_one(glyph_id, (1.0, 1.0, 0.0, 0.0), (), ()))

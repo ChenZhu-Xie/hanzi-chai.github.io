@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .candidate_graph import compile_candidate_graph, render_candidate_graph
 from .domain import DecompositionRequest
+from .grammar import GlyphRepository
 from .pipeline import decompose_with_artifacts
 from .review import render_review_html
 from .skeleton import audit_annotations, render_skeleton_audit
@@ -36,11 +38,25 @@ def build_parser() -> argparse.ArgumentParser:
     skeleton.add_argument("--annotations", type=Path, nargs="+", required=True)
     skeleton.add_argument("--size", type=int, default=256)
     skeleton.add_argument("--output", type=Path, required=True)
+    candidate = subparsers.add_parser(
+        "candidate-audit", help="compile candidate strokes and recursive IDS"
+    )
+    candidate.add_argument("request", type=Path)
+    candidate.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "candidate-audit":
+        request = DecompositionRequest.model_validate_json(
+            args.request.read_text(encoding="utf-8")
+        )
+        repository = GlyphRepository.load(Path(request.glyph_data_path))
+        graph = compile_candidate_graph(repository, request.candidate_glyph_id)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(render_candidate_graph(graph), encoding="utf-8")
+        return 0
     if args.command == "skeleton-audit":
         cases = audit_annotations(
             args.pdf, args.bbox_cache, args.annotations, size=args.size
