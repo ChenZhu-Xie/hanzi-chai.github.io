@@ -8,6 +8,11 @@ from pathlib import Path
 from .domain import DecompositionRequest
 from .pipeline import decompose_with_artifacts
 from .review import render_review_html
+from .trajectory import (
+    complete_historic_routes,
+    load_historic_review,
+    render_trajectory_review,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,11 +22,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("request", type=Path)
     audit.add_argument("--output", type=Path)
     audit.add_argument("--review-html", type=Path)
+    trajectory = subparsers.add_parser(
+        "trajectory-audit", help="extend historic directed routes on the PDF skeleton"
+    )
+    trajectory.add_argument("historic_review", type=Path)
+    trajectory.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "trajectory-audit":
+        payload = load_historic_review(args.historic_review)
+        completed, evidence = complete_historic_routes(payload)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            render_trajectory_review(payload, completed, evidence), encoding="utf-8"
+        )
+        return 0
     if args.command != "audit":
         raise AssertionError(args.command)
     request = DecompositionRequest.model_validate_json(

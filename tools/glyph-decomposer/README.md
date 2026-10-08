@@ -21,5 +21,16 @@ The prototype performs independently testable operations:
 
 Run from this directory with `uv run glyph-decomposer --help`.
 
+To inspect the older directed decoder without any ink colouring, normalize its
+routes and the human trajectories onto the same PDF skeleton:
+
+```powershell
+uv run glyph-decomposer trajectory-audit <historic-review.html> --output <review.html>
+```
+
+The report labels blind endpoint continuation separately from the
+teacher-forced skeleton target. The latter intentionally reads human landmarks
+and must never be reported as inference accuracy.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

@@ -99,6 +99,29 @@ The clean `U+65E8-T` case still selects exact enumeration and retains 100%
 root and recursive component accuracy. Removing `annotationPath` again yields
 an identical inference payload after evaluation-only fields are removed.
 
+### Skeleton-only inertia target
+
+Region ownership was temporarily set aside to recover the more fundamental
+object: one directed pen route from pen-down to pen-up. The historic
+`U+6418-G` decoder and thirteen human trajectories are rendered on the same
+PDF skeleton without coloured ink regions.
+
+A conservative blind continuation follows an unfinished route through an
+unambiguous corridor. At a junction it proceeds only when one outgoing tangent
+clearly wins; straight `横`, `竖` and `提` routes additionally preserve their
+cumulative axis. This improves mean endpoint errors:
+
+- pen-down: 3.60% to 3.22% of the canvas diagonal;
+- pen-up: 3.47% to 3.09%;
+- the fifth `竖` no longer turns into another stroke (52 erroneous added
+  pixels reduced to 2).
+
+Human points are also snapped to the PDF skeleton and joined through their
+ordered intermediate landmarks. This teacher-forced normalization reaches
+0.24% mean pen-down error and 0.47% mean pen-up error. It explicitly reads
+truth and defines the route target for later blind inference; it is not an
+inference result.
+
 ### Next unresolved layer
 
 The remaining errors are concentrated inside the `439`/`133` surround. The
