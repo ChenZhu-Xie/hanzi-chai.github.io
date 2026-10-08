@@ -159,3 +159,20 @@ for the undirected PDF skeleton, but it cannot uniquely recover stroke order,
 direction, or ownership at shared intersections. Those require candidate
 stroke/IDS constraints on top of this fixed graph; they should not be hidden
 inside skeleton generation.
+
+### Lossless topology compression
+
+The binary skeleton is now compressed into connected critical-pixel clusters
+and maximal non-branching chains. Synthetic straight-line, T-junction,
+X-junction and closed-loop tests confirm exact pixel conservation. The same
+invariant holds on all six real glyphs: all 7,924 skeleton pixels are owned
+exactly once by a node cluster or chain.
+
+The raw six-glyph graph contains 361 nodes and 373 chains. Its endpoint and
+junction counts deliberately still include serif/calligraphic branches. In
+particular, `U+6418-G` contains 22 raw junction clusters although its thirteen
+standard strokes need fewer semantic decisions. No branch is pruned at this
+stage: candidate strokes and recursive IDS constraints must first explain the
+valid through-routes, after which only unsupported terminal residue can be
+classified as decoration. This prevents a short but real hook or dot from
+being destroyed by a length-only heuristic.

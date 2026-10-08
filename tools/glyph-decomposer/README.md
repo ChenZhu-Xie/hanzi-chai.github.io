@@ -47,7 +47,10 @@ uv run glyph-decomposer skeleton-audit `
 The command first extracts and freezes every PDF skeleton, and only then loads
 the annotation paths. It uses deterministic vector rasterisation followed by
 connectivity-preserving Zhang-Suen thinning; it performs no fitting or model
-training. This solves the undirected centreline problem. Stroke order,
+training. It then losslessly contracts every maximal degree-two pixel chain
+between endpoint/junction clusters into a topology graph. Every skeleton pixel
+belongs to exactly one node cluster or chain, and the review can toggle and
+inspect chain/node IDs. This solves the undirected centreline problem. Stroke order,
 pen-down/pen-up direction and the correct continuation through an intersection
 remain a separate constrained graph-decomposition problem.
 

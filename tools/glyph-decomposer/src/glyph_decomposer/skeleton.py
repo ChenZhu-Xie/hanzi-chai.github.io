@@ -14,6 +14,7 @@ from shapely import contains_xy
 
 from .geometry import normalize_geometry
 from .pdf_svg import export_page_svg, extract_cell_geometry, find_cell, parse_cells
+from .topology import SkeletonTopology, compress_skeleton
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class SkeletonCase:
     source: str
     character: str
     skeleton: np.ndarray
+    topology: SkeletonTopology
     truth_paths: tuple[np.ndarray, ...]
     metrics: dict
 
@@ -171,6 +173,7 @@ def audit_annotations(
             pages[cell.page] = export_page_svg(pdf_path, cell.page)
         geometry = extract_cell_geometry(pages[cell.page], cell)
         _ink, skeleton = generate_skeleton(geometry, size)
+        topology = compress_skeleton(skeleton)
         metrics = evaluate_skeleton(skeleton, truth_paths)
         output.append(
             SkeletonCase(
@@ -178,6 +181,7 @@ def audit_annotations(
                 source=source,
                 character=chr(codepoint),
                 skeleton=skeleton,
+                topology=topology,
                 truth_paths=truth_paths,
                 metrics=metrics,
             )
@@ -200,11 +204,55 @@ def _truth_paths(paths: tuple[np.ndarray, ...]) -> str:
     )
 
 
+_EDGE_COLOURS = (
+    "#2563eb",
+    "#16a34a",
+    "#9333ea",
+    "#ea580c",
+    "#0891b2",
+    "#db2777",
+    "#65a30d",
+    "#7c3aed",
+    "#dc2626",
+    "#0d9488",
+)
+
+
+def _topology_svg(topology: SkeletonTopology, size: int) -> str:
+    scale = 100 / size
+    edges = []
+    for edge in topology.edges:
+        points = " ".join(
+            f"{(x + 0.5) * scale:.3f},{(y + 0.5) * scale:.3f}" for x, y in edge.path
+        )
+        colour = _EDGE_COLOURS[edge.id % len(_EDGE_COLOURS)]
+        edges.append(
+            f'<polyline class="topology-chain" points="{points}" '
+            f'style="--chain:{colour}"><title>chain {edge.id}: '
+            f"{edge.start_node} → {edge.end_node}; length {edge.length:.1f}px; "
+            f"{len(edge.pixels)} owned pixels</title></polyline>"
+        )
+    nodes = []
+    for node in topology.nodes:
+        x, y = node.centre
+        incident = ", ".join(map(str, node.incident_edges)) or "none"
+        nodes.append(
+            f'<circle class="topology-node {node.kind}" '
+            f'cx="{(x + 0.5) * scale:.3f}" cy="{(y + 0.5) * scale:.3f}" '
+            f'r="{max(0.65, scale * 1.6):.3f}"><title>node {node.id}: '
+            f"{node.kind}; degree {node.degree}; chains {incident}; "
+            f"{len(node.pixels)} owned pixels</title></circle>"
+        )
+    return '<g class="topology">' + "".join(edges + nodes) + "</g>"
+
+
 def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
     cards = "".join(
         f"""<section><h2>{case.unicode} {html.escape(case.character)} · {case.source}</h2>
 <svg viewBox="0 0 100 100"><path class="skeleton" d="{_skeleton_path(case.skeleton)}"/>
+{_topology_svg(case.topology, case.skeleton.shape[0])}
 <g class="truth">{_truth_paths(case.truth_paths)}</g></svg>
+<p>拓扑压缩：{len(case.topology.nodes)} nodes / {len(case.topology.edges)} chains；{case.topology.endpoint_count} endpoints / {case.topology.junction_count} junctions；像素守恒 {case.topology.skeleton_pixel_count}/{case.metrics["skeletonPixels"]}</p>
 <p>人工路径→骨架：mean {case.metrics["truthMeanDistance"]:.2f} / p95 {case.metrics["truthP95Distance"]:.2f}；覆盖 {case.metrics["truthCoverage"]:.2%}</p>
 <p>骨架→人工路径：mean {case.metrics["skeletonMeanDistance"]:.2f} / p95 {case.metrics["skeletonP95Distance"]:.2f}；覆盖 {case.metrics["skeletonCoverage"]:.2%}</p>
 <p>起收笔→骨架：mean {case.metrics["endpointMeanDistance"]:.2f} / p95 {case.metrics["endpointP95Distance"]:.2f}</p></section>"""
@@ -213,6 +261,14 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
     summary = {
         "caseCount": len(cases),
         "strokeCount": sum(case.metrics["strokeCount"] for case in cases),
+        "topologyNodeCount": sum(len(case.topology.nodes) for case in cases),
+        "topologyChainCount": sum(len(case.topology.edges) for case in cases),
+        "topologyEndpointCount": sum(case.topology.endpoint_count for case in cases),
+        "topologyJunctionCount": sum(case.topology.junction_count for case in cases),
+        "topologyPixelConservation": all(
+            case.topology.skeleton_pixel_count == case.metrics["skeletonPixels"]
+            for case in cases
+        ),
         "meanTruthCoverage": float(
             np.mean([case.metrics["truthCoverage"] for case in cases])
         ),
@@ -225,6 +281,8 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
         "truthIsolation": "annotations loaded only after each PDF skeleton is frozen",
     }
     return f"""<!doctype html><meta charset="utf-8"><title>确定性 PDF 骨架回归</title>
-<style>body{{font:15px system-ui;margin:20px;background:#f3f5f8;color:#172033}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}section{{background:#fff;border:1px solid #ccd5e2;border-radius:10px;padding:12px}}svg{{width:100%;aspect-ratio:1;background:white}}.skeleton{{fill:#111827}}.truth{{fill:none;stroke:#06b6d4;stroke-width:.55;stroke-dasharray:1.5 1;stroke-linecap:round;stroke-linejoin:round}}pre{{background:#111827;color:#e5edf8;padding:12px;border-radius:8px}}</style>
-<h1>确定性 PDF 无向骨架生成器</h1><p>黑色＝仅由 PDF 矢量墨迹生成的 Zhang–Suen 骨架；青色虚线＝骨架冻结后才载入的人工有向笔画。人工标注不参与栅格化、细化或参数选择。</p>
-<pre>{html.escape(json.dumps(summary, ensure_ascii=False, indent=2))}</pre><div class="grid">{cards}</div>"""
+<style>body{{font:15px system-ui;margin:20px;background:#f3f5f8;color:#172033}}.toolbar{{position:sticky;top:8px;z-index:3;display:flex;gap:12px;background:#fff;border:1px solid #ccd5e2;border-radius:9px;padding:9px 12px;box-shadow:0 3px 12px #1e293b1c}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}section{{background:#fff;border:1px solid #ccd5e2;border-radius:10px;padding:12px}}svg{{width:100%;aspect-ratio:1;background:white}}.skeleton{{fill:#cbd5e1}}.topology-chain{{fill:none;stroke:var(--chain);stroke-width:.62;stroke-linecap:round;stroke-linejoin:round}}.topology-chain:hover{{stroke-width:1.5}}.topology-node{{stroke:#fff;stroke-width:.35}}.topology-node.endpoint{{fill:#2563eb}}.topology-node.junction{{fill:#ef4444}}.topology-node.anchor{{fill:#111827}}.truth{{fill:none;stroke:#06b6d4;stroke-width:.55;stroke-dasharray:1.5 1;stroke-linecap:round;stroke-linejoin:round}}body.hide-skeleton .skeleton,body.hide-topology .topology,body.hide-truth .truth{{display:none}}pre{{background:#111827;color:#e5edf8;padding:12px;border-radius:8px}}</style>
+<h1>确定性 PDF 无向骨架与拓扑压缩</h1><p>浅灰＝仅由 PDF 矢量墨迹生成的骨架；彩色＝最大无分叉链；蓝点＝端点；红点＝路口；青色虚线＝骨架冻结后才载入的人工有向笔画。悬浮链或节点可查看 ID。人工标注不参与骨架或拓扑生成。</p>
+<div class="toolbar"><label><input data-layer="skeleton" type="checkbox" checked> 原始骨架</label><label><input data-layer="topology" type="checkbox" checked> 拓扑链/节点</label><label><input data-layer="truth" type="checkbox" checked> 人工路径</label></div>
+<pre>{html.escape(json.dumps(summary, ensure_ascii=False, indent=2))}</pre><div class="grid">{cards}</div>
+<script>document.querySelectorAll('[data-layer]').forEach(input=>input.addEventListener('change',()=>document.body.classList.toggle('hide-'+input.dataset.layer,!input.checked)))</script>"""
