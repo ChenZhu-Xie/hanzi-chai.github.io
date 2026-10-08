@@ -222,3 +222,28 @@ hypothesis must improve whole-candidate route coverage, preserve required
 stroke contacts, satisfy recursive IDS placement and avoid unexplained long
 residue. Low-margin alternatives remain unresolved rather than being silently
 cut.
+
+### Certified skeleton-only reasoning boundary
+
+The two-dimensional PDF ink region and one-dimensional skeleton are not
+literally graph-isomorphic. The required property is topology preservation (a
+digital homotopy-equivalent centreline). A runtime certificate now checks:
+
+- 8-connected foreground component count;
+- 4-connected background hole count and Euler characteristic;
+- that every skeleton pixel lies inside source ink;
+- that every source-ink component retains skeleton representation.
+
+Synthetic tests reject a missing component and an out-of-ink skeleton pixel,
+and confirm preservation on a two-component shape containing a hole. All six
+real annotated glyphs pass. Their component transitions are `3→3`, `5→5`,
+`6→6`, `5→5`, `4→4`, and `2→2`; hole transitions are respectively `2→2`,
+`3→3`, `1→1`, `1→1`, `0→0`, and `2→2`.
+
+Once certified, all candidate matching, cut/no-cut comparison and recursive
+IDS reasoning operate on the compact skeleton graph only. PDF geometry is no
+longer an optimization input. It remains immutable audit evidence and is used
+again only after a decision, when skeleton ownership is expanded back to
+filled ink for visualization or data entry. Certificate failure is a hard
+gate rather than an invitation to mix outline details back into the graph
+solver.

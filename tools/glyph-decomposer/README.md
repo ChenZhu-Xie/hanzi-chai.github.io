@@ -72,5 +72,14 @@ accepted automatically only when complete downstream stroke coverage improves
 by a sufficient absolute score and margin without violating IDS, continuity or
 exclusive ownership constraints.
 
+After skeleton generation, a runtime topology certificate compares foreground
+connected components, background holes and Euler characteristic, verifies that
+every skeleton pixel remains inside source ink, and confirms that every ink
+component is represented. A certified glyph enters a skeleton-only reasoning
+boundary: PDF outlines no longer participate in component cuts, route search
+or recursive decisions. They are retained only for audit and for propagating
+the final skeleton ownership back onto the original filled ink. A failed
+certificate stops that path and requires extraction/thinning review.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

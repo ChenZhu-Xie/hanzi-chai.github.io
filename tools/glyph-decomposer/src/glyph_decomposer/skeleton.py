@@ -15,6 +15,7 @@ from shapely import contains_xy
 from .geometry import normalize_geometry
 from .pdf_svg import export_page_svg, extract_cell_geometry, find_cell, parse_cells
 from .topology import SkeletonTopology, compress_skeleton
+from .topology_certificate import TopologyCertificate, certify_skeleton
 from .topology_features import TopologyDescriptors, describe_topology
 
 
@@ -26,6 +27,7 @@ class SkeletonCase:
     skeleton: np.ndarray
     topology: SkeletonTopology
     descriptors: TopologyDescriptors
+    certificate: TopologyCertificate
     truth_paths: tuple[np.ndarray, ...]
     metrics: dict
 
@@ -174,7 +176,8 @@ def audit_annotations(
         if cell.page not in pages:
             pages[cell.page] = export_page_svg(pdf_path, cell.page)
         geometry = extract_cell_geometry(pages[cell.page], cell)
-        _ink, skeleton = generate_skeleton(geometry, size)
+        ink, skeleton = generate_skeleton(geometry, size)
+        certificate = certify_skeleton(ink, skeleton)
         topology = compress_skeleton(skeleton)
         descriptors = describe_topology(topology, size)
         metrics = evaluate_skeleton(skeleton, truth_paths)
@@ -186,6 +189,7 @@ def audit_annotations(
                 skeleton=skeleton,
                 topology=topology,
                 descriptors=descriptors,
+                certificate=certificate,
                 truth_paths=truth_paths,
                 metrics=metrics,
             )
@@ -276,6 +280,7 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
 <svg viewBox="0 0 100 100"><path class="skeleton" d="{_skeleton_path(case.skeleton)}"/>
 {_topology_svg(case.topology, case.descriptors, case.skeleton.shape[0])}
 <g class="truth">{_truth_paths(case.truth_paths)}</g></svg>
+<p class="certificate {"pass" if case.certificate.certified else "fail"}">拓扑证书：{"通过" if case.certificate.certified else "失败"}；components {case.certificate.ink_components}→{case.certificate.skeleton_components}；holes {case.certificate.ink_holes}→{case.certificate.skeleton_holes}；Euler {case.certificate.ink_euler}→{case.certificate.skeleton_euler}；骨架位于墨迹内 {case.certificate.skeleton_inside_ink}</p>
 <p>拓扑压缩：{len(case.topology.nodes)} nodes / {len(case.topology.edges)} chains；{case.topology.endpoint_count} endpoints / {case.topology.junction_count} junctions；像素守恒 {case.topology.skeleton_pixel_count}/{case.metrics["skeletonPixels"]}</p>
 <p>链描述降维：{case.descriptors.original_path_points} → {case.descriptors.simplified_path_points} points（减少 {case.descriptors.reduction_ratio:.1%}）</p>
 <p>人工路径→骨架：mean {case.metrics["truthMeanDistance"]:.2f} / p95 {case.metrics["truthP95Distance"]:.2f}；覆盖 {case.metrics["truthCoverage"]:.2%}</p>
@@ -293,6 +298,9 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
         "topologyPixelConservation": all(
             case.topology.skeleton_pixel_count == case.metrics["skeletonPixels"]
             for case in cases
+        ),
+        "allSkeletonsTopologyCertified": all(
+            case.certificate.certified for case in cases
         ),
         "originalChainPathPoints": sum(
             case.descriptors.original_path_points for case in cases
@@ -315,7 +323,7 @@ def render_skeleton_audit(cases: list[SkeletonCase]) -> str:
         "truthIsolation": "annotations loaded only after each PDF skeleton is frozen",
     }
     return f"""<!doctype html><meta charset="utf-8"><title>确定性 PDF 骨架回归</title>
-<style>body{{font:15px system-ui;margin:20px;background:#f3f5f8;color:#172033}}.toolbar{{position:sticky;top:8px;z-index:3;display:flex;gap:12px;background:#fff;border:1px solid #ccd5e2;border-radius:9px;padding:9px 12px;box-shadow:0 3px 12px #1e293b1c}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}section{{background:#fff;border:1px solid #ccd5e2;border-radius:10px;padding:12px}}svg{{width:100%;aspect-ratio:1;background:white}}.skeleton{{fill:#dbe2ea}}.raw-chain{{fill:none;stroke:#64748b;stroke-width:.35;stroke-linecap:round;stroke-linejoin:round}}.descriptor-chain{{fill:none;stroke:var(--chain);stroke-width:.72;stroke-linecap:round;stroke-linejoin:round}}.descriptor-chain:hover{{stroke-width:1.7}}.topology-node{{stroke:#fff;stroke-width:.35}}.topology-node.endpoint{{fill:#2563eb}}.topology-node.junction{{fill:#ef4444}}.topology-node.anchor{{fill:#111827}}.truth{{fill:none;stroke:#06b6d4;stroke-width:.55;stroke-dasharray:1.5 1;stroke-linecap:round;stroke-linejoin:round}}body.hide-skeleton .skeleton,body.hide-raw .raw-chain,body.hide-descriptor .descriptor-chain,body.hide-descriptor .topology-node,body.hide-truth .truth{{display:none}}pre{{background:#111827;color:#e5edf8;padding:12px;border-radius:8px}}</style>
+<style>body{{font:15px system-ui;margin:20px;background:#f3f5f8;color:#172033}}.toolbar{{position:sticky;top:8px;z-index:3;display:flex;gap:12px;background:#fff;border:1px solid #ccd5e2;border-radius:9px;padding:9px 12px;box-shadow:0 3px 12px #1e293b1c}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}section{{background:#fff;border:1px solid #ccd5e2;border-radius:10px;padding:12px}}svg{{width:100%;aspect-ratio:1;background:white}}.skeleton{{fill:#dbe2ea}}.raw-chain{{fill:none;stroke:#64748b;stroke-width:.35;stroke-linecap:round;stroke-linejoin:round}}.descriptor-chain{{fill:none;stroke:var(--chain);stroke-width:.72;stroke-linecap:round;stroke-linejoin:round}}.descriptor-chain:hover{{stroke-width:1.7}}.topology-node{{stroke:#fff;stroke-width:.35}}.topology-node.endpoint{{fill:#2563eb}}.topology-node.junction{{fill:#ef4444}}.topology-node.anchor{{fill:#111827}}.truth{{fill:none;stroke:#06b6d4;stroke-width:.55;stroke-dasharray:1.5 1;stroke-linecap:round;stroke-linejoin:round}}.certificate{{padding:5px 7px;border-radius:5px}}.certificate.pass{{background:#dcfce7;color:#166534}}.certificate.fail{{background:#fee2e2;color:#991b1b}}body.hide-skeleton .skeleton,body.hide-raw .raw-chain,body.hide-descriptor .descriptor-chain,body.hide-descriptor .topology-node,body.hide-truth .truth{{display:none}}pre{{background:#111827;color:#e5edf8;padding:12px;border-radius:8px}}</style>
 <h1>确定性 PDF 骨架的高信息拓扑描述</h1><p>浅灰＝完整骨架像素；灰线＝最大无分叉链；彩色折线＝有误差上界的紧凑描述；蓝点＝端点；红点＝路口；青色虚线＝生成后才载入的人工路径。悬浮可查看链形状特征或路口最佳穿行配对。</p>
 <div class="toolbar"><label><input data-layer="skeleton" type="checkbox" checked> 原始骨架</label><label><input data-layer="raw" type="checkbox" checked> 完整拓扑链</label><label><input data-layer="descriptor" type="checkbox" checked> 紧凑描述/节点</label><label><input data-layer="truth" type="checkbox" checked> 人工路径</label></div>
 <pre>{html.escape(json.dumps(summary, ensure_ascii=False, indent=2))}</pre><div class="grid">{cards}</div>
