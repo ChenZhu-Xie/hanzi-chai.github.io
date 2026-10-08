@@ -49,3 +49,11 @@ class GlyphRepository:
             operator=record.get("operator"),
             children=children,
         )
+
+    def record(self, glyph_id: int) -> dict:
+        try:
+            return self._records[glyph_id]
+        except KeyError as error:
+            raise KeyError(
+                f"glyph {glyph_id} is absent from repository data"
+            ) from error

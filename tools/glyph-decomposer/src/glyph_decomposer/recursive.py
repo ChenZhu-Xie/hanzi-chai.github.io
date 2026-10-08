@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .atoms import assign_vector_atoms
+from .candidate import compile_stroke_seeds
 from .domain import ComponentProgram, DecompositionNodeEvidence
+from .grammar import GlyphRepository
 from .solver import solve_root_partition, solve_surround_partition
 
 SUPPORTED_BINARY_OPERATORS = frozenset({"⿰", "⿱", "⿸"})
@@ -27,7 +30,11 @@ def _local_search_bounds(geometry, operator: str) -> tuple[float, float, float]:
     return low + inset, high - inset, step
 
 
-def decompose_recursive(geometry, program: ComponentProgram) -> DecompositionNode:
+def decompose_recursive(
+    geometry,
+    program: ComponentProgram,
+    repository: GlyphRepository | None = None,
+) -> DecompositionNode:
     if program.kind == "component":
         evidence = DecompositionNodeEvidence(
             glyphId=program.glyph_id,
@@ -47,7 +54,16 @@ def decompose_recursive(geometry, program: ComponentProgram) -> DecompositionNod
 
     try:
         if program.operator == "⿸":
-            partition = solve_surround_partition(geometry, program)
+            try:
+                partition = solve_surround_partition(geometry, program)
+            except ValueError:
+                if repository is None:
+                    raise
+                seeds = compile_stroke_seeds(repository, program.glyph_id)
+                groups = tuple(
+                    frozenset(child.leaf_ids()) for child in program.children
+                )
+                partition = assign_vector_atoms(geometry, seeds, groups)
         else:
             minimum, maximum, step = _local_search_bounds(geometry, program.operator)
             partition = solve_root_partition(
@@ -68,7 +84,7 @@ def decompose_recursive(geometry, program: ComponentProgram) -> DecompositionNod
         return DecompositionNode(program, geometry, evidence)
 
     children = tuple(
-        decompose_recursive(child_geometry, child_program)
+        decompose_recursive(child_geometry, child_program, repository)
         for child_geometry, child_program in zip(partition.children, program.children)
     )
     evidence = DecompositionNodeEvidence(

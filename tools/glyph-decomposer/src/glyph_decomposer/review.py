@@ -101,6 +101,31 @@ def render_review_html(
             f"平均 IoU {result.recursive_evaluation.mean_iou:.2%}；"
             f"最低 IoU {result.recursive_evaluation.minimum_iou:.2%}。</p>"
         )
+    atom_evidence = ""
+    atom_partitions = [
+        node.evidence.partition
+        for node in terminals
+        if node.evidence.partition and node.evidence.partition.axis == "atoms"
+    ]
+    if not atom_partitions:
+
+        def collect(node):
+            output = []
+            if node.evidence.partition and node.evidence.partition.axis == "atoms":
+                output.append(node.evidence.partition)
+            for child in node.children:
+                output.extend(collect(child))
+            return output
+
+        atom_partitions = collect(artifacts.decomposition)
+    if atom_partitions:
+        atom = atom_partitions[0]
+        atom_evidence = (
+            f"<p><strong>矢量原子：</strong>{atom.atom_count} 个互斥面；"
+            f"种子墨迹覆盖 {atom.seed_coverage:.2%}；"
+            f"无监督配准 IoU {atom.alignment_iou:.2%}；"
+            f"重构误差 {atom.reconstruction_error:.3g}。</p>"
+        )
     truth = _truth_overlays(request.annotation_path)
     return f"""<!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><title>{result.unicode}-{result.source} 确定性拆分审阅</title>
@@ -120,6 +145,6 @@ code{{font-size:13px}} ul{{margin:.35rem 0;padding-left:1.4rem}} .note{{color:#4
  <section class="card"><h2>盲推 IDS 递归分区</h2><svg viewBox="0 0 100 100">{colored}<g class="cut">{cut_line}</g></svg><p>{legend}</p></section>
  <section class="card"><h2>事后人工真值轮廓</h2><svg viewBox="0 0 100 100"><path d="{source_path}" fill="#cbd5e1" fill-rule="evenodd"/>{truth}</svg></section>
 </div>
-<section class="card"><h2>结果</h2><p><strong>根层：</strong>{metrics}</p>{recursive_metrics}<p class="note">人工标注只在盲推完成后用于评分和红色虚线叠加，不进入求解目标。</p></section>
+<section class="card"><h2>结果</h2><p><strong>根层：</strong>{metrics}</p>{recursive_metrics}{atom_evidence}<p class="note">人工标注只在盲推完成后用于评分和红色虚线叠加，不进入求解目标。</p></section>
 <section class="card"><h2>递归候选程序</h2><ul>{_program_tree(result.program)}</ul></section>
 </html>"""

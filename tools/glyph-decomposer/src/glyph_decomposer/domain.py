@@ -41,14 +41,17 @@ class ComponentProgram(StrictModel):
 
 
 class PartitionEvidence(StrictModel):
-    axis: Literal["x", "y", "xy"]
-    cut: float
+    axis: Literal["x", "y", "xy", "atoms"]
+    cut: float | None
     secondary_cut: float | None = Field(default=None, alias="secondaryCut")
     score: float
     crossing_ratio: float = Field(alias="crossingRatio")
     balance_error: float = Field(alias="balanceError")
     reconstruction_error: float = Field(alias="reconstructionError")
     solver_status: str = Field(alias="solverStatus")
+    seed_coverage: float | None = Field(default=None, alias="seedCoverage")
+    alignment_iou: float | None = Field(default=None, alias="alignmentIoU")
+    atom_count: int | None = Field(default=None, alias="atomCount")
 
 
 class EvaluationEvidence(StrictModel):

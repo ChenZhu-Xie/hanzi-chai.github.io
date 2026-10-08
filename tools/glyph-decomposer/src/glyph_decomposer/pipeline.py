@@ -34,7 +34,7 @@ def decompose_with_artifacts(request: DecompositionRequest) -> DecompositionArti
     source = extract_cell_geometry(page_svg, cell)
     repository = GlyphRepository.load(Path(request.glyph_data_path))
     program = repository.compile(request.candidate_glyph_id)
-    decomposition = decompose_recursive(source, program)
+    decomposition = decompose_recursive(source, program, repository)
     if decomposition.evidence.partition is None or len(decomposition.children) != 2:
         raise ValueError("candidate root could not be partitioned")
     partition = decomposition.evidence.partition
