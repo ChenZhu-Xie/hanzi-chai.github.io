@@ -11,7 +11,7 @@ import numpy as np
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
 
-from .candidate import IDS_INTERVALS, StrokeSeed, compile_stroke_seeds
+from .candidate import IDS_INTERVALS, StrokeSeed, compile_stroke_seeds, stroke_points
 from .grammar import GlyphRepository
 from .topology_features import simplify_path
 
@@ -205,6 +205,123 @@ def compile_candidate_graph(
     root = _compile_component(
         repository, glyph_id, (), (1.0, 1.0, 0.0, 0.0), strokes, ()
     )
+    relations = tuple(
+        _stroke_relation(first, second) for first, second in combinations(strokes, 2)
+    )
+    return CandidateGraph(glyph_id, root, strokes, relations)
+
+
+def compile_catalog_candidate_graph(
+    catalog: dict, codepoint: int, glyph_id: int
+) -> CandidateGraph:
+    """Compile a locally reviewed candidate whose synthetic root is not upstream.
+
+    Catalog rows already contain absolute 0..100 candidate paths and explicit
+    leaf ownership. No annotation coordinates are read here.
+    """
+    row = next(
+        (
+            item
+            for item in catalog.get("rows", ())
+            if int(item.get("unicode", -1)) == codepoint
+            and str(glyph_id) in item.get("candidates", {})
+        ),
+        None,
+    )
+    if row is None:
+        raise KeyError(
+            f"candidate {glyph_id} for U+{codepoint:04X} absent from catalog"
+        )
+    raw_strokes = row["candidates"][str(glyph_id)]
+    leaves = row["candidateLeafSvgs"][str(glyph_id)]
+    node_metadata: dict[tuple[int, int], dict] = {}
+    child_keys: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for leaf in leaves:
+        occurrence = int(leaf.get("occurrence", 0))
+        hierarchy = leaf.get("hierarchy") or (
+            {"id": int(leaf["leafId"]), "type": "component", "label": "末级部件"},
+            {"id": glyph_id, "type": "glyph", "label": ""},
+        )
+        keys = [
+            (int(item["id"]), occurrence if index == 0 else 0)
+            for index, item in enumerate(hierarchy)
+        ]
+        for key, item in zip(keys, hierarchy):
+            node_metadata[key] = item
+        for child_key, parent_key in pairwise(keys):
+            children = child_keys.setdefault(parent_key, [])
+            if child_key not in children:
+                children.append(child_key)
+
+    path_by_key: dict[tuple[int, int], tuple[int, ...]] = {}
+
+    def assign_paths(key: tuple[int, int], path: tuple[int, ...]):
+        path_by_key[key] = path
+        for index, child_key in enumerate(child_keys.get(key, ())):
+            assign_paths(child_key, (*path, index))
+
+    root_key = glyph_id, 0
+    assign_paths(root_key, ())
+    ownership = {}
+    for leaf in leaves:
+        leaf_id = int(leaf["leafId"])
+        occurrence = int(leaf.get("occurrence", 0))
+        for stroke_index in leaf["strokeIndices"]:
+            ownership[int(stroke_index)] = (
+                path_by_key[(leaf_id, occurrence)],
+                leaf_id,
+                occurrence,
+            )
+    if sorted(ownership) != list(range(len(raw_strokes))):
+        raise ValueError("catalog candidate has incomplete leaf stroke ownership")
+    seeds = tuple(
+        StrokeSeed(
+            leaf_id=ownership[index][1],
+            occurrence=ownership[index][2],
+            feature=stroke.get("feature", "unknown"),
+            points=tuple(stroke_points(stroke)),
+            component_path=ownership[index][0],
+        )
+        for index, stroke in enumerate(raw_strokes)
+    )
+    strokes = tuple(_describe_stroke(index, seed) for index, seed in enumerate(seeds))
+
+    def compile_node(key: tuple[int, int], path: tuple[int, ...]) -> CandidateComponent:
+        identifier, _occurrence = key
+        child_node_keys = child_keys.get(key, ())
+        children = tuple(
+            compile_node(child_key, (*path, index))
+            for index, child_key in enumerate(child_node_keys)
+        )
+        indices = tuple(
+            stroke.index
+            for stroke in strokes
+            if stroke.component_path[: len(path)] == path
+        )
+        coordinates = np.asarray(
+            [point for index in indices for point in strokes[index].points], dtype=float
+        )
+        minimum = coordinates.min(axis=0)
+        maximum = coordinates.max(axis=0)
+        metadata = node_metadata.get(key, {})
+        label = str(metadata.get("label", ""))
+        operator = label if label.startswith(("⿰", "⿱", "⿸")) else None
+        return CandidateComponent(
+            glyph_id=identifier,
+            path=path,
+            kind="compound" if children else "component",
+            operator=operator,
+            bounds=(
+                float(minimum[0]),
+                float(minimum[1]),
+                float(maximum[0]),
+                float(maximum[1]),
+            ),
+            stroke_indices=indices,
+            children=children,
+        )
+
+    root = compile_node(root_key, ())
     relations = tuple(
         _stroke_relation(first, second) for first, second in combinations(strokes, 2)
     )

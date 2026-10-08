@@ -1,5 +1,33 @@
 # Deterministic decomposition experiments
 
+## IDS leaf route cover and semantic cuts
+
+Cutting is now defined as an ownership problem rather than a global connected-
+component problem. Candidate strokes retain their recursive IDS leaf
+occurrence, are routed on the certified skeleton, and request a semantic cut
+where different leaf routes share one physical junction. The physical
+skeleton is not deleted or raster-sliced. No proposal is auto-accepted until
+all stroke routes jointly cover the skeleton without stealing another leaf's
+route.
+
+The initial regression set is U+64CF H (口/句 enclosure), U+64EC T (right-side
+幺-like leaf/lower leaf), U+6418 G (老/匕), and U+6424 J (扌/upper 八).
+
+The first independent per-stroke shortest-route attempt was retained only as a
+negative control: it reused long chains across strokes, produced clustered
+false cuts on three cases, and missed U+6424 entirely. The current stage instead
+assigns every maximal no-branch skeleton chain exactly once, requires every IDS
+leaf occurrence to be represented, and balances leaf path capacity as a soft
+global constraint. Reviewed synthetic candidates preserve their full recursive
+hierarchy and repeated leaves such as the two `117` occurrences in U+6424.
+
+On the four dry-run regressions, all candidate strokes found paths and all
+skeleton chains received one exclusive owner. The current proposed semantic-cut
+counts are 6 (U+64CF H), 10 (U+64EC T), 6 (U+6418 G), and 6 (U+6424 J). Visual
+review shows materially better leaf blocks than independent routing, but these
+counts are not accepted answers yet: the next solver must optimize recursively
+at every IDS node and reject any cut set that fails whole-tree reconstruction.
+
 ## U+6418-G / candidate 17973
 
 Human annotations are loaded only after inference. Re-running without

@@ -94,5 +94,17 @@ split that reconnects through another route receives zero gain. These are
 structural priors only and are never auto-accepted before directed candidate
 strokes are covered by skeleton routes.
 
+The leaf-aware follow-up diagnostic is:
+
+```powershell
+uv run glyph-decomposer route-cover-audit <request.json> --output <review.html>
+```
+
+This treats a cut as semantic ownership separation, not as deletion of the
+physical skeleton. A real PDF junction may remain connected, but if routes
+owned by different recursive IDS leaf occurrences share it, the node must be
+split between those owners. This represents contacts such as 口/句, 幺/下部,
+老/匕 and 扌/八 without pretending that the printed ink is disconnected.
+
 See [EXPERIMENTS.md](EXPERIMENTS.md) for accepted and rejected geometric
 approaches and their held-out measurements.

@@ -11,6 +11,7 @@ from .domain import DecompositionRequest
 from .grammar import GlyphRepository
 from .pipeline import decompose_with_artifacts
 from .review import render_review_html
+from .route_cover import build_route_cover_audit, render_route_cover_audit
 from .skeleton import audit_annotations, render_skeleton_audit
 from .trajectory import (
     complete_historic_routes,
@@ -49,11 +50,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cut.add_argument("request", type=Path)
     cut.add_argument("--output", type=Path, required=True)
+    route = subparsers.add_parser(
+        "route-cover-audit",
+        help="route candidate leaf strokes over the skeleton and expose semantic cuts",
+    )
+    route.add_argument("request", type=Path)
+    route.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "route-cover-audit":
+        request = DecompositionRequest.model_validate_json(
+            args.request.read_text(encoding="utf-8")
+        )
+        audit = build_route_cover_audit(request)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(render_route_cover_audit(audit), encoding="utf-8")
+        return 0
     if args.command == "cut-audit":
         request = DecompositionRequest.model_validate_json(
             args.request.read_text(encoding="utf-8")

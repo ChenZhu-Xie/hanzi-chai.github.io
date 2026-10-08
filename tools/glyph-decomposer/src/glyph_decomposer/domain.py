@@ -16,6 +16,9 @@ class DecompositionRequest(StrictModel):
     pdf_path: str = Field(alias="pdfPath")
     bbox_path: str = Field(alias="bboxPath")
     glyph_data_path: str = Field(alias="glyphDataPath")
+    candidate_catalog_path: str | None = Field(
+        default=None, alias="candidateCatalogPath"
+    )
     unicode: str
     source: str
     candidate_glyph_id: int = Field(alias="candidateGlyphId")

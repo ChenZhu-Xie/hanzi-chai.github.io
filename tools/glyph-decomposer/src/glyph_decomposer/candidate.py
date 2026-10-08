@@ -59,7 +59,7 @@ def _cubic(start, values, steps: int = 16):
     return output, end
 
 
-def _stroke_points(stroke: dict) -> list[tuple[float, float]]:
+def stroke_points(stroke: dict) -> list[tuple[float, float]]:
     current = tuple(map(float, stroke["start"]))
     points = [current]
     for curve in stroke.get("curveList", ()):
@@ -112,7 +112,7 @@ def compile_stroke_seeds(
                     occurrence=occurrence,
                     feature=stroke.get("feature", "unknown"),
                     points=tuple(
-                        _point(transform, point) for point in _stroke_points(stroke)
+                        _point(transform, point) for point in stroke_points(stroke)
                     ),
                     component_path=component_path,
                 )
