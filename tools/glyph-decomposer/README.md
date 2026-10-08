@@ -13,7 +13,9 @@ The prototype performs independently testable operations:
    clean geometric boundary does not exist; then use directed candidate
    strokes to induce mutually exclusive vector Voronoi ink atoms, with local
    junction ownership, within-stroke continuity and between-stroke
-   independence guarded by truth-free checks;
+   independence guarded by truth-free checks; disconnected contour fragments
+   inherit ownership from trusted whole-stroke cores instead of isolated
+   nearest-point sites;
 5. evaluate root and recursive terminal regions against a human annotation
    that inference never reads.
 

@@ -129,6 +129,8 @@ def render_review_html(
             f"{atom.atom_count} 个互斥面；{atom.stroke_count} 笔；"
             f"{atom.junction_count} 个交点；连续性 {atom.stroke_continuity:.2%}；"
             f"独立性 {atom.stroke_independence:.2%}；"
+            f"主干惯性 {atom.stroke_inertia:.2%}；"
+            f"主干外墨迹 {atom.orphan_ink_ratio:.2%}；"
             f"种子墨迹覆盖 {atom.seed_coverage:.2%}；"
             f"配准 IoU {atom.alignment_iou:.2%}。</p>"
             for node, atom in zip(atom_nodes, atom_partitions)

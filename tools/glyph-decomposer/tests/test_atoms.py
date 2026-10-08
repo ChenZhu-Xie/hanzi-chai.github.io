@@ -42,3 +42,31 @@ def test_crossing_strokes_keep_identity_and_later_stroke_owns_junction():
     assert result.evidence.junction_count == 1
     assert result.evidence.stroke_independence == 1
     assert result.evidence.stroke_continuity > 0.95
+    assert result.evidence.stroke_inertia > 0.99
+    assert result.evidence.orphan_ink_ratio < 0.01
+
+
+def test_disconnected_voronoi_fragments_grow_from_whole_stroke_cores():
+    geometry = unary_union(
+        [
+            box(4, 43, 96, 57),
+            box(43, 4, 57, 96),
+            # A remote serif-like island must not inherit a colour merely
+            # because it shares a point site's unbounded Voronoi cell.
+            box(62, 62, 68, 68),
+        ]
+    )
+    seeds = (
+        StrokeSeed(1, 0, "横", ((4, 50), (96, 50))),
+        StrokeSeed(2, 0, "竖", ((50, 4), (50, 96))),
+    )
+
+    result = assign_vector_atoms(geometry, seeds, (frozenset({1}), frozenset({2})))
+
+    assert result.children[0].intersection(result.children[1]).area < 1e-6
+    assert (
+        result.children[0].union(result.children[1]).symmetric_difference(geometry).area
+        < 1e-6
+    )
+    assert result.evidence.stroke_inertia > 0.9
+    assert result.evidence.orphan_ink_ratio > 0

@@ -119,6 +119,71 @@ def _intersection_points(geometry):
     return [point for part in geometry.geoms for point in _intersection_points(part)]
 
 
+def _polygon_parts(geometry):
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    if not hasattr(geometry, "geoms"):
+        return []
+    return [part for item in geometry.geoms for part in _polygon_parts(item)]
+
+
+def _inertial_atom_owners(geometry, cells, site_stroke_owners, lines):
+    """Grow mutually exclusive ink ownership from whole-stroke vector cores.
+
+    A Voronoi cell may intersect several disconnected pieces of PDF ink.  The
+    old point-site assignment gave every such piece the site's colour, which
+    produced remote speckles.  Here each connected vector atom is considered
+    separately.  Atoms touching a complete directed candidate line form the
+    trusted stroke cores; all remaining ink grows from the nearest such core.
+    """
+    atoms = []
+    initial_owners = []
+    for cell, owner in zip(cells, site_stroke_owners):
+        for part in _polygon_parts(make_valid(cell).intersection(geometry)):
+            if part.area > 1e-9:
+                atoms.append(part)
+                initial_owners.append(owner)
+    anchored_by_stroke = [[] for _ in lines]
+    core_tubes = [line.buffer(1.0, cap_style="flat") for line in lines]
+    is_anchored = []
+    for atom, owner in zip(atoms, initial_owners):
+        # The PDF centerline can sit a fraction outside a serif outline after
+        # truth-free alignment.  A narrow tube keeps that numerical detail
+        # from breaking an otherwise continuous stroke core.
+        anchored = core_tubes[owner].intersects(atom)
+        is_anchored.append(anchored)
+        if anchored:
+            anchored_by_stroke[owner].append(atom)
+
+    missing = [index for index, owned in enumerate(anchored_by_stroke) if not owned]
+    if missing:
+        raise ValueError(f"candidate strokes have no PDF-ink anchor: {missing}")
+    cores = tuple(unary_union(owned) for owned in anchored_by_stroke)
+
+    owners = []
+    orphan_area = 0.0
+    inertial_area = 0.0
+    for atom, owner, anchored in zip(atoms, initial_owners, is_anchored):
+        probe = atom.representative_point()
+        if anchored:
+            inertial_area += atom.area
+        else:
+            orphan_area += atom.area
+            owner = min(
+                range(len(lines)),
+                key=lambda index: (probe.distance(cores[index]), -index),
+            )
+        owners.append(owner)
+    return (
+        atoms,
+        owners,
+        inertial_area / geometry.area,
+        orphan_area / geometry.area,
+    )
+
+
 def _partition_from_seeds(geometry, aligned, child_leaf_groups):
     sites = {}
     lines = [LineString(seed.points) for seed in aligned]
@@ -150,11 +215,12 @@ def _partition_from_seeds(geometry, aligned, child_leaf_groups):
     min_x, min_y, max_x, max_y = geometry.bounds
     extent = box(min_x - 10, min_y - 10, max_x + 10, max_y + 10)
     cells = voronoi_polygons(MultiPoint(points), extend_to=extent, ordered=True).geoms
+    atoms, stroke_owners, stroke_inertia, orphan_ink_ratio = _inertial_atom_owners(
+        geometry, cells, stroke_owners, lines
+    )
     by_stroke = defaultdict(list)
-    for cell, stroke_owner in zip(cells, stroke_owners):
-        atom = make_valid(cell).intersection(geometry)
-        if not atom.is_empty:
-            by_stroke[stroke_owner].append(atom)
+    for atom, stroke_owner in zip(atoms, stroke_owners):
+        by_stroke[stroke_owner].append(atom)
     stroke_regions = tuple(
         unary_union(by_stroke[index]) for index in range(len(aligned))
     )
@@ -168,7 +234,15 @@ def _partition_from_seeds(geometry, aligned, child_leaf_groups):
         )
         for child_index in range(2)
     )
-    return children, points, cells, stroke_regions, tuple(junctions)
+    return (
+        children,
+        points,
+        atoms,
+        stroke_regions,
+        tuple(junctions),
+        stroke_inertia,
+        orphan_ink_ratio,
+    )
 
 
 def _stroke_metrics(geometry, aligned, stroke_regions, junctions):
@@ -202,9 +276,15 @@ def assign_vector_atoms(
         raise ValueError("candidate contains no stroke seeds")
     initial = _align_seeds(seeds, geometry)
     alignment_iou, aligned = _optimize_alignment(geometry, initial)
-    children, points, cells, stroke_regions, junctions = _partition_from_seeds(
-        geometry, aligned, child_leaf_groups
-    )
+    (
+        children,
+        points,
+        atoms,
+        stroke_regions,
+        junctions,
+        stroke_inertia,
+        orphan_ink_ratio,
+    ) = _partition_from_seeds(geometry, aligned, child_leaf_groups)
     # One EM-like self-consistency pass: each child may adapt to the ink it
     # currently owns, but the pass is accepted only when the global, truth-free
     # rendered-centerline IoU improves.
@@ -219,9 +299,15 @@ def assign_vector_atoms(
     if refined_iou > alignment_iou + 1e-6:
         aligned = refined
         alignment_iou = refined_iou
-        children, points, cells, stroke_regions, junctions = _partition_from_seeds(
-            geometry, aligned, child_leaf_groups
-        )
+        (
+            children,
+            points,
+            atoms,
+            stroke_regions,
+            junctions,
+            stroke_inertia,
+            orphan_ink_ratio,
+        ) = _partition_from_seeds(geometry, aligned, child_leaf_groups)
     if any(child.is_empty for child in children):
         raise ValueError("vector atom assignment produced an empty child")
 
@@ -260,11 +346,13 @@ def assign_vector_atoms(
             solverStatus="VECTOR_VORONOI",
             seedCoverage=seed_coverage,
             alignmentIoU=alignment_iou,
-            atomCount=len(cells),
+            atomCount=len(atoms),
             strokeCount=len(aligned),
             junctionCount=len(junctions),
             strokeContinuity=stroke_continuity,
             strokeIndependence=stroke_independence,
+            strokeInertia=stroke_inertia,
+            orphanInkRatio=orphan_ink_ratio,
         ),
         children=children,
         stroke_regions=stroke_regions,

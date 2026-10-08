@@ -56,6 +56,8 @@ class PartitionEvidence(StrictModel):
     junction_count: int | None = Field(default=None, alias="junctionCount")
     stroke_continuity: float | None = Field(default=None, alias="strokeContinuity")
     stroke_independence: float | None = Field(default=None, alias="strokeIndependence")
+    stroke_inertia: float | None = Field(default=None, alias="strokeInertia")
+    orphan_ink_ratio: float | None = Field(default=None, alias="orphanInkRatio")
 
 
 class EvaluationEvidence(StrictModel):

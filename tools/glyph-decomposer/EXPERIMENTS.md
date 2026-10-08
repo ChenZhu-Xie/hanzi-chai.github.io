@@ -73,6 +73,32 @@ This path is deliberately gated. A clean axis partition with no crossed ink
 keeps exact enumeration; forcing vector atoms on the clean `U+65E8` split
 reduced accuracy from 100% to 97.57%.
 
+### Whole-stroke inertial ownership
+
+Treating sampled centerline points as independent Voronoi owners allowed one
+site's cell to reach disconnected PDF contours, producing small remote colour
+islands. The solver now keeps the original directed stroke as the unit of
+identity:
+
+1. split every clipped Voronoi cell into connected vector atoms;
+2. accept an atom as a trusted core only when it touches a narrow tube around
+   its complete candidate stroke;
+3. grow remaining ink from the nearest trusted whole-stroke core;
+4. retain mutual exclusion and the existing writing-order junction rule.
+
+On `U+6418-G`, without access to annotations during inference:
+
+- root classified-ink accuracy: 99.74% (previously 98.90%);
+- recursive four-leaf accuracy: 96.69% (previously 95.60%);
+- mean leaf IoU: 85.89% (previously 84.09%);
+- minimum leaf IoU: 65.50% (previously 64.18%);
+- root directly anchored ink: 81.50%; inherited contour ink: 18.50%;
+- nested `4158` directly anchored ink: 97.11%; inherited ink: 2.89%.
+
+The clean `U+65E8-T` case still selects exact enumeration and retains 100%
+root and recursive component accuracy. Removing `annotationPath` again yields
+an identical inference payload after evaluation-only fields are removed.
+
 ### Next unresolved layer
 
 The remaining errors are concentrated inside the `439`/`133` surround. The
