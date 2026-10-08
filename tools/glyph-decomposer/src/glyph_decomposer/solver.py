@@ -92,3 +92,105 @@ def solve_root_partition(
         ),
         children=(first, second),
     )
+
+
+def solve_surround_partition(
+    geometry,
+    program: ComponentProgram,
+    *,
+    grid_steps: int = 36,
+    band_width: float = 0.75,
+) -> RootPartition:
+    if program.kind != "compound" or len(program.children) != 2:
+        raise ValueError("surround solver requires a binary compound")
+    if program.operator != "⿸":
+        raise ValueError(
+            f"initial surround solver supports ⿸, not {program.operator!r}"
+        )
+    total_area = geometry.area
+    if total_area <= 0:
+        raise ValueError("source geometry has no area")
+    min_x, min_y, max_x, max_y = geometry.bounds
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    child_strokes = [max(1, child.stroke_count()) for child in program.children]
+    expected_ratio = child_strokes[0] / sum(child_strokes)
+    options = []
+    for x_index in range(1, grid_steps):
+        x_cut = min_x + span_x * x_index / grid_steps
+        for y_index in range(1, grid_steps):
+            y_cut = min_y + span_y * y_index / grid_steps
+            lower_right = box(x_cut, y_cut, max_x + 1, max_y + 1)
+            second = geometry.intersection(lower_right)
+            first = geometry.difference(second)
+            if first.area <= 0 or second.area <= 0:
+                continue
+            # A real child program cannot collapse into a serif-sized speck.
+            # This is deliberately based on program existence, not annotation.
+            if min(first.area, second.area) / total_area < 0.10:
+                continue
+            vertical_boundary = box(
+                x_cut - band_width,
+                y_cut,
+                x_cut + band_width,
+                max_y + 1,
+            )
+            horizontal_boundary = box(
+                x_cut,
+                y_cut - band_width,
+                max_x + 1,
+                y_cut + band_width,
+            )
+            boundary = vertical_boundary.union(horizontal_boundary)
+            crossing_ratio = geometry.intersection(boundary).area / total_area
+            observed_ratio = first.area / total_area
+            balance_error = abs(observed_ratio - expected_ratio)
+            corner_penalty = (
+                abs(x_cut - (min_x + span_x * 0.45)) / span_x
+                + abs(y_cut - (min_y + span_y * 0.45)) / span_y
+            )
+            score = crossing_ratio * 25.0 + balance_error * 6.0 + corner_penalty * 0.03
+            options.append(
+                (
+                    x_cut,
+                    y_cut,
+                    first,
+                    second,
+                    crossing_ratio,
+                    balance_error,
+                    score,
+                )
+            )
+    if not options:
+        raise ValueError("no feasible upper-left surround candidates")
+    x_cut, y_cut, first, second, crossing_ratio, balance_error, score = min(
+        options,
+        key=lambda option: (
+            round(option[-1], 12),
+            round(option[4], 12),
+            round(option[5], 12),
+            option[1],
+            option[0],
+        ),
+    )
+    if crossing_ratio > 0.01:
+        raise ValueError(
+            f"best ⿸ boundary crosses {crossing_ratio:.3%} of source ink; "
+            "stroke-level assignment is required"
+        )
+    reconstruction_error = (
+        first.union(second).symmetric_difference(geometry).area / total_area
+    )
+    return RootPartition(
+        evidence=PartitionEvidence(
+            axis="xy",
+            cut=y_cut,
+            secondaryCut=x_cut,
+            score=score,
+            crossingRatio=crossing_ratio,
+            balanceError=balance_error,
+            reconstructionError=reconstruction_error,
+            solverStatus="EXACT_ENUMERATION",
+        ),
+        children=(first, second),
+    )

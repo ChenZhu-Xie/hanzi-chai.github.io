@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .domain import DecompositionRequest, DecompositionResult
-from .evaluation import evaluate_root_partition
+from .evaluation import evaluate_root_partition, evaluate_terminal_partition
 from .geometry import polygon_parts
 from .grammar import GlyphRepository
 from .pdf_svg import export_page_svg, extract_cell_geometry, find_cell, parse_cells
-from .solver import solve_root_partition
+from .recursive import DecompositionNode, decompose_recursive, terminal_nodes
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class DecompositionArtifacts:
     result: DecompositionResult
     source_geometry: object
     predicted_children: tuple[object, object]
+    decomposition: DecompositionNode
 
 
 def parse_unicode(value: str) -> int:
@@ -33,14 +34,26 @@ def decompose_with_artifacts(request: DecompositionRequest) -> DecompositionArti
     source = extract_cell_geometry(page_svg, cell)
     repository = GlyphRepository.load(Path(request.glyph_data_path))
     program = repository.compile(request.candidate_glyph_id)
-    partition = solve_root_partition(source, program)
+    decomposition = decompose_recursive(source, program)
+    if decomposition.evidence.partition is None or len(decomposition.children) != 2:
+        raise ValueError("candidate root could not be partitioned")
+    partition = decomposition.evidence.partition
+    root_children = tuple(child.geometry for child in decomposition.children)
+    terminals = terminal_nodes(decomposition)
     evaluation = None
+    recursive_evaluation = None
     if request.annotation_path:
         evaluation = evaluate_root_partition(
             source,
-            partition.children,
+            root_children,
             program,
-            partition.evidence.axis,
+            partition.axis,
+            Path(request.annotation_path),
+        )
+        recursive_evaluation = evaluate_terminal_partition(
+            source,
+            terminals,
+            partition.axis,
             Path(request.annotation_path),
         )
     return DecompositionArtifacts(
@@ -53,11 +66,14 @@ def decompose_with_artifacts(request: DecompositionRequest) -> DecompositionArti
             sourceValid=source.is_valid,
             sourceParts=polygon_parts(source),
             program=program,
-            partition=partition.evidence,
+            partition=partition,
             evaluation=evaluation,
+            decomposition=decomposition.evidence,
+            recursiveEvaluation=recursive_evaluation,
         ),
         source_geometry=source,
-        predicted_children=partition.children,
+        predicted_children=root_children,
+        decomposition=decomposition,
     )
 
 

@@ -41,8 +41,9 @@ class ComponentProgram(StrictModel):
 
 
 class PartitionEvidence(StrictModel):
-    axis: Literal["x", "y"]
+    axis: Literal["x", "y", "xy"]
     cut: float
+    secondary_cut: float | None = Field(default=None, alias="secondaryCut")
     score: float
     crossing_ratio: float = Field(alias="crossingRatio")
     balance_error: float = Field(alias="balanceError")
@@ -58,6 +59,27 @@ class EvaluationEvidence(StrictModel):
     mapping_mode: str = Field(alias="mappingMode")
 
 
+class RecursiveEvaluationEvidence(StrictModel):
+    truth_isolation: Literal[True] = Field(True, alias="truthIsolation")
+    terminal_count: int = Field(alias="terminalCount")
+    classified_ink_ratio: float = Field(alias="classifiedInkRatio")
+    component_accuracy: float = Field(alias="componentAccuracy")
+    terminal_ious: tuple[float, ...] = Field(alias="terminalIoUs")
+    mean_iou: float = Field(alias="meanIoU")
+    minimum_iou: float = Field(alias="minimumIoU")
+    mapping_mode: str = Field(alias="mappingMode")
+
+
+class DecompositionNodeEvidence(StrictModel):
+    glyph_id: int = Field(alias="glyphId")
+    status: Literal["leaf", "partitioned", "unsupported-operator", "infeasible"]
+    operator: str | None = None
+    reason: str | None = None
+    area: float
+    partition: PartitionEvidence | None = None
+    children: tuple[DecompositionNodeEvidence, ...] = ()
+
+
 class DecompositionResult(StrictModel):
     schema_version: Literal[1] = Field(1, alias="schemaVersion")
     unicode: str
@@ -70,6 +92,11 @@ class DecompositionResult(StrictModel):
     program: ComponentProgram
     partition: PartitionEvidence
     evaluation: EvaluationEvidence | None = None
+    decomposition: DecompositionNodeEvidence | None = None
+    recursive_evaluation: RecursiveEvaluationEvidence | None = Field(
+        default=None, alias="recursiveEvaluation"
+    )
 
 
 ComponentProgram.model_rebuild()
+DecompositionNodeEvidence.model_rebuild()

@@ -10,8 +10,9 @@ from shapely.geometry import MultiPolygon, Polygon
 
 from .domain import ComponentProgram, DecompositionRequest
 from .pipeline import DecompositionArtifacts
+from .recursive import terminal_nodes
 
-COLORS = ("#2563eb", "#f97316")
+COLORS = ("#2563eb", "#f97316", "#16a34a", "#9333ea", "#db2777", "#0891b2")
 
 
 def _polygons(geometry):
@@ -69,9 +70,16 @@ def render_review_html(
 ) -> str:
     result = artifacts.result
     source_path = geometry_path_data(artifacts.source_geometry)
+    terminals = terminal_nodes(artifacts.decomposition)
     colored = "".join(
-        f'<path d="{geometry_path_data(child)}" fill="{color}" fill-rule="evenodd"/>'
-        for child, color in zip(artifacts.predicted_children, COLORS)
+        f'<path d="{geometry_path_data(node.geometry)}" fill="{COLORS[index % len(COLORS)]}" '
+        f'fill-rule="evenodd"><title>{node.program.glyph_id} · {node.evidence.status}</title></path>'
+        for index, node in enumerate(terminals)
+    )
+    legend = " · ".join(
+        f'<span style="color:{COLORS[index % len(COLORS)]}">■</span> '
+        f"{node.program.glyph_id} ({node.evidence.status})"
+        for index, node in enumerate(terminals)
     )
     if result.partition.axis == "x":
         cut_line = f'<line x1="{result.partition.cut}" y1="0" x2="{result.partition.cut}" y2="100"/>'
@@ -84,6 +92,14 @@ def render_review_html(
             f"归类墨迹覆盖 {evaluation.classified_ink_ratio:.2%}；"
             f"归属准确率 {evaluation.component_accuracy:.2%}；"
             f"两子部件 IoU {evaluation.child_ious[0]:.2%} / {evaluation.child_ious[1]:.2%}"
+        )
+    recursive_metrics = ""
+    if result.recursive_evaluation:
+        recursive_metrics = (
+            f"<p><strong>递归终端：</strong>{result.recursive_evaluation.terminal_count} 个；"
+            f"归属准确率 {result.recursive_evaluation.component_accuracy:.2%}；"
+            f"平均 IoU {result.recursive_evaluation.mean_iou:.2%}；"
+            f"最低 IoU {result.recursive_evaluation.minimum_iou:.2%}。</p>"
         )
     truth = _truth_overlays(request.annotation_path)
     return f"""<!doctype html>
@@ -101,9 +117,9 @@ code{{font-size:13px}} ul{{margin:.35rem 0;padding-left:1.4rem}} .note{{color:#4
 跨切线墨迹 {result.partition.crossing_ratio:.3%}；重构误差 {result.partition.reconstruction_error:.3g}。</p>
 <div class="panels">
  <section class="card"><h2>PDF 原生矢量</h2><svg viewBox="0 0 100 100"><path d="{source_path}" fill="#111827" fill-rule="evenodd"/></svg></section>
- <section class="card"><h2>盲推 IDS 根分区</h2><svg viewBox="0 0 100 100">{colored}<g class="cut">{cut_line}</g></svg></section>
+ <section class="card"><h2>盲推 IDS 递归分区</h2><svg viewBox="0 0 100 100">{colored}<g class="cut">{cut_line}</g></svg><p>{legend}</p></section>
  <section class="card"><h2>事后人工真值轮廓</h2><svg viewBox="0 0 100 100"><path d="{source_path}" fill="#cbd5e1" fill-rule="evenodd"/>{truth}</svg></section>
 </div>
-<section class="card"><h2>结果</h2><p>{metrics}</p><p class="note">人工标注只在盲推完成后用于评分和红色虚线叠加，不进入求解目标。</p></section>
+<section class="card"><h2>结果</h2><p><strong>根层：</strong>{metrics}</p>{recursive_metrics}<p class="note">人工标注只在盲推完成后用于评分和红色虚线叠加，不进入求解目标。</p></section>
 <section class="card"><h2>递归候选程序</h2><ul>{_program_tree(result.program)}</ul></section>
 </html>"""

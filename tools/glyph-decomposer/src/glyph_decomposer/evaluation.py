@@ -8,7 +8,12 @@ from pathlib import Path
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
-from .domain import ComponentProgram, EvaluationEvidence
+from .domain import (
+    ComponentProgram,
+    EvaluationEvidence,
+    RecursiveEvaluationEvidence,
+)
+from .recursive import DecompositionNode
 
 
 def _truth_polygons(path: Path) -> list[tuple[int | None, Polygon]]:
@@ -87,5 +92,66 @@ def evaluate_root_partition(
         classifiedInkRatio=classified_area / source_geometry.area,
         componentAccuracy=correct_area / classified_area,
         childIoUs=(ious[0], ious[1]),
+        mappingMode=mapping_mode,
+    )
+
+
+def evaluate_terminal_partition(
+    source_geometry,
+    terminals: tuple[DecompositionNode, ...],
+    root_axis: str,
+    annotation_path: Path,
+) -> RecursiveEvaluationEvidence:
+    truth = _truth_polygons(annotation_path)
+    labels = {label for label, _ in truth if label is not None}
+    leaf_sets = [set(node.program.leaf_ids()) for node in terminals]
+    if all(leaves & labels for leaves in leaf_sets):
+        groups = [
+            unary_union(
+                [
+                    polygon
+                    for label, polygon in truth
+                    if label is not None and label in leaves
+                ]
+            )
+            for leaves in leaf_sets
+        ]
+        mapping_mode = "terminal-leaf-id"
+    elif len(terminals) == len(truth) == 2:
+        coordinate = (
+            (lambda item: item[1].centroid.x)
+            if root_axis == "x"
+            else (lambda item: item[1].centroid.y)
+        )
+        groups = [polygon for _, polygon in sorted(truth, key=coordinate)]
+        mapping_mode = "spatial-two-component"
+    else:
+        raise ValueError("annotation polygons cannot be mapped to terminal regions")
+
+    truth_ink = [source_geometry.intersection(group) for group in groups]
+    classified = unary_union(truth_ink)
+    classified_area = classified.area
+    if classified_area <= 0:
+        raise ValueError("annotation does not overlap source ink")
+    correct_area = sum(
+        node.geometry.intersection(expected).area
+        for node, expected in zip(terminals, truth_ink)
+    )
+    ious = []
+    for node, expected in zip(terminals, truth_ink):
+        union_area = node.geometry.union(expected).area
+        ious.append(
+            node.geometry.intersection(expected).area / union_area
+            if union_area
+            else 1.0
+        )
+    return RecursiveEvaluationEvidence(
+        truthIsolation=True,
+        terminalCount=len(terminals),
+        classifiedInkRatio=classified_area / source_geometry.area,
+        componentAccuracy=correct_area / classified_area,
+        terminalIoUs=tuple(ious),
+        meanIoU=sum(ious) / len(ious),
+        minimumIoU=min(ious),
         mappingMode=mapping_mode,
     )
