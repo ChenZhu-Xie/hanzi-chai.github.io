@@ -79,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     primitive.add_argument("--candidate-catalog", type=Path, required=True)
     primitive.add_argument("--annotations", type=Path, nargs="+", required=True)
     primitive.add_argument("--size", type=int, default=256)
+    primitive.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".local/glyph-decomposer-cache"),
+        help="versioned cache for PDF, skeleton, distance-field, and leaf pools",
+    )
     primitive.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -93,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             args.candidate_catalog,
             args.annotations,
             size=args.size,
+            cache_dir=args.cache_dir,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(render_primitive_fit_audit(cases), encoding="utf-8")

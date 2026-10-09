@@ -66,16 +66,12 @@ def _endpoint_candidates(
     diverse: bool = False,
 ) -> tuple[Pixel, ...]:
     offsets = tuple(
-        (dy, dx)
-        for dy in (-1, 0, 1)
-        for dx in (-1, 0, 1)
-        if (dy, dx) != (0, 0)
+        (dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)
     )
     critical = [
         pixel
         for pixel in component
-        if sum((pixel[0] + dy, pixel[1] + dx) in component for dy, dx in offsets)
-        != 2
+        if sum((pixel[0] + dy, pixel[1] + dx) in component for dy, dx in offsets) != 2
     ]
     ordered = sorted(
         critical or component,
@@ -139,8 +135,7 @@ def _endpoint_candidates(
             if pixel not in selected
             and all(
                 np.linalg.norm(
-                    np.asarray(_xy(pixel, scale))
-                    - np.asarray(_xy(other, scale))
+                    np.asarray(_xy(pixel, scale)) - np.asarray(_xy(other, scale))
                 )
                 >= separation
                 for other in selected
@@ -153,8 +148,7 @@ def _endpoint_candidates(
             key=lambda item: (
                 -min(
                     np.linalg.norm(
-                        np.asarray(_xy(item, scale))
-                        - np.asarray(_xy(other, scale))
+                        np.asarray(_xy(item, scale)) - np.asarray(_xy(other, scale))
                     )
                     for other in selected
                 ),
@@ -255,9 +249,7 @@ def _single_curve_turn_compatible(
             u * (controls[2] - 2 * controls[1] + controls[0])
             + t * (controls[3] - 2 * controls[2] + controls[1])
         )
-        signed_curvature = float(
-            first[0] * second[1] - first[1] * second[0]
-        )
+        signed_curvature = float(first[0] * second[1] - first[1] * second[0])
         if signed_curvature > tolerance:
             signs.add(1)
         elif signed_curvature < -tolerance:
@@ -277,9 +269,10 @@ def _single_curve_turn_compatible(
         for control in controls[1:3]
     )
     opposite_sides = signed_control_distances[0] * signed_control_distances[1] < 0
-    material_crossing = opposite_sides and min(
-        abs(value) for value in signed_control_distances
-    ) > 0.1 * chord_length
+    material_crossing = (
+        opposite_sides
+        and min(abs(value) for value in signed_control_distances) > 0.1 * chord_length
+    )
     control_polygon_length = float(
         np.linalg.norm(np.diff(controls, axis=0), axis=1).sum()
     )
@@ -311,15 +304,27 @@ def _guided_shortest_paths(
     start: Pixel,
     goals: tuple[Pixel, ...],
     guide_distance: dict[Pixel, float],
+    *,
+    cache: dict | None = None,
+    cache_key: object | None = None,
 ) -> dict[Pixel, tuple[Pixel, ...]]:
-    remaining = set(goals)
-    distance = {start: 0.0}
-    previous: dict[Pixel, Pixel] = {}
-    queue = [(0.0, start)]
+    state = cache.get(cache_key) if cache is not None else None
+    if state is None:
+        distance = {start: 0.0}
+        previous: dict[Pixel, Pixel] = {}
+        queue = [(0.0, start)]
+        settled: set[Pixel] = set()
+        state = (distance, previous, queue, settled)
+        if cache is not None:
+            cache[cache_key] = state
+    else:
+        distance, previous, queue, settled = state
+    remaining = set(goals) - settled
     while queue and remaining:
         cost, point = heapq.heappop(queue)
         if cost != distance.get(point):
             continue
+        settled.add(point)
         remaining.discard(point)
         for neighbour in _pixel_neighbours(point, shape):
             if neighbour not in component:
@@ -448,6 +453,7 @@ def enumerate_primitive_routes(
     *,
     endpoint_count: int = 7,
     leaf_alignment: LeafAlignment | None = None,
+    shortest_path_cache: dict | None = None,
 ) -> tuple[PrimitiveRoute, ...]:
     """Enumerate a small, deterministic route set without annotation truth."""
     scale = 100.0 / skeleton.shape[0]
@@ -484,9 +490,7 @@ def enumerate_primitive_routes(
     interior_contact = _has_interior_same_leaf_contact(candidate, stroke)
     effective_endpoint_count = (
         max(endpoint_count, 11)
-        if leaf_stroke_count >= 5
-        and stroke.feature == "点"
-        and interior_contact
+        if leaf_stroke_count >= 5 and stroke.feature == "点" and interior_contact
         else endpoint_count
     )
     stroke_evidence = min(1.0, max(0.0, (leaf_stroke_count - 2) / 3))
@@ -533,6 +537,12 @@ def enumerate_primitive_routes(
                 start,
                 ends,
                 guide_distance,
+                cache=shortest_path_cache,
+                cache_key=(
+                    component,
+                    start,
+                    tuple(float(value) for value in aligned.ravel()),
+                ),
             ).items()
         }
         for start, end in product(starts, ends):
@@ -624,8 +634,10 @@ def route_truth_distance(route: PrimitiveRoute, truth_points) -> float:
 
 @cache
 def _route_moments(pixels: tuple[Pixel, ...]) -> tuple[int, float, float]:
-    return len(pixels), sum(pixel[1] for pixel in pixels), sum(
-        pixel[0] for pixel in pixels
+    return (
+        len(pixels),
+        sum(pixel[1] for pixel in pixels),
+        sum(pixel[0] for pixel in pixels),
     )
 
 
@@ -637,8 +649,7 @@ def _ids_structure_specs(
     def visit(node: CandidateComponent):
         pairs = (
             ((node.operator, node.children[0], node.children[1]),)
-            if len(node.children) == 2
-            and node.operator in {"⿰", "⿱", "⿸", "⿹"}
+            if len(node.children) == 2 and node.operator in {"⿰", "⿱", "⿸", "⿹"}
             else tuple(
                 (
                     "⿰" if node.operator == "⿲" else "⿱",
@@ -687,15 +698,17 @@ def _ids_structure_cost(
     total_count = sum(item[0] for item in all_moments)
     if not total_count:
         return 0.0
-    all_x = [pixel[1] for route in selected for pixel in (route.pixels[0], route.pixels[-1])]
-    all_y = [pixel[0] for route in selected for pixel in (route.pixels[0], route.pixels[-1])]
+    all_x = [
+        pixel[1] for route in selected for pixel in (route.pixels[0], route.pixels[-1])
+    ]
+    all_y = [
+        pixel[0] for route in selected for pixel in (route.pixels[0], route.pixels[-1])
+    ]
     width = max(max(all_x) - min(all_x), 1)
     height = max(max(all_y) - min(all_y), 1)
     cost = 0.0
     for operator, first_indices, second_indices in specs:
-        first_count, first_x_sum, first_y_sum = _selected_moments(
-            first_indices, routes
-        )
+        first_count, first_x_sum, first_y_sum = _selected_moments(first_indices, routes)
         second_count, second_x_sum, second_y_sum = _selected_moments(
             second_indices, routes
         )
@@ -818,9 +831,7 @@ def select_joint_routes(
                     else 0.0
                 )
                 new_relation_cost = (
-                    _new_stroke_relation_cost(
-                        candidate, routes, route, relation_cache
-                    )
+                    _new_stroke_relation_cost(candidate, routes, route, relation_cache)
                     if candidate is not None
                     else 0.0
                 )

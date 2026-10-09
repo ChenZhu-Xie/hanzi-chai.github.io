@@ -62,6 +62,8 @@ def refine_suspicious_leaf_alignments(
     candidate: CandidateGraph,
     pools: dict[tuple[int, ...], tuple[LeafAlignment, ...]],
     solution: JointLeafAlignmentSolution,
+    *,
+    shortest_path_cache: dict | None = None,
 ) -> tuple[dict[tuple[int, ...], LeafAlignment], tuple[LeafRouteRefinement, ...]]:
     """Validate suspicious shrunken leaves using cheap, real stroke routing."""
     selected = {item.component_path: item for item in solution.alignments}
@@ -74,9 +76,7 @@ def refine_suspicious_leaf_alignments(
             continue
         shortlist = _refinement_shortlist(pools[path], original)
         scored = []
-        baseline_structure = alignment_ids_cost(
-            candidate, tuple(selected.values())
-        )
+        baseline_structure = alignment_ids_cost(candidate, tuple(selected.values()))
         for alignment in shortlist:
             proposed_alignments = tuple(
                 alignment if selected_path == path else item
@@ -95,6 +95,7 @@ def refine_suspicious_leaf_alignments(
                     stroke,
                     endpoint_count=2,
                     leaf_alignment=alignment,
+                    shortest_path_cache=shortest_path_cache,
                 )
                 for stroke in strokes
             )

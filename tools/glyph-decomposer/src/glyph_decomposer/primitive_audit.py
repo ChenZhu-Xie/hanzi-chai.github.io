@@ -8,8 +8,15 @@ from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 from scipy.optimize import linear_sum_assignment
 
+from .audit_cache import (
+    PrimitiveAuditCache,
+    array_identity,
+    file_identity,
+    stable_key,
+)
 from .candidate_graph import (
     CandidateGraph,
     compile_candidate_graph,
@@ -202,9 +209,8 @@ def _leaf_stroke_order_issues(
     def directed_cost(first: np.ndarray, second: np.ndarray) -> float:
         first = resample_polyline(first, 41)
         second = resample_polyline(second, 41)
-        endpoint = (
-            np.linalg.norm(first[0] - second[0])
-            + np.linalg.norm(first[-1] - second[-1])
+        endpoint = np.linalg.norm(first[0] - second[0]) + np.linalg.norm(
+            first[-1] - second[-1]
         )
         return symmetric_chamfer(first, second) + 0.5 * endpoint
 
@@ -272,34 +278,24 @@ def _adaptive_leaf_alignment_solution(
     *,
     ids_trigger: float = 0.12,
     local_score_trigger: float = 2.5,
+    search=None,
 ):
     """Expand only ambiguous leaf pools when the recursive IDS solve is strained."""
     if solution is None or solution.ids_structure_cost <= ids_trigger:
         return pools, solution, ()
+    search = search or search_leaf_alignments
     selected = {item.component_path: item for item in solution.alignments}
     suspicious = sorted(
-        (
-            path
-            for path, item in selected.items()
-            if item.score >= local_score_trigger
-        ),
+        (path for path, item in selected.items() if item.score >= local_score_trigger),
         key=lambda path: (-len(path), -selected[path].score, path),
     )
     working = dict(pools)
     best = solution
     refinements = []
     for path in suspicious:
-        expanded = search_leaf_alignments(
-            skeleton,
-            candidate,
-            path,
-            count=400,
-            allow_extreme_scales=True,
-        )
+        expanded = search(path, count=400, allow_extreme_scales=True)
         trial_pools = {**working, path: expanded}
-        trial = select_joint_leaf_alignments(
-            trial_pools, candidate, skeleton=skeleton
-        )
+        trial = select_joint_leaf_alignments(trial_pools, candidate, skeleton=skeleton)
         accepted = trial is not None and trial.score < best.score - 1e-9
         refinements.append(
             {
@@ -327,11 +323,17 @@ def build_primitive_fit_cases(
     annotation_paths: list[Path],
     *,
     size: int = 256,
+    cache_dir: Path | None = None,
 ) -> list[dict]:
     """Fit first, then load directed truth solely for held-out evaluation."""
     cells = parse_cells(bbox_path)
     repository = GlyphRepository.load(glyph_data_path)
     catalog = json.loads(candidate_catalog_path.read_text(encoding="utf-8"))
+    cache = PrimitiveAuditCache(cache_dir) if cache_dir is not None else None
+    pdf_identity = file_identity(pdf_path)
+    module_dir = Path(__file__).parent
+    skeleton_algorithm_identity = file_identity(module_dir / "skeleton.py")
+    leaf_algorithm_identity = file_identity(module_dir / "leaf_alignment.py")
     pages: dict[int, str] = {}
     cases = []
     for annotation_path in annotation_paths:
@@ -346,34 +348,115 @@ def build_primitive_fit_cases(
         candidate_id = int(metadata["candidateGlyphId"])
         cell = find_cell(cells, codepoint, source)
         if cell.page not in pages:
-            pages[cell.page] = export_page_svg(pdf_path, cell.page)
+            if cache is None:
+                pages[cell.page] = export_page_svg(pdf_path, cell.page)
+            else:
+                page_key = stable_key(pdf_identity, cell.page)
+                pages[cell.page] = cache.text(
+                    "page-svg",
+                    page_key,
+                    lambda page=cell.page: export_page_svg(pdf_path, page),
+                )
         geometry = extract_cell_geometry(pages[cell.page], cell)
-        ink, skeleton = generate_skeleton(geometry, size)
+        if cache is None:
+            ink, skeleton = generate_skeleton(geometry, size)
+        else:
+            skeleton_key = stable_key(
+                pdf_identity,
+                cell.page,
+                cell.unicode,
+                cell.source,
+                cell.bbox,
+                size,
+                skeleton_algorithm_identity,
+            )
+            ink, skeleton = cache.arrays(
+                "skeleton",
+                skeleton_key,
+                lambda geometry=geometry: generate_skeleton(geometry, size),
+            )
+            ink = ink.astype(bool, copy=False)
+            skeleton = skeleton.astype(bool, copy=False)
+        skeleton_identity = array_identity(skeleton)
+        if cache is None:
+            distance_field = distance_transform_edt(~skeleton, return_indices=True)
+        else:
+            distance_key = stable_key(skeleton_identity)
+            distance_field = cache.arrays(
+                "distance-field",
+                distance_key,
+                lambda skeleton=skeleton: distance_transform_edt(
+                    ~skeleton, return_indices=True
+                ),
+            )
         topology_certificate = certify_skeleton(ink, skeleton)
         multiscale_certificate = certify_multiscale(geometry)
         candidate = _compile_audit_candidate(
             repository, catalog, codepoint, candidate_id
         )
+        candidate_identity = stable_key(repr(candidate))
+
+        def search_pool(
+            path,
+            *,
+            count,
+            allow_extreme_scales=False,
+            skeleton=skeleton,
+            candidate=candidate,
+            distance_field=distance_field,
+            skeleton_identity=skeleton_identity,
+            candidate_identity=candidate_identity,
+        ):
+            def produce():
+                return search_leaf_alignments(
+                    skeleton,
+                    candidate,
+                    path,
+                    count=count,
+                    allow_extreme_scales=allow_extreme_scales,
+                    distance_field=distance_field,
+                )
+
+            if cache is None:
+                return produce()
+            key = stable_key(
+                skeleton_identity,
+                candidate_identity,
+                leaf_algorithm_identity,
+                path,
+                count,
+                allow_extreme_scales,
+            )
+            return cache.object("leaf-pool", key, produce)
+
         # Blind boundary: every fit is frozen before the annotation paths load.
         blind_fits = []
         fit_failures = []
         leaf_paths = sorted({stroke.component_path for stroke in candidate.strokes})
         leaf_alignment_pools = {
-            path: search_leaf_alignments(skeleton, candidate, path, count=128)
-            for path in leaf_paths
+            path: search_pool(path, count=128) for path in leaf_paths
         }
         leaf_solution = select_joint_leaf_alignments(
             leaf_alignment_pools, candidate, skeleton=skeleton
         )
         leaf_alignment_pools, leaf_solution, pool_refinements = (
             _adaptive_leaf_alignment_solution(
-                skeleton, candidate, leaf_alignment_pools, leaf_solution
+                skeleton,
+                candidate,
+                leaf_alignment_pools,
+                leaf_solution,
+                search=search_pool,
             )
         )
+        shortest_path_cache = {}
         if leaf_solution:
             selected_leaf_alignments, leaf_refinements = (
                 refine_suspicious_leaf_alignments(
-                    skeleton, candidate, leaf_alignment_pools, leaf_solution
+                    skeleton,
+                    candidate,
+                    leaf_alignment_pools,
+                    leaf_solution,
+                    shortest_path_cache=shortest_path_cache,
                 )
             )
         else:
@@ -384,6 +467,7 @@ def build_primitive_fit_cases(
                 candidate,
                 stroke,
                 leaf_alignment=selected_leaf_alignments.get(stroke.component_path),
+                shortest_path_cache=shortest_path_cache,
             )
             for stroke in candidate.strokes
         )
@@ -446,7 +530,10 @@ def build_primitive_fit_cases(
             )
 
         skeleton_xy = np.asarray(
-            [((x + 0.5) * 100 / size, (y + 0.5) * 100 / size) for y, x in np.argwhere(skeleton)]
+            [
+                ((x + 0.5) * 100 / size, (y + 0.5) * 100 / size)
+                for y, x in np.argwhere(skeleton)
+            ]
         )
         fit_polylines = [
             np.asarray(item["fittedPath"], dtype=float) for item in blind_fits
@@ -673,6 +760,10 @@ render();
 def render_primitive_fit_audit(cases: list[dict]) -> str:
     if not cases:
         raise ValueError("no primitive-fit cases")
-    return _TEMPLATE.replace(
-        "__DATA__", json.dumps(cases, ensure_ascii=False, separators=(",", ":"))
-    ) + _ORACLE_ENHANCEMENT + _OVERVIEW_ENHANCEMENT
+    return (
+        _TEMPLATE.replace(
+            "__DATA__", json.dumps(cases, ensure_ascii=False, separators=(",", ":"))
+        )
+        + _ORACLE_ENHANCEMENT
+        + _OVERVIEW_ENHANCEMENT
+    )

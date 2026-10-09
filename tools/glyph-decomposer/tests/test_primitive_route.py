@@ -8,6 +8,7 @@ from glyph_decomposer.primitive_fit import FittedPrimitive, FittedStroke
 from glyph_decomposer.primitive_route import (
     PrimitiveRoute,
     _endpoint_candidates,
+    _guided_shortest_paths,
     _single_curve_direction_compatible,
     _single_curve_turn_compatible,
     enumerate_primitive_routes,
@@ -53,9 +54,7 @@ def test_single_curve_direction_is_a_hard_stroke_grammar_constraint():
     grammar = canonical_stroke_grammar("点", ("c",))
     candidate = ((10, 10), (10, 20))
 
-    assert _single_curve_direction_compatible(
-        ((10, 10), (7, 20)), grammar, candidate
-    )
+    assert _single_curve_direction_compatible(((10, 10), (7, 20)), grammar, candidate)
     assert not _single_curve_direction_compatible(
         ((17, 10), (10, 15)), grammar, candidate
     )
@@ -498,3 +497,38 @@ def test_joint_selection_preserves_same_leaf_intersection_position():
     assert solution is not None
     assert solution.routes[1].pixels == horizontal(50).pixels
     assert solution.stroke_relation_cost < 0.1
+
+
+def test_guided_shortest_path_search_continues_from_cached_frontier():
+    component = frozenset((y, x) for y in range(7) for x in range(7))
+    guide = {point: float(abs(point[0] - point[1])) for point in component}
+    cache = {}
+
+    first = _guided_shortest_paths(
+        component,
+        (7, 7),
+        (0, 0),
+        ((2, 2),),
+        guide,
+        cache=cache,
+        cache_key="same-stroke-and-guide",
+    )
+    continued = _guided_shortest_paths(
+        component,
+        (7, 7),
+        (0, 0),
+        ((2, 2), (6, 6)),
+        guide,
+        cache=cache,
+        cache_key="same-stroke-and-guide",
+    )
+    cold = _guided_shortest_paths(
+        component,
+        (7, 7),
+        (0, 0),
+        ((2, 2), (6, 6)),
+        guide,
+    )
+
+    assert first[(2, 2)] == cold[(2, 2)]
+    assert continued == cold

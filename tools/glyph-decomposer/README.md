@@ -66,6 +66,27 @@ continuity. This solves the undirected centreline problem. Stroke order,
 pen-down/pen-up direction and the correct continuation through an intersection
 remain a separate constrained graph-decomposition problem.
 
+The primitive-fit audit caches only deterministic, derived intermediates:
+
+```powershell
+uv run glyph-decomposer primitive-fit-audit `
+  --pdf <U4E00.pdf> `
+  --bbox-cache <U4E00-bbox.html> `
+  --glyph-data <glyphs.json> `
+  --candidate-catalog <review-catalog.json> `
+  --annotations <annotation.json> [<annotation.json> ...] `
+  --cache-dir <local-cache-directory> `
+  --output <review.html>
+```
+
+The cache stores page SVG, skeleton/ink arrays, skeleton distance fields and
+leaf-alignment pools. Keys include source-file identities, candidate content,
+canvas size and the relevant algorithm module identity; an input or algorithm
+change therefore creates a new entry instead of silently reusing stale work.
+The default directory is `.local/glyph-decomposer-cache`, which is local-only
+and must not be committed. Pickle files below that private directory are
+trusted derived artifacts, not portable input data.
+
 The next matcher treats every proposed logical cut as an explicit hypothesis.
 The unchanged/no-cut graph is always retained as the baseline; a cut may be
 accepted automatically only when complete downstream stroke coverage improves

@@ -91,7 +91,9 @@ def _hypothesis_bounds(
     )
 
 
-def _inside_canvas(bounds: tuple[float, float, float, float], margin: float = 3) -> bool:
+def _inside_canvas(
+    bounds: tuple[float, float, float, float], margin: float = 3
+) -> bool:
     return (
         bounds[0] >= -margin
         and bounds[1] >= -margin
@@ -123,6 +125,7 @@ def search_leaf_alignments(
     *,
     count: int = 8,
     allow_extreme_scales: bool = False,
+    distance_field: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[LeafAlignment, ...]:
     """Find leaf-local affine placements without reading annotation truth.
 
@@ -136,12 +139,18 @@ def search_leaf_alignments(
     span = np.maximum(point_maximum - point_minimum, 1e-6)
     normalized = (points - point_minimum) / span
     aligned = _align_points(
-        tuple(map(tuple, points)), _candidate_bounds(candidate), _skeleton_bounds(skeleton)
+        tuple(map(tuple, points)),
+        _candidate_bounds(candidate),
+        _skeleton_bounds(skeleton),
     )
     minimum = aligned.min(axis=0)
     maximum = aligned.max(axis=0)
     base = (float(minimum[0]), float(minimum[1]), float(maximum[0]), float(maximum[1]))
-    distances, nearest = distance_transform_edt(~skeleton, return_indices=True)
+    distances, nearest = (
+        distance_field
+        if distance_field is not None
+        else distance_transform_edt(~skeleton, return_indices=True)
+    )
     scales = (
         (0.4, 0.5, 0.6, 0.8, 1.0, 1.3, 1.7, 2.2, 2.8, 3.5)
         if allow_extreme_scales
@@ -223,8 +232,7 @@ def _alignment_ids_specs(candidate: CandidateGraph, leaf_paths):
     def visit(node):
         pairs = (
             ((node.operator, node.children[0], node.children[1]),)
-            if len(node.children) == 2
-            and node.operator in {"⿰", "⿱", "⿸", "⿹"}
+            if len(node.children) == 2 and node.operator in {"⿰", "⿱", "⿸", "⿹"}
             else tuple(
                 (
                     "⿰" if node.operator == "⿲" else "⿱",
@@ -308,9 +316,7 @@ def _alignment_ids_cost(specs, selected: tuple[LeafAlignment, ...]) -> float:
             """
             first_start, first_end = first_interval
             second_start, second_end = second_interval
-            union_span = max(first_end, second_end) - min(
-                first_start, second_start
-            )
+            union_span = max(first_end, second_end) - min(first_start, second_start)
             if union_span <= 1e-6:
                 return 0.0
             first_center = (first_start + first_end) / 2
@@ -319,7 +325,9 @@ def _alignment_ids_cost(specs, selected: tuple[LeafAlignment, ...]) -> float:
                 0.0,
                 max(first_start, second_start) - min(first_end, second_end),
             )
-            return 0.5 * abs(first_center - second_center) / union_span + gap / union_span
+            return (
+                0.5 * abs(first_center - second_center) / union_span + gap / union_span
+            )
 
         def ordered_axis_overlap(
             first_interval: tuple[float, float],
@@ -369,12 +377,8 @@ def _alignment_ids_cost(specs, selected: tuple[LeafAlignment, ...]) -> float:
             tolerance = 3.0
             cost += max(0.0, first_bounds[0] - second_bounds[0]) / 100
             cost += max(0.0, first_bounds[1] - second_bounds[1]) / 100
-            cost += max(
-                0.0, second_bounds[2] - first_bounds[2] - tolerance
-            ) / 100
-            cost += max(
-                0.0, second_bounds[3] - first_bounds[3] - tolerance
-            ) / 100
+            cost += max(0.0, second_bounds[2] - first_bounds[2] - tolerance) / 100
+            cost += max(0.0, second_bounds[3] - first_bounds[3] - tolerance) / 100
         elif operator == "⿹":
             # Upper-right enclosure: the first child is the frame. The inner
             # child must lie below its top and left of its right edge. Bottom
@@ -383,9 +387,7 @@ def _alignment_ids_cost(specs, selected: tuple[LeafAlignment, ...]) -> float:
             cost += max(0.0, first_y - second_y + 1.0) / 100
             cost += max(0.0, second_x - first_x + 1.0) / 100
             cost += max(0.0, first_bounds[1] - second_bounds[1]) / 100
-            cost += max(
-                0.0, second_bounds[2] - first_bounds[2] - tolerance
-            ) / 100
+            cost += max(0.0, second_bounds[2] - first_bounds[2] - tolerance) / 100
     return cost
 
 
@@ -445,10 +447,19 @@ def select_joint_leaf_alignments(
     is only activated for gross subset matches, preserving optical whitespace
     in otherwise valid recursive layouts.
     """
-    if not alignments_by_path or any(not items for items in alignments_by_path.values()):
+    if not alignments_by_path or any(
+        not items for items in alignments_by_path.values()
+    ):
         return None
     paths = tuple(sorted(alignments_by_path))
     specs = _alignment_ids_specs(candidate, paths)
+    path_order = {path: index for index, path in enumerate(paths)}
+    specs_by_completion_path: dict[tuple[int, ...], list] = {path: [] for path in paths}
+    for spec in specs:
+        _operator, first_paths, second_paths = spec
+        relation_paths = first_paths | second_paths
+        completion_path = max(relation_paths, key=path_order.__getitem__)
+        specs_by_completion_path[completion_path].append(spec)
     target_bounds = _skeleton_bounds(skeleton) if skeleton is not None else None
 
     def solve(envelope_penalty: float) -> JointLeafAlignmentSolution:
@@ -456,14 +467,16 @@ def select_joint_leaf_alignments(
         states = [(0.0, (), frozenset(), 0, 0.0)]
         for path in paths:
             expanded = []
-            for score, selected, occupied, repeated, _structure in states:
+            for score, selected, occupied, repeated, previous_structure in states:
                 for alignment in alignments_by_path[path]:
                     claims = frozenset(alignment.claimed_pixels)
                     overlap = len(claims & occupied)
                     charged_overlap = max(0, overlap - free_contact_claims)
                     new_claims = len(claims - occupied)
                     proposed_selected = (*selected, alignment)
-                    structure = _alignment_ids_cost(specs, proposed_selected)
+                    structure = previous_structure + _alignment_ids_cost(
+                        tuple(specs_by_completion_path[path]), proposed_selected
+                    )
                     envelope = (
                         _global_envelope_cost(proposed_selected, target_bounds)
                         if target_bounds is not None
@@ -508,6 +521,9 @@ def select_joint_leaf_alignments(
     ordinary = solve(0.0)
     if target_bounds is None or global_envelope_penalty <= 0:
         return ordinary
-    if _global_envelope_cost(ordinary.alignments, target_bounds) <= global_envelope_trigger:
+    if (
+        _global_envelope_cost(ordinary.alignments, target_bounds)
+        <= global_envelope_trigger
+    ):
         return ordinary
     return solve(global_envelope_penalty)
