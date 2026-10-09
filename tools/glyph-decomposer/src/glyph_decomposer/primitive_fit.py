@@ -83,9 +83,20 @@ def _parameterize(points: np.ndarray) -> np.ndarray:
 
 
 def _fit_line(points: np.ndarray, command: str, start: int, end: int):
-    controls = (tuple(points[0]), tuple(points[-1]))
-    t = _parameterize(points)[:, None]
-    prediction = points[0] * (1 - t) + points[-1] * t
+    # A line primitive represents the complete directed pen backbone, not a
+    # chord aimed from one calligraphic spur to another.  Total least squares
+    # keeps exactly two controls while allowing a short serif at either end to
+    # contribute ink without rotating the whole backbone towards that serif.
+    centre = points.mean(axis=0)
+    _u, _singular, vectors = np.linalg.svd(points - centre, full_matrices=False)
+    axis = vectors[0]
+    if float(np.dot(axis, points[-1] - points[0])) < 0:
+        axis = -axis
+    parameters = (points - centre) @ axis
+    first = centre + float(parameters.min()) * axis
+    last = centre + float(parameters.max()) * axis
+    controls = (tuple(first), tuple(last))
+    prediction = centre + parameters[:, None] * axis
     error = float(np.sum((points - prediction) ** 2))
     return FittedPrimitive(
         command,

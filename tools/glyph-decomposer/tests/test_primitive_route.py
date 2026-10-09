@@ -8,9 +8,11 @@ from glyph_decomposer.primitive_fit import FittedPrimitive, FittedStroke
 from glyph_decomposer.primitive_route import (
     PrimitiveRoute,
     _endpoint_candidates,
+    _endpoint_contact_permissions,
     _guided_shortest_paths,
     _single_curve_direction_compatible,
     _single_curve_turn_compatible,
+    _single_line_direction_compatible,
     enumerate_primitive_routes,
     select_joint_routes,
 )
@@ -50,6 +52,57 @@ def test_endpoint_candidates_reserve_spatially_diverse_modes():
     assert any(x >= 70 for _y, x in selected)
 
 
+def test_endpoint_candidates_always_reserve_real_skeleton_terminals():
+    component = frozenset(
+        {(10, x) for x in range(2, 22)}
+        | {(y, 12) for y in range(4, 17)}
+        | {(y, 15) for y in range(5, 16)}
+    )
+
+    selected = _endpoint_candidates(
+        component, np.asarray((5.0, 10.0)), 1.0, count=1
+    )
+
+    assert (10, 2) in selected
+
+
+def test_cross_leaf_exact_contact_permits_a_stroke_endpoint():
+    records = [
+        {
+            "id": 1,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "横",
+                    "start": [10, 50],
+                    "curveList": [{"command": "h", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 2,
+            "type": "component",
+            "strokes": [
+                {
+                    "feature": "横",
+                    "start": [0, 50],
+                    "curveList": [{"command": "h", "parameterList": [90]}],
+                }
+            ],
+        },
+        {
+            "id": 3,
+            "type": "compound",
+            "operator": "⿰",
+            "references": [{"id": 1}, {"id": 2}],
+        },
+    ]
+    graph = compile_candidate_graph(GlyphRepository(records), 3)
+
+    assert _endpoint_contact_permissions(graph, graph.strokes[0]) == (False, True)
+    assert _endpoint_contact_permissions(graph, graph.strokes[1]) == (True, False)
+
+
 def test_single_curve_direction_is_a_hard_stroke_grammar_constraint():
     grammar = canonical_stroke_grammar("点", ("c",))
     candidate = ((10, 10), (10, 20))
@@ -61,6 +114,13 @@ def test_single_curve_direction_is_a_hard_stroke_grammar_constraint():
     assert not _single_curve_direction_compatible(
         ((10, 10), (2, 20)), grammar, candidate, minimum_cosine=0.85
     )
+
+
+def test_single_line_direction_is_a_hard_stroke_grammar_constraint():
+    grammar = canonical_stroke_grammar("横", ("h",))
+
+    assert _single_line_direction_compatible(((10, 10), (90, 14)), grammar)
+    assert not _single_line_direction_compatible(((10, 30), (25, 10)), grammar)
 
 
 def _cubic_fit(controls):
@@ -316,6 +376,63 @@ def test_joint_selection_rejects_globally_useful_but_locally_bad_route():
     assert solution.routes[1].pixels == duplicate.pixels
 
 
+def test_joint_selection_prefers_complete_endpoints_before_local_fit_score():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "竖",
+                            "start": [50, 10],
+                            "curveList": [{"command": "v", "parameterList": [80]}],
+                        }
+                    ],
+                }
+            ]
+        ),
+        1,
+    )
+    skeleton = np.zeros((101, 101), dtype=bool)
+    skeleton[10:91, 50] = True
+    template = enumerate_primitive_routes(skeleton, graph, graph.strokes[0])[0]
+    clipped = PrimitiveRoute(
+        0,
+        tuple((y, 50) for y in range(50, 91)),
+        template.fit,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        2,
+        endpoint_completion_violations=1,
+    )
+    complete = PrimitiveRoute(
+        0,
+        tuple((y, 50) for y in range(10, 91)),
+        template.fit,
+        5.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        2,
+        endpoint_completion_violations=0,
+    )
+
+    solution = select_joint_routes(((clipped, complete),), int(skeleton.sum()))
+
+    assert solution is not None
+    assert solution.routes[0].pixels == complete.pixels
+
+
 def test_joint_selection_locks_local_winner_at_full_placement_confidence():
     graph = compile_candidate_graph(
         GlyphRepository(
@@ -426,6 +543,77 @@ def test_joint_selection_never_reuses_a_long_segment_inside_one_leaf():
     assert solution is not None
     assert solution.routes[1].pixels == locally_worse_but_distinct.pixels
     assert solution.repeated_pixel_count == 0
+
+
+def test_joint_selection_never_reuses_a_long_segment_across_leaves():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [10, 50],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        }
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [10, 50],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        }
+                    ],
+                },
+                {
+                    "id": 3,
+                    "type": "compound",
+                    "operator": "⿱",
+                    "references": [{"id": 1}, {"id": 2}],
+                },
+            ]
+        ),
+        3,
+    )
+    skeleton = np.zeros((20, 20), dtype=bool)
+    skeleton[5, 1:11] = True
+    skeleton[12, 1:11] = True
+    template = enumerate_primitive_routes(skeleton, graph, graph.strokes[0])[0]
+
+    def route(index, pixels, score):
+        return PrimitiveRoute(
+            index,
+            tuple(pixels),
+            template.fit,
+            score,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            2,
+        )
+
+    first = route(0, tuple((5, x) for x in range(1, 11)), 1.0)
+    cross_leaf_retrace = route(1, first.pixels, 1.0)
+    distinct = route(1, tuple((12, x) for x in range(1, 11)), 4.0)
+
+    solution = select_joint_routes(
+        ((first,), (cross_leaf_retrace, distinct)),
+        int(skeleton.sum()),
+        candidate=graph,
+        free_contact_pixels=0,
+    )
+
+    assert solution is not None
+    assert solution.routes[1].pixels == distinct.pixels
 
 
 def test_joint_selection_returns_none_when_a_leaf_can_only_retrace_itself():
@@ -590,7 +778,7 @@ def test_joint_selection_preserves_same_leaf_intersection_position():
         )
 
     solution = select_joint_routes(
-        ((first,), (horizontal(85), horizontal(50))),
+        ((first,), (horizontal(85, 1.0), horizontal(50, 5.0))),
         int(skeleton.sum()),
         candidate=graph,
         free_contact_pixels=0,

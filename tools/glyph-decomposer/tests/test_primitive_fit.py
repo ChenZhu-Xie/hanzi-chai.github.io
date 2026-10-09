@@ -25,6 +25,17 @@ def test_horizontal_uses_one_line_and_two_points():
     assert fit.rmse < 1e-9
 
 
+def test_line_fit_keeps_the_full_stroke_span_without_aiming_at_a_start_spur():
+    route = [(2, 0), (1, 0), (0, 0), *[(0, y) for y in range(1, 11)]]
+
+    fit = fit_stroke_primitives(route, ("v",), [(0, 0), (0, 10)])
+
+    assert fit.control_point_count == 2
+    assert abs(fit.fitted_path[0][0]) < 0.75
+    assert abs(fit.fitted_path[-1][0]) < 0.75
+    assert fit.fitted_path[-1][1] - fit.fitted_path[0][1] > 9.5
+
+
 def test_cubic_uses_exactly_four_control_points():
     route = _cubic(((5, 5), (10, 60), (70, 90), (95, 20)))
 

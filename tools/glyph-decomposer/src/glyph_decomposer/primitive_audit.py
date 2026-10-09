@@ -622,6 +622,11 @@ def build_primitive_fit_cases(
                 stroke,
                 leaf_alignment=selected_leaf_alignments.get(stroke.component_path),
                 shortest_path_cache=shortest_path_cache,
+                competing_bounds=tuple(
+                    alignment.bounds
+                    for path, alignment in selected_leaf_alignments.items()
+                    if path != stroke.component_path
+                ),
             )
             for stroke in candidate.strokes
         )
@@ -697,6 +702,10 @@ def build_primitive_fit_cases(
                     "directionCost": route.direction_cost,
                     "regionCost": route.region_cost,
                     "placementConfidence": route.placement_confidence,
+                    "endpointCompletionViolations": (
+                        route.endpoint_completion_violations
+                    ),
+                    "endpointCompletionCost": route.endpoint_completion_cost,
                 }
             )
 

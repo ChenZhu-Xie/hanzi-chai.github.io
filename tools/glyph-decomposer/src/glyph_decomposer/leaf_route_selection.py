@@ -164,6 +164,11 @@ def refine_suspicious_leaf_alignments(
                     endpoint_count=2,
                     leaf_alignment=alignment,
                     shortest_path_cache=shortest_path_cache,
+                    competing_bounds=tuple(
+                        item.bounds
+                        for selected_path, item in selected.items()
+                        if selected_path != path
+                    ),
                 )
                 for stroke in strokes
             )
@@ -299,6 +304,11 @@ def refine_low_confidence_leaf_routes(
                     stroke,
                     leaf_alignment=alignment,
                     shortest_path_cache=shortest_path_cache,
+                    competing_bounds=tuple(
+                        item.bounds
+                        for selected_path, item in current_alignments.items()
+                        if selected_path != path
+                    ),
                 )
                 alternatives = tuple(
                     route

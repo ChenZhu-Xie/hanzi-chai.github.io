@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from collections import deque
 from dataclasses import dataclass
 from functools import cache
 from itertools import product
@@ -39,6 +40,8 @@ class PrimitiveRoute:
     region_cost: float
     placement_confidence: float
     alternative_count: int
+    endpoint_completion_violations: int = 0
+    endpoint_completion_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,54 @@ def _endpoint_candidates(
             pixel,
         ),
     )
+
+    terminals = tuple(
+        sorted(
+            (
+                pixel
+                for pixel in component
+                if sum(
+                    (pixel[0] + dy, pixel[1] + dx) in component
+                    for dy, dx in offsets
+                )
+                <= 1
+            ),
+            key=lambda pixel: (
+                float(np.linalg.norm(np.asarray(_xy(pixel, scale)) - target)),
+                pixel,
+            ),
+        )
+    )
+
+    def reserve_terminals(selected: list[Pixel], reserve: int = 2) -> tuple[Pixel, ...]:
+        appended = 0
+        for pixel in terminals:
+            if any(
+                np.linalg.norm(
+                    np.asarray(_xy(pixel, scale)) - np.asarray(_xy(other, scale))
+                )
+                < separation
+                for other in selected
+            ):
+                continue
+            if len(selected) >= count:
+                removable = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, 0, -1)
+                        if selected[index] not in terminals
+                    ),
+                    None,
+                )
+                if removable is None:
+                    continue
+                selected.pop(removable)
+            selected.append(pixel)
+            appended += 1
+            if appended == reserve:
+                break
+        return tuple(selected)
+
     if not diverse:
         selected = []
         for pixel in ordered:
@@ -107,7 +158,7 @@ def _endpoint_candidates(
             for other in selected
         ):
             selected.append(nearest)
-        return tuple(selected)
+        return reserve_terminals(selected)
     separated = []
     for pixel in (nearest, *ordered):
         point = np.asarray(_xy(pixel, scale))
@@ -157,7 +208,7 @@ def _endpoint_candidates(
             ),
         )
         selected.append(pixel)
-    return tuple(selected)
+    return reserve_terminals(selected)
 
 
 def _angle_cost(first: np.ndarray, second: np.ndarray) -> float:
@@ -298,6 +349,98 @@ def _has_interior_same_leaf_contact(
     return False
 
 
+def _single_line_direction_compatible(
+    fitted_path, grammar: StrokeGrammar, *, minimum_cosine: float = 0.90
+) -> bool:
+    """Keep a one-line grammar a line of the candidate's directed kind."""
+    if len(grammar.commands) != 1 or grammar.commands[0] not in {"h", "v"}:
+        return True
+    points = np.asarray(fitted_path, dtype=float)
+    observed = points[-1] - points[0]
+    expected = np.asarray(grammar.direction_vectors[0], dtype=float)
+    denominator = float(np.linalg.norm(observed) * np.linalg.norm(expected))
+    if denominator <= 1e-9:
+        return False
+    return float(np.dot(observed, expected) / denominator) >= minimum_cosine
+
+
+def _endpoint_contact_permissions(
+    candidate: CandidateGraph, stroke: CandidateStroke
+) -> tuple[bool, bool]:
+    """Return whether candidate topology permits contact at either endpoint."""
+    start_contact = end_contact = False
+    for relation in candidate.relations:
+        if not relation.exact_intersection:
+            continue
+        if relation.first_stroke == stroke.index:
+            position = relation.first_position
+        elif relation.second_stroke == stroke.index:
+            position = relation.second_position
+        else:
+            continue
+        start_contact |= position <= 0.12
+        end_contact |= position >= 0.88
+    return start_contact, end_contact
+
+
+def _terminal_distances(component: frozenset[Pixel]) -> dict[Pixel, int]:
+    offsets = tuple(
+        (dy, dx)
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if (dy, dx) != (0, 0)
+    )
+    terminals = tuple(
+        point
+        for point in component
+        if sum(
+            (point[0] + dy, point[1] + dx) in component for dy, dx in offsets
+        )
+        <= 1
+    )
+    distances = {point: 0 for point in terminals}
+    queue = deque(terminals)
+    while queue:
+        point = queue.popleft()
+        for dy, dx in offsets:
+            neighbour = point[0] + dy, point[1] + dx
+            if neighbour not in component or neighbour in distances:
+                continue
+            distances[neighbour] = distances[point] + 1
+            queue.append(neighbour)
+    return distances
+
+
+def _endpoint_completion_measure(
+    component: frozenset[Pixel],
+    route: tuple[Pixel, ...],
+    candidate: CandidateGraph,
+    stroke: CandidateStroke,
+) -> tuple[int, float]:
+    """Count route ends that stop internally without candidate justification.
+
+    This is deliberately categorical rather than another fit weight.  If a
+    terminal-to-terminal realization exists, a shorter internal sub-route may
+    not win merely because it has a smaller RMSE.
+    """
+    permissions = _endpoint_contact_permissions(candidate, stroke)
+    distances = _terminal_distances(component)
+    violations = 0
+    completion_cost = 0.0
+    for endpoint, contact_permitted in zip(
+        (route[0], route[-1]), permissions, strict=True
+    ):
+        if contact_permitted:
+            continue
+        distance = distances.get(endpoint, len(component))
+        completion_cost += distance
+        # Five 256-grid pixels is about 2% of an em: enough for a serif or
+        # press-lift ornament, but far too short to hide a missing stroke half.
+        if distance > 5:
+            violations += 1
+    return violations, completion_cost
+
+
 def _guided_shortest_paths(
     component: frozenset[Pixel],
     shape: tuple[int, int],
@@ -358,6 +501,7 @@ def _route_score(
     scale: float,
     region_bounds: tuple[float, float, float, float],
     placement_confidence: float,
+    competing_bounds: tuple[tuple[float, float, float, float], ...] | None = None,
 ) -> tuple[float, float, float, float, float, float]:
     route_xy = np.asarray([_xy(pixel, scale) for pixel in route])
     endpoint_cost = float(
@@ -377,7 +521,24 @@ def _route_score(
     x0, y0, x1, y1 = region_bounds
     outside_x = np.maximum(x0 - probes[:, 0], 0) + np.maximum(probes[:, 0] - x1, 0)
     outside_y = np.maximum(y0 - probes[:, 1], 0) + np.maximum(probes[:, 1] - y1, 0)
-    region_cost = float(np.mean(np.hypot(outside_x, outside_y)))
+    outside = np.hypot(outside_x, outside_y)
+    if competing_bounds is not None:
+        # A leaf box is a proposal domain, not a refusal domain.  Ink outside
+        # it remains viable when no other selected leaf claims that space.
+        # Only another leaf's box supplies strong negative evidence.
+        conflicts = np.asarray(
+            [
+                any(
+                    other[0] <= point[0] <= other[2]
+                    and other[1] <= point[1] <= other[3]
+                    for other in competing_bounds
+                )
+                for point in probes
+            ],
+            dtype=bool,
+        )
+        outside = outside * np.where(conflicts, 1.0, 0.1)
+    region_cost = float(np.mean(outside))
     endpoint_weight = 0.05 + 0.23 * placement_confidence
     guide_weight = 0.03 + 0.13 * placement_confidence
     length_weight = 0.5 + 1.5 * placement_confidence
@@ -454,6 +615,7 @@ def enumerate_primitive_routes(
     endpoint_count: int = 7,
     leaf_alignment: LeafAlignment | None = None,
     shortest_path_cache: dict | None = None,
+    competing_bounds: tuple[tuple[float, float, float, float], ...] | None = None,
 ) -> tuple[PrimitiveRoute, ...]:
     """Enumerate a small, deterministic route set without annotation truth."""
     scale = 100.0 / skeleton.shape[0]
@@ -570,6 +732,8 @@ def enumerate_primitive_routes(
                 minimum_cosine=0.85 if interior_contact else 0.80,
             ):
                 continue
+            if not _single_line_direction_compatible(fit.fitted_path, grammar):
+                continue
             if interior_contact and not _single_curve_direction_compatible(
                 fit.fitted_path, grammar, minimum_cosine=0.85
             ):
@@ -584,6 +748,12 @@ def enumerate_primitive_routes(
                 scale,
                 region_bounds,
                 stroke_evidence,
+                competing_bounds,
+            )
+            endpoint_completion_violations, endpoint_completion_cost = (
+                _endpoint_completion_measure(
+                component, route, candidate, stroke
+                )
             )
             alternatives.append(
                 PrimitiveRoute(
@@ -598,6 +768,8 @@ def enumerate_primitive_routes(
                     region,
                     placement_confidence,
                     0,
+                    endpoint_completion_violations,
+                    endpoint_completion_cost,
                 )
             )
     alternatives.sort(key=lambda item: (item.score, item.pixels))
@@ -615,6 +787,8 @@ def enumerate_primitive_routes(
             item.region_cost,
             item.placement_confidence,
             count,
+            item.endpoint_completion_violations,
+            item.endpoint_completion_cost,
         )
         for item in alternatives
     )
@@ -782,6 +956,60 @@ def _new_stroke_relation_cost(
     return cost
 
 
+def _preserves_interior_contact_signature(
+    candidate: CandidateGraph,
+    previous: tuple[PrimitiveRoute, ...],
+    current: PrimitiveRoute,
+    *,
+    endpoint_margin: float = 0.12,
+    observed_contact_distance: float = 3.0,
+) -> bool:
+    """Reject turning a known interior intersection into a stroke endpoint.
+
+    A source font may open a contact that the candidate closes, so a distant
+    nearest approach remains a soft relation.  Once two proposed routes do
+    make contact, however, an intersection known to occur inside a candidate
+    stroke may not migrate to that stroke's start or end just to improve fit.
+    """
+    previous_by_index = {route.stroke_index: route for route in previous}
+    for relation in candidate.relations:
+        if not relation.exact_intersection or not relation.same_leaf_occurrence:
+            continue
+        if relation.second_stroke == current.stroke_index:
+            other = previous_by_index.get(relation.first_stroke)
+            expected_other = relation.first_position
+            expected_current = relation.second_position
+        elif relation.first_stroke == current.stroke_index:
+            other = previous_by_index.get(relation.second_stroke)
+            expected_other = relation.second_position
+            expected_current = relation.first_position
+        else:
+            continue
+        if other is None:
+            continue
+        other_points = np.asarray(other.pixels, dtype=float)
+        current_points = np.asarray(current.pixels, dtype=float)
+        distances = np.linalg.norm(
+            other_points[:, None, :] - current_points[None, :, :], axis=2
+        )
+        other_index, current_index = np.unravel_index(
+            int(np.argmin(distances)), distances.shape
+        )
+        if float(distances[other_index, current_index]) > observed_contact_distance:
+            continue
+        observed_other = other_index / max(len(other_points) - 1, 1)
+        observed_current = current_index / max(len(current_points) - 1, 1)
+        for expected, observed in (
+            (expected_other, observed_other),
+            (expected_current, observed_current),
+        ):
+            if endpoint_margin < expected < 1.0 - endpoint_margin and not (
+                endpoint_margin < observed < 1.0 - endpoint_margin
+            ):
+                return False
+    return True
+
+
 def _longest_shared_run(route: tuple[Pixel, ...], occupied: frozenset[Pixel]) -> int:
     longest = current = 0
     for pixel in route:
@@ -793,19 +1021,14 @@ def _longest_shared_run(route: tuple[Pixel, ...], occupied: frozenset[Pixel]) ->
     return longest
 
 
-def _reuses_same_leaf_segment(
+def _reuses_completed_segment(
     candidate: CandidateGraph,
     selected: tuple[PrimitiveRoute, ...],
     proposed: PrimitiveRoute,
     *,
     maximum_shared_run: int,
 ) -> bool:
-    strokes = {stroke.index: stroke for stroke in candidate.strokes}
-    proposed_stroke = strokes[proposed.stroke_index]
     for route in selected:
-        selected_stroke = strokes[route.stroke_index]
-        if selected_stroke.component_path != proposed_stroke.component_path:
-            continue
         if (
             _longest_shared_run(proposed.pixels, frozenset(route.pixels))
             > maximum_shared_run
@@ -845,11 +1068,31 @@ def select_joint_routes(
     # route score, routes, occupied pixels, repeated count, IDS cost, relation cost
     states = [(0.0, (), frozenset(), 0, 0.0, 0.0)]
     for alternatives in alternatives_by_stroke:
-        placement_confidence = alternatives[0].placement_confidence
+        minimum_completion_violations = min(
+            route.endpoint_completion_violations for route in alternatives
+        )
+        complete_alternatives = tuple(
+            route
+            for route in alternatives
+            if route.endpoint_completion_violations
+            == minimum_completion_violations
+        )
+        minimum_completion_cost = min(
+            route.endpoint_completion_cost for route in complete_alternatives
+        )
+        completion_alternatives = tuple(
+            route
+            for route in complete_alternatives
+            if route.endpoint_completion_cost <= minimum_completion_cost + 4.0
+        )
+        local_winner = min(completion_alternatives, key=lambda route: route.score)
+        placement_confidence = local_winner.placement_confidence
         adaptive_slack = local_score_slack * (1.0 - placement_confidence)
-        local_limit = alternatives[0].score + adaptive_slack
+        local_limit = local_winner.score + adaptive_slack
         eligible_alternatives = tuple(
-            route for route in alternatives if route.score <= local_limit
+            route
+            for route in completion_alternatives
+            if route.score <= local_limit
         )
         expanded = []
         for score, routes, occupied, repeated, _structure, relation_cost in states:
@@ -857,18 +1100,30 @@ def select_joint_routes(
                 route
                 for route in eligible_alternatives
                 if candidate is None
-                or not _reuses_same_leaf_segment(
-                    candidate,
-                    routes,
-                    route,
-                    maximum_shared_run=maximum_same_leaf_shared_run,
+                or (
+                    _preserves_interior_contact_signature(candidate, routes, route)
+                    and not _reuses_completed_segment(
+                        candidate,
+                        routes,
+                        route,
+                        maximum_shared_run=maximum_same_leaf_shared_run,
+                    )
                 )
             )
             if not state_alternatives and candidate is not None:
                 state_alternatives = tuple(
                     route
-                    for route in alternatives
-                    if not _reuses_same_leaf_segment(
+                    for route in sorted(
+                        alternatives,
+                        key=lambda item: (
+                            item.endpoint_completion_violations,
+                            item.endpoint_completion_cost,
+                            item.score,
+                            item.pixels,
+                        ),
+                    )
+                    if _preserves_interior_contact_signature(candidate, routes, route)
+                    and not _reuses_completed_segment(
                         candidate,
                         routes,
                         route,
