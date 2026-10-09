@@ -7,12 +7,17 @@ from glyph_decomposer.leaf_alignment import LeafAlignment
 from glyph_decomposer.primitive_fit import FittedPrimitive, FittedStroke
 from glyph_decomposer.primitive_route import (
     PrimitiveRoute,
+    _complete_terminal_hook,
     _endpoint_candidates,
+    _endpoint_completion_measure,
     _endpoint_contact_permissions,
     _guided_shortest_paths,
+    _prefer_observed_routes,
     _single_curve_direction_compatible,
     _single_curve_turn_compatible,
     _single_line_direction_compatible,
+    _terminal_compound_direction_compatible,
+    _terminal_hook_direction_compatible,
     enumerate_primitive_routes,
     select_joint_routes,
 )
@@ -64,6 +69,40 @@ def test_endpoint_candidates_always_reserve_real_skeleton_terminals():
     )
 
     assert (10, 2) in selected
+
+
+def test_direction_complete_terminal_need_not_be_a_whole_graph_terminal():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [0, 0],
+                            "curveList": [{"command": "h", "parameterList": [10]}],
+                        }
+                    ],
+                }
+            ]
+        ),
+        1,
+    )
+    component = frozenset((10, x) for x in range(2, 23))
+    route = tuple((10, x) for x in range(2, 11))
+
+    assert _endpoint_completion_measure(
+        component, route, graph, graph.strokes[0]
+    ) == (1, 8.0)
+    assert _endpoint_completion_measure(
+        component,
+        route,
+        graph,
+        graph.strokes[0],
+        terminal_direction_complete=True,
+    ) == (0, 0.0)
 
 
 def test_cross_leaf_exact_contact_permits_a_stroke_endpoint():
@@ -121,6 +160,155 @@ def test_single_line_direction_is_a_hard_stroke_grammar_constraint():
 
     assert _single_line_direction_compatible(((10, 10), (90, 14)), grammar)
     assert not _single_line_direction_compatible(((10, 30), (25, 10)), grammar)
+
+
+def _multi_primitive_fit(commands, primitives):
+    route = tuple(
+        point
+        for index, primitive in enumerate(primitives)
+        for point in (primitive.controls if index == 0 else primitive.controls[1:])
+    )
+    return FittedStroke(
+        commands,
+        tuple(primitives),
+        route,
+        route,
+        0.0,
+        0.0,
+        1 + sum(1 if item.kind == "line" else 3 for item in primitives),
+        1.0,
+    )
+
+
+def _line_primitive(command, start, end, index):
+    return FittedPrimitive(
+        command,
+        "line",
+        (start, end),
+        (start, end),
+        index,
+        index + 1,
+        0.0,
+    )
+
+
+def test_horizontal_hook_rejects_a_terminal_that_continues_rightward():
+    grammar = canonical_stroke_grammar("横钩", ("h",))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    real_hook = _line_primitive("l", (10, 0), (7, 4), 1)
+    false_extension = _line_primitive("l", (10, 0), (14, 1), 1)
+
+    assert _terminal_hook_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (horizontal, real_hook)), grammar
+    )
+    assert not _terminal_hook_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (horizontal, false_extension)),
+        grammar,
+    )
+
+
+def test_vertical_bend_hook_requires_an_upward_terminal_tangent():
+    grammar = canonical_stroke_grammar("竖弯钩", ("v", "h"))
+    first = FittedPrimitive(
+        "c", "cubic", ((0, 0), (0, 3), (0, 7), (2, 9)), (), 0, 1, 0.0
+    )
+    hooked = FittedPrimitive(
+        "c", "cubic", ((2, 9), (5, 10), (8, 10), (9, 7)), (), 1, 2, 0.0
+    )
+    flat = FittedPrimitive(
+        "c", "cubic", ((2, 9), (5, 10), (8, 10), (10, 10)), (), 1, 2, 0.0
+    )
+
+    assert _terminal_hook_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (first, hooked)), grammar
+    )
+    assert not _terminal_hook_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (first, flat)), grammar
+    )
+
+
+def test_missing_terminal_hooks_are_completed_without_adding_a_command():
+    grammar = canonical_stroke_grammar("横钩", ("h",))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    false_extension = _line_primitive("l", (10, 0), (14, 1), 1)
+    fit = _multi_primitive_fit(grammar.commands, (horizontal, false_extension))
+
+    completed = _complete_terminal_hook(fit, grammar)
+
+    assert completed.commands == grammar.commands
+    assert completed.control_point_count == 3
+    assert completed.semantic_completion == "terminal-hook"
+    assert _terminal_hook_direction_compatible(completed, grammar)
+
+
+def test_missing_vertical_bend_hook_uses_the_existing_two_cubics():
+    grammar = canonical_stroke_grammar("竖弯钩", ("v", "h"))
+    first = FittedPrimitive(
+        "c", "cubic", ((0, 0), (0, 3), (0, 7), (2, 9)), (), 0, 1, 0.0
+    )
+    flat = FittedPrimitive(
+        "c", "cubic", ((2, 9), (5, 10), (8, 10), (10, 10)), (), 1, 2, 0.0
+    )
+    fit = _multi_primitive_fit(grammar.commands, (first, flat))
+
+    completed = _complete_terminal_hook(fit, grammar)
+
+    assert completed.commands == ("c", "c")
+    assert completed.control_point_count == 7
+    assert completed.semantic_completion == "terminal-hook-tangent"
+    assert _terminal_hook_direction_compatible(completed, grammar)
+
+
+def test_horizontal_fall_cannot_stop_after_its_horizontal_prefix():
+    grammar = canonical_stroke_grammar("横撇", ("h", "c"))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    falling = FittedPrimitive(
+        "c", "cubic", ((10, 0), (9, 2), (6, 7), (3, 10)), (), 1, 2, 0.0
+    )
+    flat = FittedPrimitive(
+        "c", "cubic", ((10, 0), (11, 0), (13, 0), (15, 0)), (), 1, 2, 0.0
+    )
+
+    assert _terminal_compound_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (horizontal, falling)), grammar
+    )
+    assert not _terminal_compound_direction_compatible(
+        _multi_primitive_fit(grammar.commands, (horizontal, flat)), grammar
+    )
+
+
+def _route_with_fit(fit, score):
+    return PrimitiveRoute(
+        stroke_index=0,
+        pixels=((0, 0), (0, 1)),
+        fit=fit,
+        score=score,
+        endpoint_cost=0.0,
+        guide_cost=0.0,
+        length_cost=0.0,
+        direction_cost=0.0,
+        region_cost=0.0,
+        placement_confidence=0.0,
+        alternative_count=2,
+    )
+
+
+def test_plausible_observed_hook_route_precedes_semantic_completion():
+    grammar = canonical_stroke_grammar("横钩", ("h",))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    observed_hook = _line_primitive("l", (10, 0), (7, 4), 1)
+    false_extension = _line_primitive("l", (10, 0), (14, 1), 1)
+    observed = _multi_primitive_fit(grammar.commands, (horizontal, observed_hook))
+    synthesized = _complete_terminal_hook(
+        _multi_primitive_fit(grammar.commands, (horizontal, false_extension)), grammar
+    )
+
+    selected = _prefer_observed_routes(
+        (_route_with_fit(synthesized, 1.0), _route_with_fit(observed, 4.0))
+    )
+
+    assert len(selected) == 1
+    assert selected[0].fit.semantic_completion is None
 
 
 def _cubic_fit(controls):

@@ -41,6 +41,7 @@ class FittedStroke:
     maximum_error: float
     control_point_count: int
     compression_ratio: float
+    semantic_completion: str | None = None
 
 
 def _lengths(points: np.ndarray) -> tuple[np.ndarray, float]:
@@ -260,6 +261,36 @@ def _sample_primitive(primitive: FittedPrimitive, count: int = 101) -> np.ndarra
     _, last = controls[2]
     angle = np.linspace(first, last, count)
     return centre + radius * np.column_stack((np.cos(angle), np.sin(angle)))
+
+
+def rebuild_fitted_stroke(
+    fit: FittedStroke,
+    primitives: tuple[FittedPrimitive, ...],
+    *,
+    semantic_completion: str | None = None,
+) -> FittedStroke:
+    """Recompute derived fit metrics after a grammar-preserving adjustment."""
+    dense_parts = [_sample_primitive(primitive) for primitive in primitives]
+    fitted = np.vstack(
+        [part if index == 0 else part[1:] for index, part in enumerate(dense_parts)]
+    )
+    original = np.asarray(fit.route, dtype=float)
+    distances = _distances_to_polyline(original, fitted)
+    point_count = 1 + sum(
+        1 if item.kind == "line" else 3 if item.kind == "cubic" else 2
+        for item in primitives
+    )
+    return FittedStroke(
+        commands=fit.commands,
+        primitives=primitives,
+        route=fit.route,
+        fitted_path=tuple(map(tuple, fitted)),
+        rmse=float(np.sqrt(np.mean(distances * distances))),
+        maximum_error=float(np.max(distances)),
+        control_point_count=point_count,
+        compression_ratio=len(original) / point_count,
+        semantic_completion=semantic_completion,
+    )
 
 
 def _distances_to_polyline(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:

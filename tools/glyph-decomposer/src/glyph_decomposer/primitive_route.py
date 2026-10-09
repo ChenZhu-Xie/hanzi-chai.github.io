@@ -13,7 +13,13 @@ import numpy as np
 
 from .candidate_graph import CandidateComponent, CandidateGraph, CandidateStroke
 from .leaf_alignment import LeafAlignment
-from .primitive_fit import FittedStroke, fit_stroke_primitives, symmetric_chamfer
+from .primitive_fit import (
+    FittedPrimitive,
+    FittedStroke,
+    fit_stroke_primitives,
+    rebuild_fitted_stroke,
+    symmetric_chamfer,
+)
 from .route_cover import (
     Pixel,
     _align_points,
@@ -364,6 +370,166 @@ def _single_line_direction_compatible(
     return float(np.dot(observed, expected) / denominator) >= minimum_cosine
 
 
+def _terminal_hook_direction_compatible(
+    fit: FittedStroke,
+    grammar: StrokeGrammar,
+    *,
+    minimum_cosine: float = 0.35,
+    minimum_vertical_fraction: float = 0.45,
+) -> bool:
+    """Require the terminal part of a hook stroke to remain a real hook.
+
+    Repository paths intentionally omit some conditional hook decoration, so
+    the canonical grammar restores it. A soft direction score is insufficient
+    here: a nearby terminal can otherwise turn 横钩 into a longer horizontal or
+    smooth 竖弯钩 into a plain bend. The constraint stays local to the final
+    primitive and therefore does not prescribe the rest of the stroke shape.
+    """
+    if not fit.primitives:
+        return False
+    terminal = fit.primitives[-1]
+    controls = np.asarray(terminal.controls, dtype=float)
+
+    if grammar.feature in {"竖钩", "横钩", "横折钩"}:
+        observed = controls[-1] - controls[0]
+        expected = np.asarray(grammar.direction_vectors[-1], dtype=float)
+        denominator = float(np.linalg.norm(observed) * np.linalg.norm(expected))
+        if denominator <= 1e-9:
+            return False
+        return float(np.dot(observed, expected) / denominator) >= minimum_cosine
+
+    if grammar.feature == "竖弯钩":
+        # Two cubics are the agreed minimal representation. Its final control
+        # edge is the hook tangent; it must rise materially rather than merely
+        # continue the bottom sweep to the right.
+        if terminal.kind != "cubic" or controls.shape != (4, 2):
+            return False
+        tangent = controls[-1] - controls[-2]
+        length = float(np.linalg.norm(tangent))
+        return (
+            length > 1e-9
+            and float(-tangent[1] / length) >= minimum_vertical_fraction
+        )
+
+    return True
+
+
+def _terminal_compound_direction_compatible(
+    fit: FittedStroke,
+    grammar: StrokeGrammar,
+    *,
+    minimum_cosine: float = 0.35,
+) -> bool:
+    """Keep a compound stroke's decisive terminal segment semantic.
+
+    横撇 is especially vulnerable to stopping after its horizontal prefix:
+    that truncated route can be a graph terminal even though it omits the
+    entire falling stroke. The final primitive must therefore agree with the
+    candidate's directed terminal command before endpoint completeness is
+    considered.
+    """
+    if grammar.feature != "横撇" or len(fit.primitives) < 2:
+        return True
+    controls = np.asarray(fit.primitives[-1].controls, dtype=float)
+    observed = controls[-1] - controls[0]
+    expected = np.asarray(grammar.direction_vectors[-1], dtype=float)
+    denominator = float(np.linalg.norm(observed) * np.linalg.norm(expected))
+    if denominator <= 1e-9:
+        return False
+    return float(np.dot(observed, expected) / denominator) >= minimum_cosine
+
+
+def _prefer_observed_routes(
+    alternatives: tuple[PrimitiveRoute, ...], *, score_slack: float = 4.0
+) -> tuple[PrimitiveRoute, ...]:
+    """Prefer a plausible PDF-evidenced route over a synthesized hook."""
+    observed = tuple(
+        route for route in alternatives if route.fit.semantic_completion is None
+    )
+    if not observed:
+        return alternatives
+    best_score = min(route.score for route in alternatives)
+    if min(route.score for route in observed) <= best_score + score_slack:
+        return observed
+    return alternatives
+
+
+def _complete_terminal_hook(
+    fit: FittedStroke, grammar: StrokeGrammar
+) -> FittedStroke:
+    """Restore a semantic hook that the medial skeleton did not preserve.
+
+    The candidate feature is authoritative about whether a stroke owns a hook;
+    the PDF skeleton remains authoritative about the evidenced main backbone.
+    Completion is used only when that backbone has no grammar-compatible hook
+    terminal, and is recorded explicitly for the audit UI.
+    """
+    if _terminal_hook_direction_compatible(fit, grammar):
+        return fit
+    if not fit.primitives or len(fit.route) < 2:
+        return fit
+
+    route = np.asarray(fit.route, dtype=float)
+    route_length = float(np.linalg.norm(np.diff(route, axis=0), axis=1).sum())
+    primitives = list(fit.primitives)
+
+    if grammar.feature in {"竖钩", "横钩", "横折钩"} and len(primitives) >= 2:
+        anchor = route[-1]
+        expected = np.asarray(grammar.direction_vectors[-1], dtype=float)
+        expected /= max(float(np.linalg.norm(expected)), 1e-9)
+        hook_length = max(1.5, route_length * grammar.segment_ratios[-1])
+
+        previous = primitives[-2]
+        previous_controls = list(previous.controls)
+        previous_controls[-1] = tuple(anchor)
+        primitives[-2] = FittedPrimitive(
+            previous.command,
+            previous.kind,
+            tuple(previous_controls),
+            (),
+            previous.route_start,
+            len(route) - 1,
+            previous.squared_error,
+        )
+        terminal = primitives[-1]
+        primitives[-1] = FittedPrimitive(
+            terminal.command,
+            "line",
+            (tuple(anchor), tuple(anchor + hook_length * expected)),
+            (),
+            len(route) - 1,
+            len(route) - 1,
+            0.0,
+        )
+        return rebuild_fitted_stroke(
+            fit, tuple(primitives), semantic_completion="terminal-hook"
+        )
+
+    if grammar.feature == "竖弯钩":
+        terminal = primitives[-1]
+        controls = np.asarray(terminal.controls, dtype=float)
+        if terminal.kind != "cubic" or controls.shape != (4, 2):
+            return fit
+        hook_direction = np.asarray((0.35, -1.0), dtype=float)
+        hook_direction /= float(np.linalg.norm(hook_direction))
+        handle_length = max(1.5, route_length * 0.08)
+        controls[-2] = controls[-1] - handle_length * hook_direction
+        primitives[-1] = FittedPrimitive(
+            terminal.command,
+            terminal.kind,
+            tuple(map(tuple, controls)),
+            (),
+            terminal.route_start,
+            terminal.route_end,
+            terminal.squared_error,
+        )
+        return rebuild_fitted_stroke(
+            fit, tuple(primitives), semantic_completion="terminal-hook-tangent"
+        )
+
+    return fit
+
+
 def _endpoint_contact_permissions(
     candidate: CandidateGraph, stroke: CandidateStroke
 ) -> tuple[bool, bool]:
@@ -416,6 +582,8 @@ def _endpoint_completion_measure(
     route: tuple[Pixel, ...],
     candidate: CandidateGraph,
     stroke: CandidateStroke,
+    *,
+    terminal_direction_complete: bool = False,
 ) -> tuple[int, float]:
     """Count route ends that stop internally without candidate justification.
 
@@ -427,10 +595,10 @@ def _endpoint_completion_measure(
     distances = _terminal_distances(component)
     violations = 0
     completion_cost = 0.0
-    for endpoint, contact_permitted in zip(
-        (route[0], route[-1]), permissions, strict=True
+    for index, (endpoint, contact_permitted) in enumerate(
+        zip((route[0], route[-1]), permissions, strict=True)
     ):
-        if contact_permitted:
+        if contact_permitted or (index == 1 and terminal_direction_complete):
             continue
         distance = distances.get(endpoint, len(component))
         completion_cost += distance
@@ -725,6 +893,9 @@ def enumerate_primitive_routes(
                 )
             except ValueError:
                 continue
+            if not _terminal_compound_direction_compatible(fit, grammar):
+                continue
+            fit = _complete_terminal_hook(fit, grammar)
             if not _single_curve_direction_compatible(
                 fit.fitted_path,
                 grammar,
@@ -733,6 +904,8 @@ def enumerate_primitive_routes(
             ):
                 continue
             if not _single_line_direction_compatible(fit.fitted_path, grammar):
+                continue
+            if not _terminal_hook_direction_compatible(fit, grammar):
                 continue
             if interior_contact and not _single_curve_direction_compatible(
                 fit.fitted_path, grammar, minimum_cosine=0.85
@@ -752,7 +925,11 @@ def enumerate_primitive_routes(
             )
             endpoint_completion_violations, endpoint_completion_cost = (
                 _endpoint_completion_measure(
-                component, route, candidate, stroke
+                    component,
+                    route,
+                    candidate,
+                    stroke,
+                    terminal_direction_complete=grammar.feature == "横撇",
                 )
             )
             alternatives.append(
@@ -1068,6 +1245,7 @@ def select_joint_routes(
     # route score, routes, occupied pixels, repeated count, IDS cost, relation cost
     states = [(0.0, (), frozenset(), 0, 0.0, 0.0)]
     for alternatives in alternatives_by_stroke:
+        alternatives = _prefer_observed_routes(alternatives)
         minimum_completion_violations = min(
             route.endpoint_completion_violations for route in alternatives
         )
