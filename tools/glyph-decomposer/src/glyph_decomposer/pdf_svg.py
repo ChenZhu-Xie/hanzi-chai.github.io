@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,19 @@ def parse_cells(path: Path) -> list[PdfCell]:
             for child in page
             if child.tag.rsplit("}", 1)[-1] == "word" and child.text
         ]
+        source_words = [
+            (word, source)
+            for word in words
+            if (source := _source(word["text"])) is not None
+        ]
+        glyph_words_by_text_and_column = defaultdict(list)
+        for word in words:
+            text = word["text"]
+            if len(text) != 1:
+                continue
+            center = (word["x0"] + word["x1"]) / 2
+            column = 0 if center < width / 2 else 1
+            glyph_words_by_text_and_column[(text, column)].append(word)
         codepoints = []
         for word in words:
             if not re.fullmatch(r"[0-9A-F]{4}", word["text"]):
@@ -89,18 +103,16 @@ def parse_cells(path: Path) -> list[PdfCell]:
             half_end = width / 2 if codepoint["column"] == 0 else width
             glyph_words = [
                 word
-                for word in words
-                if word["text"] == chr(codepoint["unicode"])
-                and half_start <= (word["x0"] + word["x1"]) / 2 < half_end
-                and codepoint["y0"] - 3 <= word["y0"] <= row_end
+                for word in glyph_words_by_text_and_column.get(
+                    (chr(codepoint["unicode"]), codepoint["column"]), ()
+                )
+                if codepoint["y0"] - 3 <= word["y0"] <= row_end
             ]
             seen: set[str] = set()
-            for word in words:
-                source = _source(word["text"])
+            for word, source in source_words:
                 center = (word["x0"] + word["x1"]) / 2
                 if (
-                    source is None
-                    or source in seen
+                    source in seen
                     or not half_start <= center < half_end
                     or not codepoint["y0"] + 13 <= word["y0"] <= row_end + 1
                 ):
