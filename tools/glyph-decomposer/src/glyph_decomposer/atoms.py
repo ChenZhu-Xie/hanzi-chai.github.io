@@ -36,6 +36,7 @@ def _align_seeds(seeds: tuple[StrokeSeed, ...], geometry) -> tuple[StrokeSeed, .
                 for point in seed.points
             ),
             seed.component_path,
+            seed.commands,
         )
         for seed in seeds
     )
@@ -63,6 +64,7 @@ def _transform_seeds(seeds, center, scale_x, scale_y, offset_x, offset_y):
                 for point in seed.points
             ),
             seed.component_path,
+            seed.commands,
         )
         for seed in seeds
     )

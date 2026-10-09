@@ -11,7 +11,13 @@ import numpy as np
 from shapely.geometry import LineString
 from shapely.ops import nearest_points
 
-from .candidate import IDS_INTERVALS, StrokeSeed, compile_stroke_seeds, stroke_points
+from .candidate import (
+    IDS_INTERVALS,
+    StrokeSeed,
+    compile_stroke_seeds,
+    normalize_stroke_seed_order,
+    stroke_points,
+)
 from .grammar import GlyphRepository
 from .topology_features import simplify_path
 
@@ -42,6 +48,7 @@ class CandidateStroke:
     start_tangent: float
     end_tangent: float
     bounds: tuple[float, float, float, float]
+    commands: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -120,6 +127,7 @@ def _describe_stroke(index: int, seed: StrokeSeed) -> CandidateStroke:
             float(maximum[0]),
             float(maximum[1]),
         ),
+        commands=seed.commands,
     )
 
 
@@ -274,13 +282,16 @@ def compile_catalog_candidate_graph(
             )
     if sorted(ownership) != list(range(len(raw_strokes))):
         raise ValueError("catalog candidate has incomplete leaf stroke ownership")
-    seeds = tuple(
+    seeds = normalize_stroke_seed_order(
         StrokeSeed(
             leaf_id=ownership[index][1],
             occurrence=ownership[index][2],
             feature=stroke.get("feature", "unknown"),
             points=tuple(stroke_points(stroke)),
             component_path=ownership[index][0],
+            commands=tuple(
+                str(curve["command"]) for curve in stroke.get("curveList", ())
+            ),
         )
         for index, stroke in enumerate(raw_strokes)
     )
@@ -305,7 +316,11 @@ def compile_catalog_candidate_graph(
         maximum = coordinates.max(axis=0)
         metadata = node_metadata.get(key, {})
         label = str(metadata.get("label", ""))
-        operator = label if label.startswith(("⿰", "⿱", "⿸")) else None
+        operator = (
+            label
+            if label.startswith(("⿰", "⿱", "⿲", "⿳", "⿸", "⿹"))
+            else None
+        )
         return CandidateComponent(
             glyph_id=identifier,
             path=path,

@@ -32,6 +32,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
+    { name = "scipy" },
     { name = "shapely" },
     { name = "svgpathtools" },
 ]
@@ -46,6 +47,7 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.1" },
     { name = "pydantic", specifier = ">=2.11" },
+    { name = "scipy", specifier = ">=1.18" },
     { name = "shapely", specifier = ">=2.1" },
     { name = "svgpathtools", specifier = ">=1.7" },
 ]

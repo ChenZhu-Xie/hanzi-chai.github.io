@@ -63,3 +63,42 @@ def test_compile_stroke_seeds_samples_directed_cubic_curve():
     assert seed.points[0] == pytest.approx((90, 10))
     assert seed.points[-1] == pytest.approx((10, 90))
     assert len(seed.points) > 2
+
+
+def test_compile_stroke_seeds_applies_confirmed_component_order_correction():
+    repository = GlyphRepository(
+        [
+            {
+                "id": 486,
+                "type": "component",
+                "strokes": [
+                    {
+                        "feature": "竖",
+                        "start": [37, 6],
+                        "curveList": [{"command": "v", "parameterList": [88]}],
+                    },
+                    {
+                        "feature": "横",
+                        "start": [7, 50],
+                        "curveList": [{"command": "h", "parameterList": [30]}],
+                    },
+                    {
+                        "feature": "竖",
+                        "start": [63, 6],
+                        "curveList": [{"command": "v", "parameterList": [88]}],
+                    },
+                    {
+                        "feature": "横",
+                        "start": [63, 50],
+                        "curveList": [{"command": "h", "parameterList": [30]}],
+                    },
+                ],
+            }
+        ]
+    )
+
+    seeds = compile_stroke_seeds(repository, 486)
+
+    assert [seed.feature for seed in seeds] == ["横", "竖", "竖", "横"]
+    assert seeds[0].points[0] == pytest.approx((7, 50))
+    assert seeds[1].points[0] == pytest.approx((37, 6))

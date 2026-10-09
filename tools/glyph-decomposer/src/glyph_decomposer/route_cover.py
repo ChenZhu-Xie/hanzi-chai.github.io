@@ -194,6 +194,15 @@ def _choose_component(
     components: tuple[frozenset[Pixel], ...],
     scale: float,
 ) -> frozenset[Pixel]:
+    return _rank_components(polyline, components, scale)[0][1]
+
+
+def _rank_components(
+    polyline: np.ndarray,
+    components: tuple[frozenset[Pixel], ...],
+    scale: float,
+) -> tuple[tuple[float, frozenset[Pixel]], ...]:
+    """Rank disconnected skeleton components by distance to a stroke guide."""
     probes = polyline[
         np.linspace(0, len(polyline) - 1, min(7, len(polyline))).astype(int)
     ]
@@ -209,7 +218,7 @@ def _choose_component(
             )
         )
 
-    return min(components, key=score)
+    return tuple(sorted((score(component), component) for component in components))
 
 
 def _shortest_guided_path(

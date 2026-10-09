@@ -10,8 +10,17 @@ from .grammar import GlyphRepository
 IDS_INTERVALS = {
     "⿰": ((0, 0, 50, 100), (50, 0, 100, 100)),
     "⿱": ((0, 0, 100, 50), (0, 50, 100, 100)),
+    "⿲": ((0, 0, 33, 100), (33, 0, 67, 100), (67, 0, 100, 100)),
+    "⿳": ((0, 0, 100, 33), (0, 33, 100, 67), (0, 67, 100, 100)),
     "⿸": ((0, 0, 100, 100), (40, 40, 90, 90)),
+    "⿹": ((0, 0, 100, 100), (10, 40, 80, 90)),
 }
+
+# Human-confirmed directed-order corrections for upstream component records.
+# The geometry remains byte-for-byte identical; only the directed stroke
+# sequence used by the deterministic fitter changes. 486 is the disconnected
+# grass/芈字头 form whose left horizontal is written before its left vertical.
+_COMPONENT_STROKE_ORDER = {486: (1, 0, 2, 3)}
 
 
 @dataclass(frozen=True)
@@ -21,6 +30,30 @@ class StrokeSeed:
     feature: str
     points: tuple[tuple[float, float], ...]
     component_path: tuple[int, ...] = ()
+    commands: tuple[str, ...] = ()
+
+
+def normalize_stroke_seed_order(seeds) -> tuple[StrokeSeed, ...]:
+    """Apply confirmed leaf-local order corrections once at compiler boundary."""
+    output = list(seeds)
+    positions_by_leaf: dict[tuple[int, int, tuple[int, ...]], list[int]] = {}
+    for position, seed in enumerate(output):
+        key = seed.leaf_id, seed.occurrence, seed.component_path
+        positions_by_leaf.setdefault(key, []).append(position)
+    for (leaf_id, _occurrence, _path), positions in positions_by_leaf.items():
+        order = _COMPONENT_STROKE_ORDER.get(leaf_id)
+        if order is None:
+            continue
+        if len(positions) != len(order):
+            # A parent glyph may intentionally select only part of a leaf.
+            # In that case the selector's explicit order remains authoritative.
+            continue
+        if sorted(order) != list(range(len(positions))):
+            raise ValueError(f"invalid corrected stroke order for component {leaf_id}")
+        original = [output[position] for position in positions]
+        for position, source_index in zip(positions, order):
+            output[position] = original[source_index]
+    return tuple(output)
 
 
 def _point(transform, point):
@@ -106,6 +139,7 @@ def compile_stroke_seeds(
         if record["type"] == "component":
             occurrence = occurrence_count.get(identifier, 0)
             occurrence_count[identifier] = occurrence + 1
+            strokes = tuple(record.get("strokes", ()))
             return [
                 StrokeSeed(
                     leaf_id=identifier,
@@ -115,8 +149,12 @@ def compile_stroke_seeds(
                         _point(transform, point) for point in stroke_points(stroke)
                     ),
                     component_path=component_path,
+                    commands=tuple(
+                        str(curve["command"])
+                        for curve in stroke.get("curveList", ())
+                    ),
                 )
-                for stroke in record.get("strokes", ())
+                for stroke in strokes
             ]
         operator = record.get("operator")
         intervals = IDS_INTERVALS.get(operator)
@@ -143,4 +181,5 @@ def compile_stroke_seeds(
             output.extend(part[start:end])
         return output
 
-    return tuple(compile_one(glyph_id, (1.0, 1.0, 0.0, 0.0), (), ()))
+    seeds = compile_one(glyph_id, (1.0, 1.0, 0.0, 0.0), (), ())
+    return normalize_stroke_seed_order(seeds)
