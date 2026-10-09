@@ -87,6 +87,15 @@ The default directory is `.local/glyph-decomposer-cache`, which is local-only
 and must not be committed. Pickle files below that private directory are
 trusted derived artifacts, not portable input data.
 
+The generated review keeps the original per-stroke colouring and adds two
+blind-inference views. The component view assigns one colour to every final
+recursive leaf occurrence (`componentPath`). The IDS view unions the selected,
+route-refined leaf bounds upward through the candidate tree, overlays those
+actual subtree bounds on the PDF skeleton, and renders a complete nested IDS
+tree whose node thumbnails contain the strokes currently owned by that
+subtree. Human annotation paths remain confined to the optional after-the-fact
+truth overlay and metrics.
+
 The next matcher treats every proposed logical cut as an explicit hypothesis.
 The unchanged/no-cut graph is always retained as the baseline; a cut may be
 accepted automatically only when complete downstream stroke coverage improves

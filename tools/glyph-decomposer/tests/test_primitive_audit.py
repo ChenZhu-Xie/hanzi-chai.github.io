@@ -5,8 +5,10 @@ import numpy as np
 from glyph_decomposer.primitive_audit import (
     _adaptive_leaf_alignment_solution,
     _compile_audit_candidate,
+    _ids_segmentation,
     _leaf_stroke_order_issues,
     _truth_consistency,
+    render_primitive_fit_audit,
 )
 
 
@@ -15,9 +17,7 @@ def test_compile_audit_candidate_prefers_reviewed_geometry_for_ternary_ids(
 ):
     reviewed = object()
     repository = object()
-    compiled = SimpleNamespace(
-        root=SimpleNamespace(operator="⿳", children=())
-    )
+    compiled = SimpleNamespace(root=SimpleNamespace(operator="⿳", children=()))
     monkeypatch.setattr(
         "glyph_decomposer.primitive_audit.compile_catalog_candidate_graph",
         lambda catalog, codepoint, candidate_id: reviewed,
@@ -34,9 +34,7 @@ def test_compile_audit_candidate_prefers_reviewed_geometry_for_ternary_ids(
 
 def test_compile_audit_candidate_keeps_repository_geometry_for_binary_ids(monkeypatch):
     repository = object()
-    compiled = SimpleNamespace(
-        root=SimpleNamespace(operator="⿰", children=())
-    )
+    compiled = SimpleNamespace(root=SimpleNamespace(operator="⿰", children=()))
     monkeypatch.setattr(
         "glyph_decomposer.primitive_audit.compile_catalog_candidate_graph",
         lambda catalog, codepoint, candidate_id: (_ for _ in ()).throw(
@@ -189,3 +187,62 @@ def test_adaptive_leaf_pool_skips_an_ids_solution_below_trigger(monkeypatch):
     assert output_solution is solution
     assert refinements == ()
     assert called is False
+
+
+def test_ids_segmentation_unions_selected_leaf_bounds_up_the_tree():
+    first = SimpleNamespace(
+        glyph_id=220,
+        path=(0,),
+        kind="component",
+        operator=None,
+        bounds=(0, 0, 40, 100),
+        stroke_indices=(0,),
+        children=(),
+    )
+    second = SimpleNamespace(
+        glyph_id=9313,
+        path=(1,),
+        kind="component",
+        operator=None,
+        bounds=(40, 0, 100, 100),
+        stroke_indices=(1,),
+        children=(),
+    )
+    root = SimpleNamespace(
+        glyph_id=17973,
+        path=(),
+        kind="compound",
+        operator="⿰",
+        bounds=(0, 0, 100, 100),
+        stroke_indices=(0, 1),
+        children=(first, second),
+    )
+    candidate = SimpleNamespace(
+        root=root,
+        strokes=(
+            SimpleNamespace(component_path=(0,), leaf_id=220),
+            SimpleNamespace(component_path=(1,), leaf_id=9313),
+        ),
+    )
+    selected = {
+        (0,): SimpleNamespace(bounds=(1, 2, 31, 90)),
+        (1,): SimpleNamespace(bounds=(45, 5, 80, 88)),
+    }
+    fits = [
+        {"strokeIndex": 0, "componentPath": [0], "route": [[2, 3], [30, 89]]},
+        {"strokeIndex": 1, "componentPath": [1], "route": [[46, 6], [79, 87]]},
+    ]
+
+    segmentation = _ids_segmentation(candidate, selected, fits)
+
+    assert segmentation["root"]["actualBounds"] == [1, 2, 80, 90]
+    assert [leaf["glyphId"] for leaf in segmentation["leaves"]] == [220, 9313]
+    assert segmentation["leaves"][1]["strokeIndices"] == [1]
+
+
+def test_primitive_report_contains_component_and_recursive_ids_views():
+    html = render_primitive_fit_audit([{"unicode": "U+6418"}])
+
+    assert "按叶部件着色" in html
+    assert 'id="ids-overlay"' in html
+    assert 'id="ids-tree"' in html

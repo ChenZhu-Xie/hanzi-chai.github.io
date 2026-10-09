@@ -18,6 +18,7 @@ from .audit_cache import (
     stable_key,
 )
 from .candidate_graph import (
+    CandidateComponent,
     CandidateGraph,
     compile_candidate_graph,
     compile_catalog_candidate_graph,
@@ -88,6 +89,99 @@ def _pixel_path(mask: np.ndarray) -> str:
 
 def _points(points) -> list[list[float]]:
     return [[float(x), float(y)] for x, y in points]
+
+
+def _ids_segmentation(
+    candidate: CandidateGraph,
+    selected_leaf_alignments,
+    fits: list[dict],
+) -> dict:
+    """Serialize the selected leaf geometry into the recursive candidate IDS.
+
+    Candidate bounds describe the ideal repository glyph.  This view instead
+    uses the final, route-refined leaf placements and unions them upward, so
+    every compound rectangle reports where the blind algorithm actually put
+    that subtree on the PDF skeleton.
+    """
+    alignments = dict(selected_leaf_alignments)
+    fits_by_path: dict[tuple[int, ...], list[dict]] = {}
+    serialized_by_path: dict[tuple[int, ...], dict] = {}
+    for fit in fits:
+        fits_by_path.setdefault(tuple(fit["componentPath"]), []).append(fit)
+
+    def route_bounds(items: list[dict]) -> tuple[float, float, float, float] | None:
+        points = [point for item in items for point in item["route"]]
+        if not points:
+            return None
+        coordinates = np.asarray(points, dtype=float)
+        minimum = coordinates.min(axis=0)
+        maximum = coordinates.max(axis=0)
+        return (
+            float(minimum[0]),
+            float(minimum[1]),
+            float(maximum[0]),
+            float(maximum[1]),
+        )
+
+    def union_bounds(children: list[dict]):
+        bounds = [child["actualBounds"] for child in children if child["actualBounds"]]
+        if not bounds:
+            return None
+        return [
+            min(item[0] for item in bounds),
+            min(item[1] for item in bounds),
+            max(item[2] for item in bounds),
+            max(item[3] for item in bounds),
+        ]
+
+    def serialize(node: CandidateComponent) -> dict:
+        children = [serialize(child) for child in node.children]
+        path = tuple(node.path)
+        alignment = alignments.get(path)
+        actual_bounds = (
+            list(alignment.bounds)
+            if alignment is not None
+            else union_bounds(children)
+            or list(route_bounds(fits_by_path.get(path, ())) or node.bounds)
+        )
+        serialized = {
+            "glyphId": node.glyph_id,
+            "componentPath": list(path),
+            "kind": node.kind,
+            "operator": node.operator,
+            "candidateBounds": list(node.bounds),
+            "actualBounds": actual_bounds,
+            "strokeIndices": list(node.stroke_indices),
+            "children": children,
+        }
+        serialized_by_path[path] = serialized
+        return serialized
+
+    root = serialize(candidate.root)
+    leaf_paths = sorted({stroke.component_path for stroke in candidate.strokes})
+    return {
+        "root": root,
+        "leaves": [
+            {
+                "componentPath": list(path),
+                "glyphId": next(
+                    stroke.leaf_id
+                    for stroke in candidate.strokes
+                    if stroke.component_path == path
+                ),
+                "colourIndex": index,
+                "strokeIndices": [
+                    item["strokeIndex"] for item in fits_by_path.get(path, ())
+                ],
+                "actualBounds": (
+                    list(alignments[path].bounds)
+                    if path in alignments
+                    else serialized_by_path[path]["actualBounds"]
+                ),
+            }
+            for index, path in enumerate(leaf_paths)
+        ],
+    }
 
 
 def _truth_strokes(path: Path) -> list[dict]:
@@ -620,6 +714,12 @@ def build_primitive_fit_cases(
         fingerprint = hashlib.sha256(
             json.dumps(frozen, ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
+        # Presentation-only recursive IDS data is derived after the blind
+        # fingerprint is frozen; adding or changing the audit UI cannot make
+        # an unchanged inference result appear different.
+        frozen["idsSegmentation"] = _ids_segmentation(
+            candidate, selected_leaf_alignments, blind_fits
+        )
 
         truth_payload = json.loads(annotation_path.read_text(encoding="utf-8"))
         truth = _truth_strokes(annotation_path)
@@ -756,6 +856,99 @@ render=function(){
 render();
 </script>"""
 
+_IDS_SEGMENTATION_ENHANCEMENT = r"""<script>
+(()=>{
+const style=document.createElement('style');
+style.textContent=`
+.ids-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.ids-view svg{width:100%;aspect-ratio:1;border:1px solid #dbe2ea;background:#fff}
+.component-route{fill:none;stroke:var(--colour);stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round}
+.ids-bound{fill:none;stroke-width:.36;stroke-dasharray:1.2 .7;vector-effect:non-scaling-stroke}
+.ids-bound.compound{stroke:#334155}.ids-label{font-size:2.25px;font-weight:700;fill:#0f172a;paint-order:stroke;stroke:#fff;stroke-width:.7px;stroke-linejoin:round}
+.ids-legend{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.ids-chip{border:1px solid #cbd5e1;border-radius:999px;padding:3px 7px;background:#fff;font-size:12px}
+.ids-chip i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;background:var(--colour)}
+.ids-tree{margin-top:12px;padding:9px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;overflow:auto}
+.ids-node{border:1px solid #94a3b8;border-radius:7px;padding:6px;background:#fff;min-width:145px}
+.ids-node.leaf{border-width:2px;border-color:var(--colour)}.ids-node-title{font-size:12px;font-weight:700;white-space:nowrap;margin-bottom:3px}
+.ids-node svg{width:112px;height:112px;display:block;margin:auto;border:1px solid #e2e8f0;background:white}.ids-node .context{fill:#edf2f7}.ids-node .subtree-route{fill:none;stroke:var(--colour);stroke-width:1.25;stroke-linecap:round;stroke-linejoin:round}
+.ids-children{display:flex;gap:8px;margin-top:7px;align-items:flex-start}.ids-children.vertical{flex-direction:column}.ids-children.horizontal{flex-direction:row}.ids-strokes{font-size:11px;color:#475569;margin-top:3px;text-align:center}
+@media(max-width:1000px){.ids-grid{grid-template-columns:1fr}.ids-children.horizontal{flex-wrap:wrap}}
+`;
+document.head.append(style);
+const originalCanvases=byId('all').closest('section');
+const section=document.createElement('section');
+section.className='card wide';
+section.innerHTML=`<h2 style="font-size:15px;margin:0 0 8px">算法眼中的 IDS 递归分割（仅使用 blind inference）</h2>
+<div class="ids-grid">
+  <div class="ids-view"><h3>按叶部件着色：同一 componentPath 的笔画同色</h3><svg id="component-view" viewBox="0 0 100 100"></svg><div id="component-legend" class="ids-legend"></div></div>
+  <div class="ids-view"><h3>实际 IDS 分区：彩色叶笔画＋递归子树边界</h3><svg id="ids-overlay" viewBox="0 0 100 100"></svg><p class="note">实线彩色路径是最终所选笔画；虚线框由最终 leaf alignment 自底向上合并。框不是 PDF 的机械裁刀，而是算法当前认为各 IDS 子树占据的区域。</p></div>
+</div>
+<h3>完整 IDS 树：每个节点放入该子树实际拥有的笔画</h3><div id="ids-tree" class="ids-tree"></div>`;
+originalCanvases.after(section);
+const pathKey=path=>path.length?path.join('.'):'root';
+const operatorLabel=operator=>({'⿰':'左右','⿱':'上下','⿲':'左中右','⿳':'上中下','⿸':'左上包围','⿹':'右上包围'}[operator]||'复合');
+const leafFor=(c,path)=>c.idsSegmentation.leaves.find(item=>pathKey(item.componentPath)===pathKey(path));
+const colourFor=(c,path)=>COLOURS[(leafFor(c,path)?.colourIndex??0)%COLOURS.length];
+function addRoute(svg,fit,colour,className='component-route'){
+  svg.append(el('polyline',{points:pts(fit.fittedPath),class:className,style:`--colour:${colour}`}));
+}
+function descendants(node){return new Set(node.strokeIndices)}
+function drawNodeBounds(svg,c,node,depth=0){
+  const [x0,y0,x1,y1]=node.actualBounds;
+  const leaf=!node.children.length;
+  const colour=leaf?colourFor(c,node.componentPath):'#334155';
+  svg.append(el('rect',{x:x0,y:y0,width:Math.max(.1,x1-x0),height:Math.max(.1,y1-y0),rx:.7,class:`ids-bound ${leaf?'leaf':'compound'}`,style:`stroke:${colour};opacity:${Math.max(.28,1-depth*.12)}`}));
+  const labelY=leaf?Math.max(2.8,y0+2.7):Math.min(98.5,y1-1.1-depth*1.7);
+  const label=el('text',{x:x0+.8+depth*.5,y:labelY,class:'ids-label'});
+  label.textContent=`${leaf?'叶':operatorLabel(node.operator)} · ${node.glyphId} · ${pathKey(node.componentPath)}`;
+  svg.append(label);
+  node.children.forEach(child=>drawNodeBounds(svg,c,child,depth+1));
+}
+function miniSvg(c,node){
+  const svg=el('svg',{viewBox:'0 0 100 100'});
+  svg.append(el('path',{d:c.skeletonPath,class:'context'}));
+  const owned=descendants(node);
+  c.fits.filter(f=>owned.has(f.strokeIndex)).forEach(f=>addRoute(svg,f,colourFor(c,f.componentPath),'subtree-route'));
+  return svg;
+}
+function treeNode(c,node){
+  const leaf=!node.children.length;
+  const box=document.createElement('div');
+  box.className=`ids-node ${leaf?'leaf':'compound'}`;
+  if(leaf)box.style.setProperty('--colour',colourFor(c,node.componentPath));
+  const title=document.createElement('div');title.className='ids-node-title';
+  title.textContent=`${leaf?'叶部件':operatorLabel(node.operator)} · id ${node.glyphId} · path ${pathKey(node.componentPath)}`;
+  box.append(title,miniSvg(c,node));
+  if(leaf){
+    const strokes=document.createElement('div');strokes.className='ids-strokes';
+    strokes.textContent=node.strokeIndices.map(index=>{const f=c.fits.find(item=>item.strokeIndex===index);return f?`#${index+1} ${f.feature}`:`#${index+1} 未匹配`}).join(' · ');
+    box.append(strokes);
+  }
+  if(node.children.length){
+    const children=document.createElement('div');
+    children.className=`ids-children ${['⿱','⿳'].includes(node.operator)?'vertical':'horizontal'}`;
+    node.children.forEach(child=>children.append(treeNode(c,child)));
+    box.append(children);
+  }
+  return box;
+}
+function renderIds(){
+  const c=CASES[ci],seg=c.idsSegmentation;
+  const component=byId('component-view');base(component,c);
+  c.fits.forEach(f=>addRoute(component,f,colourFor(c,f.componentPath)));
+  const overlay=byId('ids-overlay');base(overlay,c);
+  c.fits.forEach(f=>addRoute(overlay,f,colourFor(c,f.componentPath)));
+  drawNodeBounds(overlay,c,seg.root);
+  const legend=byId('component-legend');legend.replaceChildren();
+  seg.leaves.forEach(leaf=>{const chip=document.createElement('span');chip.className='ids-chip';chip.style.setProperty('--colour',COLOURS[leaf.colourIndex%COLOURS.length]);chip.innerHTML=`<i></i>id ${leaf.glyphId} · path ${pathKey(leaf.componentPath)} · 笔画 ${leaf.strokeIndices.map(i=>i+1).join(',')}`;legend.append(chip)});
+  const tree=byId('ids-tree');tree.replaceChildren(treeNode(c,seg.root));
+}
+const previousRender=render;
+render=function(){previousRender();renderIds()};
+render();
+})();
+</script>"""
+
 
 def render_primitive_fit_audit(cases: list[dict]) -> str:
     if not cases:
@@ -766,4 +959,5 @@ def render_primitive_fit_audit(cases: list[dict]) -> str:
         )
         + _ORACLE_ENHANCEMENT
         + _OVERVIEW_ENHANCEMENT
+        + _IDS_SEGMENTATION_ENHANCEMENT
     )
