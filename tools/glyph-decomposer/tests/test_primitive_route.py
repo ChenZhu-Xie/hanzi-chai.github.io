@@ -368,6 +368,108 @@ def test_joint_selection_locks_local_winner_at_full_placement_confidence():
     assert solution.routes[1].pixels == duplicate.pixels
 
 
+def test_joint_selection_never_reuses_a_long_segment_inside_one_leaf():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [10, 25],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        },
+                        {
+                            "feature": "横",
+                            "start": [10, 75],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        },
+                    ],
+                }
+            ]
+        ),
+        1,
+    )
+    skeleton = np.zeros((20, 20), dtype=bool)
+    skeleton[5, 1:11] = True
+    skeleton[12, 1:11] = True
+    template = enumerate_primitive_routes(skeleton, graph, graph.strokes[0])[0]
+
+    def route(index, pixels, score):
+        return PrimitiveRoute(
+            index,
+            tuple(pixels),
+            template.fit,
+            score,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            2,
+        )
+
+    first = route(0, tuple((5, x) for x in range(1, 11)), 1.0)
+    illegal_retrace = route(1, first.pixels, 1.0)
+    locally_worse_but_distinct = route(1, tuple((12, x) for x in range(1, 11)), 4.0)
+
+    solution = select_joint_routes(
+        ((first,), (illegal_retrace, locally_worse_but_distinct)),
+        int(skeleton.sum()),
+        candidate=graph,
+        free_contact_pixels=0,
+    )
+
+    assert solution is not None
+    assert solution.routes[1].pixels == locally_worse_but_distinct.pixels
+    assert solution.repeated_pixel_count == 0
+
+
+def test_joint_selection_returns_none_when_a_leaf_can_only_retrace_itself():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [10, 25],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        },
+                        {
+                            "feature": "横",
+                            "start": [10, 75],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        },
+                    ],
+                }
+            ]
+        ),
+        1,
+    )
+    skeleton = np.zeros((20, 20), dtype=bool)
+    skeleton[5, 1:11] = True
+    template = enumerate_primitive_routes(skeleton, graph, graph.strokes[0])[0]
+    first = PrimitiveRoute(
+        0, template.pixels, template.fit, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1
+    )
+    retrace = PrimitiveRoute(
+        1, template.pixels, template.fit, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1
+    )
+
+    assert (
+        select_joint_routes(
+            ((first,), (retrace,)), int(skeleton.sum()), candidate=graph
+        )
+        is None
+    )
+
+
 def test_joint_selection_respects_recursive_ids_order():
     graph = compile_candidate_graph(
         GlyphRepository(

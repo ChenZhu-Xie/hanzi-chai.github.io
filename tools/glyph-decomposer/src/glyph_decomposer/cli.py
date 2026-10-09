@@ -10,7 +10,11 @@ from .cut_hypotheses import build_cut_audit, render_cut_audit
 from .domain import DecompositionRequest
 from .grammar import GlyphRepository
 from .pipeline import decompose_with_artifacts
-from .primitive_audit import build_primitive_fit_cases, render_primitive_fit_audit
+from .primitive_audit import (
+    build_primitive_fit_cases,
+    load_blind_case_specs,
+    render_primitive_fit_audit,
+)
 from .review import render_review_html
 from .route_cover import build_route_cover_audit, render_route_cover_audit
 from .skeleton import audit_annotations, render_skeleton_audit
@@ -77,7 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     primitive.add_argument("--bbox-cache", type=Path, required=True)
     primitive.add_argument("--glyph-data", type=Path, required=True)
     primitive.add_argument("--candidate-catalog", type=Path, required=True)
-    primitive.add_argument("--annotations", type=Path, nargs="+", required=True)
+    primitive_input = primitive.add_mutually_exclusive_group(required=True)
+    primitive_input.add_argument("--annotations", type=Path, nargs="+")
+    primitive_input.add_argument(
+        "--blind-cases",
+        type=Path,
+        help="metadata-only JSON cases; no directed annotation truth is loaded",
+    )
     primitive.add_argument("--size", type=int, default=256)
     primitive.add_argument(
         "--cache-dir",
@@ -98,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
             args.glyph_data,
             args.candidate_catalog,
             args.annotations,
+            blind_cases=(
+                load_blind_case_specs(args.blind_cases) if args.blind_cases else None
+            ),
             size=args.size,
             cache_dir=args.cache_dir,
         )

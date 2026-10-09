@@ -782,6 +782,38 @@ def _new_stroke_relation_cost(
     return cost
 
 
+def _longest_shared_run(route: tuple[Pixel, ...], occupied: frozenset[Pixel]) -> int:
+    longest = current = 0
+    for pixel in route:
+        if pixel in occupied:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _reuses_same_leaf_segment(
+    candidate: CandidateGraph,
+    selected: tuple[PrimitiveRoute, ...],
+    proposed: PrimitiveRoute,
+    *,
+    maximum_shared_run: int,
+) -> bool:
+    strokes = {stroke.index: stroke for stroke in candidate.strokes}
+    proposed_stroke = strokes[proposed.stroke_index]
+    for route in selected:
+        selected_stroke = strokes[route.stroke_index]
+        if selected_stroke.component_path != proposed_stroke.component_path:
+            continue
+        if (
+            _longest_shared_run(proposed.pixels, frozenset(route.pixels))
+            > maximum_shared_run
+        ):
+            return True
+    return False
+
+
 def select_joint_routes(
     alternatives_by_stroke: tuple[tuple[PrimitiveRoute, ...], ...],
     skeleton_pixel_count: int,
@@ -795,6 +827,8 @@ def select_joint_routes(
     ids_structure_penalty: float = 30.0,
     stroke_relation_penalty: float = 3.0,
     local_score_slack: float = 2.0,
+    maximum_same_leaf_shared_run: int = 8,
+    same_leaf_fallback_limit: int = 16,
 ) -> JointRouteSolution | None:
     """Choose one route per stroke under whole-glyph exclusive coverage pressure.
 
@@ -819,7 +853,29 @@ def select_joint_routes(
         )
         expanded = []
         for score, routes, occupied, repeated, _structure, relation_cost in states:
-            for route in eligible_alternatives:
+            state_alternatives = tuple(
+                route
+                for route in eligible_alternatives
+                if candidate is None
+                or not _reuses_same_leaf_segment(
+                    candidate,
+                    routes,
+                    route,
+                    maximum_shared_run=maximum_same_leaf_shared_run,
+                )
+            )
+            if not state_alternatives and candidate is not None:
+                state_alternatives = tuple(
+                    route
+                    for route in alternatives
+                    if not _reuses_same_leaf_segment(
+                        candidate,
+                        routes,
+                        route,
+                        maximum_shared_run=maximum_same_leaf_shared_run,
+                    )
+                )[:same_leaf_fallback_limit]
+            for route in state_alternatives:
                 pixels = frozenset(route.pixels)
                 overlap = len(pixels & occupied)
                 newly_covered = len(pixels - occupied)
@@ -861,6 +917,8 @@ def select_joint_routes(
                 tuple(route.pixels for route in item[1]),
             )
         )
+        if not expanded:
+            return None
         states = expanded[:beam_width]
     best = min(
         states,

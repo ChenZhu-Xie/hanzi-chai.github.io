@@ -96,6 +96,25 @@ tree whose node thumbnails contain the strokes currently owned by that
 subtree. Human annotation paths remain confined to the optional after-the-fact
 truth overlay and metrics.
 
+For genuinely unseen sources whose upstream glyph/IDS decomposition is known
+but which have no directed human annotation, replace `--annotations` with a
+metadata-only input:
+
+```powershell
+uv run glyph-decomposer primitive-fit-audit `
+  --pdf <U4E00.pdf> `
+  --bbox-cache <U4E00-bbox.html> `
+  --glyph-data <glyphs.json> `
+  --candidate-catalog <review-catalog.json> `
+  --blind-cases <blind-cases.json> `
+  --output <review.html>
+```
+
+`blind-cases.json` is an array of `{unicode, source, candidateGlyphId}` objects.
+This mode never opens an annotation JSON; its report therefore labels directed
+truth and Chamfer metrics as unavailable while retaining the candidate stroke,
+recursive IDS, component-colour, residual and topology views.
+
 The next matcher treats every proposed logical cut as an explicit hypothesis.
 The unchanged/no-cut graph is always retained as the baseline; a cut may be
 accepted automatically only when complete downstream stroke coverage improves

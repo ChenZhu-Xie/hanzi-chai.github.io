@@ -8,6 +8,7 @@ from glyph_decomposer.primitive_audit import (
     _ids_segmentation,
     _leaf_stroke_order_issues,
     _truth_consistency,
+    load_blind_case_specs,
     render_primitive_fit_audit,
 )
 
@@ -246,3 +247,44 @@ def test_primitive_report_contains_component_and_recursive_ids_views():
     assert "按叶部件着色" in html
     assert 'id="ids-overlay"' in html
     assert 'id="ids-tree"' in html
+
+
+def test_load_blind_case_specs_accepts_array_and_normalizes_unicode(tmp_path):
+    source = tmp_path / "blind.json"
+    source.write_text(
+        '[{"unicode":"U+827E","source":"H","candidateGlyphId":127412}]',
+        encoding="utf-8",
+    )
+
+    assert load_blind_case_specs(source) == [
+        {"unicode": 0x827E, "source": "H", "candidateGlyphId": 127412}
+    ]
+
+
+def test_load_blind_case_specs_rejects_missing_candidate(tmp_path):
+    source = tmp_path / "blind.json"
+    source.write_text('[{"unicode":"U+827E","source":"H"}]', encoding="utf-8")
+
+    try:
+        load_blind_case_specs(source)
+    except ValueError as error:
+        assert "candidateGlyphId" in str(error)
+    else:
+        raise AssertionError("invalid blind case must be rejected")
+
+
+def test_primitive_report_labels_cases_without_directed_truth():
+    html = render_primitive_fit_audit(
+        [
+            {
+                "unicode": "U+827E",
+                "character": "艾",
+                "source": "H",
+                "candidateGlyphId": 127412,
+                "truthAvailable": False,
+            }
+        ]
+    )
+
+    assert "人工有向真值未提供" in html
+    assert "expectedStrokeCount" in html

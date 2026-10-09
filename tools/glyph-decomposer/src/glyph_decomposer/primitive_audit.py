@@ -79,6 +79,44 @@ def _compile_audit_candidate(
     return repository_candidate
 
 
+def load_blind_case_specs(path: Path) -> list[dict]:
+    """Load metadata-only audit cases without directed annotation truth."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("cases") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise TypeError(
+            "blind cases must be a JSON array or an object with a cases array"
+        )
+    cases = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise TypeError(f"blind case {index} must be an object")
+        missing = [
+            key
+            for key in ("unicode", "source", "candidateGlyphId")
+            if row.get(key) is None
+        ]
+        if missing:
+            raise ValueError(f"blind case {index} is missing {', '.join(missing)}")
+        raw_unicode = row["unicode"]
+        codepoint = (
+            int(raw_unicode.removeprefix("U+"), 16)
+            if isinstance(raw_unicode, str)
+            else int(raw_unicode)
+        )
+        source = str(row["source"])
+        if len(source) not in {1, 2}:
+            raise ValueError(f"blind case {index} has invalid source {source!r}")
+        cases.append(
+            {
+                "unicode": codepoint,
+                "source": source,
+                "candidateGlyphId": int(row["candidateGlyphId"]),
+            }
+        )
+    return cases
+
+
 def _pixel_path(mask: np.ndarray) -> str:
     scale = 100 / mask.shape[0]
     return "".join(
@@ -414,12 +452,17 @@ def build_primitive_fit_cases(
     bbox_path: Path,
     glyph_data_path: Path,
     candidate_catalog_path: Path,
-    annotation_paths: list[Path],
+    annotation_paths: list[Path] | None = None,
     *,
+    blind_cases: list[dict] | None = None,
     size: int = 256,
     cache_dir: Path | None = None,
 ) -> list[dict]:
     """Fit first, then load directed truth solely for held-out evaluation."""
+    if annotation_paths and blind_cases:
+        raise ValueError("annotation paths and blind cases are mutually exclusive")
+    if not annotation_paths and not blind_cases:
+        raise ValueError("at least one annotation path or blind case is required")
     cells = parse_cells(bbox_path)
     repository = GlyphRepository.load(glyph_data_path)
     catalog = json.loads(candidate_catalog_path.read_text(encoding="utf-8"))
@@ -430,14 +473,28 @@ def build_primitive_fit_cases(
     leaf_algorithm_identity = file_identity(module_dir / "leaf_alignment.py")
     pages: dict[int, str] = {}
     cases = []
-    for annotation_path in annotation_paths:
-        metadata = load_annotation_metadata(annotation_path)
+    requests = [
+        {"metadata": load_annotation_metadata(path), "annotationPath": path}
+        for path in (annotation_paths or [])
+    ]
+    requests.extend(
+        {"metadata": metadata, "annotationPath": None}
+        for metadata in (blind_cases or [])
+    )
+    for request in requests:
+        metadata = request["metadata"]
+        annotation_path = request["annotationPath"]
         if not all(
             metadata.get(key) is not None
             for key in ("unicode", "source", "candidateGlyphId")
         ):
             continue
-        codepoint = int(str(metadata["unicode"]).removeprefix("U+"), 16)
+        raw_unicode = metadata["unicode"]
+        codepoint = (
+            raw_unicode
+            if isinstance(raw_unicode, int)
+            else int(str(raw_unicode).removeprefix("U+"), 16)
+        )
         source = str(metadata["source"])
         candidate_id = int(metadata["candidateGlyphId"])
         cell = find_cell(cells, codepoint, source)
@@ -644,8 +701,12 @@ def build_primitive_fit_cases(
             "character": chr(codepoint),
             "source": source,
             "candidateGlyphId": candidate_id,
-            "annotationBasename": annotation_path.name,
-            "truthUsage": "fit frozen before directed annotation paths load",
+            "annotationBasename": annotation_path.name if annotation_path else None,
+            "truthUsage": (
+                "fit frozen before directed annotation paths load"
+                if annotation_path
+                else "no directed annotation truth supplied"
+            ),
             "skeletonPath": _pixel_path(skeleton),
             "skeletonPixelCount": int(skeleton.sum()),
             "residualPoints": _points(residual),
@@ -721,6 +782,22 @@ def build_primitive_fit_cases(
             candidate, selected_leaf_alignments, blind_fits
         )
 
+        frozen["blindFingerprint"] = fingerprint
+        frozen["expectedStrokeCount"] = len(candidate.strokes)
+        frozen["truthAvailable"] = annotation_path is not None
+        fit_scores = [fit["fitRmse"] for fit in frozen["fits"]]
+        frozen["meanFitRmse"] = float(np.mean(fit_scores)) if fit_scores else None
+        frozen["residualFraction"] = len(residual) / max(len(skeleton_xy), 1)
+        if annotation_path is None:
+            for fit in frozen["fits"]:
+                fit["truth"] = None
+            frozen["truthConsistency"] = None
+            frozen["truthStrokeCount"] = len(candidate.strokes)
+            frozen["meanTruthChamfer"] = None
+            frozen["meanOracleRmse"] = None
+            cases.append(frozen)
+            continue
+
         truth_payload = json.loads(annotation_path.read_text(encoding="utf-8"))
         truth = _truth_strokes(annotation_path)
         truth_consistency = _truth_consistency(
@@ -776,7 +853,6 @@ def build_primitive_fit_cases(
                     )
                 ),
             }
-        frozen["blindFingerprint"] = fingerprint
         frozen["truthConsistency"] = truth_consistency
         frozen["truthStrokeCount"] = len(truth)
         truth_scores = [
@@ -793,18 +869,15 @@ def build_primitive_fit_cases(
         frozen["meanOracleRmse"] = (
             float(np.mean(oracle_scores)) if oracle_scores else None
         )
-        fit_scores = [fit["fitRmse"] for fit in frozen["fits"]]
-        frozen["meanFitRmse"] = float(np.mean(fit_scores)) if fit_scores else None
-        frozen["residualFraction"] = len(residual) / max(len(skeleton_xy), 1)
         cases.append(frozen)
     return cases
 
 
 _TEMPLATE = r"""<!doctype html><meta charset="utf-8"><title>固定笔画语法的骨架原语拟合</title>
 <style>*{box-sizing:border-box}body{margin:0;font:14px system-ui;color:#172033;background:#eef2f7}header{position:sticky;top:0;z-index:2;background:#fff;border-bottom:1px solid #cbd5e1;padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}h1{font-size:18px;margin:0}select,button{padding:6px 9px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}.card{background:#fff;border:1px solid #cbd5e1;border-radius:9px;padding:10px;overflow:auto}.wide{grid-column:1/-1}.canvases{display:grid;grid-template-columns:1fr 1fr;gap:10px}.pane h2{font-size:14px;margin:0 0 5px}.pane svg{width:100%;aspect-ratio:1;border:1px solid #dbe2ea;background:#fff}.skeleton{fill:#dbe2ea}.residual{fill:#ef4444}.route{fill:none;stroke:#64748b;stroke-width:.45;stroke-dasharray:1 1}.fit{fill:none;stroke:var(--colour);stroke-width:1.15;stroke-linecap:round;stroke-linejoin:round}.truth{fill:none;stroke:#06b6d4;stroke-width:.75;stroke-dasharray:1.3 .65}.control{fill:#fff;stroke:#111827;stroke-width:.35}.handle{stroke:#94a3b8;stroke-width:.25}table{width:100%;border-collapse:collapse}th,td{padding:5px;border-bottom:1px solid #e2e8f0;text-align:left}tr{cursor:pointer}tr.active{background:#dbeafe}pre{white-space:pre-wrap;background:#f8fafc;padding:8px}.bad{color:#b91c1c}.note{color:#475569;font-size:12px}@media(max-width:1000px){.grid,.canvases{grid-template-columns:1fr}.wide{grid-column:auto}}</style>
-<header><h1>固定笔画语法的 PDF 骨架拟合</h1><button id="prev">←</button><select id="case"></select><button id="next">→</button><label><input id="truth" type="checkbox"> 显示人工真值（只参与事后评分）</label></header>
+<header><h1>固定笔画语法的 PDF 骨架拟合</h1><button id="prev">←</button><select id="case"></select><button id="next">→</button><label><input id="truth" type="checkbox"> <span id="truth-label">显示人工真值（只参与事后评分）</span></label></header>
 <main class="grid"><section class="card wide"><div id="summary"></div></section><section class="card wide canvases"><div class="pane"><h2>全字：灰＝骨架，彩色＝最小原语，红＝未解释残差</h2><svg id="all" viewBox="0 0 100 100"></svg></div><div class="pane"><h2>所选笔画：灰虚线＝盲路径，彩色＝拟合，青色＝人工真值</h2><svg id="one" viewBox="0 0 100 100"></svg></div></section><section class="card"><table><thead><tr><th>#</th><th>笔画</th><th>语法</th><th>点</th><th>盲拟合 RMSE</th><th>真值 Chamfer</th><th>真值自身最小拟合</th></tr></thead><tbody id="rows"></tbody></table></section><section class="card"><h2>所选笔画</h2><pre id="details"></pre><p class="note">候选 command 序列、段数与控制点数均为硬约束。人工路径是在 blindFingerprint 固化后才加载，不能改变拟合；“真值自身最小拟合”只回答该固定语法是否足以压缩人工路径。</p></section></main>
-<script>const CASES=__DATA__,NS='http://www.w3.org/2000/svg',COLOURS=['#2563eb','#16a34a','#9333ea','#ea580c','#0891b2','#db2777','#65a30d','#dc2626','#0d9488','#7c3aed'];let ci=0,si=0;const byId=id=>document.getElementById(id),metric=x=>x==null?'—':x.toFixed(3);for(const c of CASES){const o=document.createElement('option');o.textContent=`${c.unicode} ${c.character} · ${c.source} · ${c.candidateGlyphId}`;byId('case').append(o)}function el(name,attrs={}){const x=document.createElementNS(NS,name);for(const[k,v]of Object.entries(attrs))x.setAttribute(k,v);return x}function pts(p){return p.map(x=>x.map(v=>v.toFixed(3)).join(',')).join(' ')}function base(svg,c){svg.replaceChildren(el('path',{d:c.skeletonPath,class:'skeleton'}))}function drawFit(svg,f,index){const colour=COLOURS[index%COLOURS.length];svg.append(el('polyline',{points:pts(f.fittedPath),class:'fit',style:`--colour:${colour}`}))}function render(){const c=CASES[ci];byId('case').selectedIndex=ci;si=Math.min(si,Math.max(0,c.fits.length-1));byId('summary').innerHTML=`<b>${c.unicode} ${c.character} · ${c.source}</b>　candidate ${c.candidateGlyphId}　成功拟合 ${c.fits.length}/${c.truthStrokeCount}　失败 ${c.fitFailures.length}　平均拟合 RMSE ${metric(c.meanFitRmse)}　事后真值 Chamfer ${metric(c.meanTruthChamfer)}　残差 ${(100*c.residualFraction).toFixed(1)}%　证书 ${c.certificates.topology?'拓扑✓':'拓扑✗'}/${c.certificates.multiscale?'多尺度✓':'多尺度✗'}<br><span class="note">blind fingerprint: ${c.blindFingerprint}</span>${c.fitFailures.length?`<pre class="bad">${JSON.stringify(c.fitFailures,null,2)}</pre>`:''}`;const all=byId('all');base(all,c);for(const p of c.residualPoints)all.append(el('circle',{cx:p[0],cy:p[1],r:.23,class:'residual'}));c.fits.forEach((f,i)=>drawFit(all,f,i));const rows=byId('rows');rows.replaceChildren();c.fits.forEach((f,i)=>{const tr=document.createElement('tr');tr.className=i===si?'active':'';tr.innerHTML=`<td>${f.strokeIndex+1}</td><td>${f.feature}</td><td>${f.commands.join('→')}</td><td>${f.controlPointCount}/${f.routePointCount}</td><td>${f.fitRmse.toFixed(3)}</td><td>${f.truth?f.truth.chamfer.toFixed(3):'—'}</td>`;tr.onclick=()=>{si=i;render()};rows.append(tr)});const f=c.fits[si],one=byId('one');base(one,c);if(!f){byId('details').textContent='没有可显示的成功拟合';return}one.append(el('polyline',{points:pts(f.route),class:'route'}));drawFit(one,f,si);for(const primitive of f.primitives){const controls=primitive.controls;if(primitive.kind==='cubic'){one.append(el('polyline',{points:pts(controls),class:'handle'}))}for(const p of controls)one.append(el('circle',{cx:p[0],cy:p[1],r:.65,class:'control'}))}if(byId('truth').checked&&f.truth)one.append(el('polyline',{points:pts(f.truth.points),class:'truth'}));byId('details').textContent=JSON.stringify({strokeIndex:f.strokeIndex,feature:f.feature,leafId:f.leafId,componentPath:f.componentPath,commands:f.commands,primitives:f.primitives.map(p=>({command:p.command,kind:p.kind,controls:p.controls})),fitRmse:f.fitRmse,maximumError:f.maximumError,compressionRatio:f.compressionRatio,truth:byId('truth').checked?f.truth:'隐藏'},null,2)}byId('case').onchange=e=>{ci=e.target.selectedIndex;si=0;render()};byId('prev').onclick=()=>{ci=(ci-1+CASES.length)%CASES.length;si=0;render()};byId('next').onclick=()=>{ci=(ci+1)%CASES.length;si=0;render()};byId('truth').onchange=render;render();</script>"""
+<script>const CASES=__DATA__,NS='http://www.w3.org/2000/svg',COLOURS=['#2563eb','#16a34a','#9333ea','#ea580c','#0891b2','#db2777','#65a30d','#dc2626','#0d9488','#7c3aed'];let ci=0,si=0;const byId=id=>document.getElementById(id),metric=x=>x==null?'—':x.toFixed(3);for(const c of CASES){const o=document.createElement('option');o.textContent=`${c.unicode} ${c.character} · ${c.source} · ${c.candidateGlyphId}`;byId('case').append(o)}function el(name,attrs={}){const x=document.createElementNS(NS,name);for(const[k,v]of Object.entries(attrs))x.setAttribute(k,v);return x}function pts(p){return p.map(x=>x.map(v=>v.toFixed(3)).join(',')).join(' ')}function base(svg,c){svg.replaceChildren(el('path',{d:c.skeletonPath,class:'skeleton'}))}function drawFit(svg,f,index){const colour=COLOURS[index%COLOURS.length];svg.append(el('polyline',{points:pts(f.fittedPath),class:'fit',style:`--colour:${colour}`}))}function render(){const c=CASES[ci],hasTruth=c.truthAvailable!==false;byId('case').selectedIndex=ci;si=Math.min(si,Math.max(0,c.fits.length-1));byId('truth').disabled=!hasTruth;if(!hasTruth)byId('truth').checked=false;byId('truth-label').textContent=hasTruth?'显示人工真值（只参与事后评分）':'人工有向真值未提供（严格盲测）';const truthMetric=hasTruth?`事后真值 Chamfer ${metric(c.meanTruthChamfer)}`:'人工有向真值未提供';byId('summary').innerHTML=`<b>${c.unicode} ${c.character} · ${c.source}</b>　candidate ${c.candidateGlyphId}　成功拟合 ${c.fits.length}/${c.expectedStrokeCount??c.truthStrokeCount}　失败 ${c.fitFailures.length}　平均拟合 RMSE ${metric(c.meanFitRmse)}　${truthMetric}　残差 ${(100*c.residualFraction).toFixed(1)}%　证书 ${c.certificates.topology?'拓扑✓':'拓扑✗'}/${c.certificates.multiscale?'多尺度✓':'多尺度✗'}<br><span class="note">blind fingerprint: ${c.blindFingerprint}</span>${c.fitFailures.length?`<pre class="bad">${JSON.stringify(c.fitFailures,null,2)}</pre>`:''}`;const all=byId('all');base(all,c);for(const p of c.residualPoints)all.append(el('circle',{cx:p[0],cy:p[1],r:.23,class:'residual'}));c.fits.forEach((f,i)=>drawFit(all,f,i));const rows=byId('rows');rows.replaceChildren();c.fits.forEach((f,i)=>{const tr=document.createElement('tr');tr.className=i===si?'active':'';tr.innerHTML=`<td>${f.strokeIndex+1}</td><td>${f.feature}</td><td>${f.commands.join('→')}</td><td>${f.controlPointCount}/${f.routePointCount}</td><td>${f.fitRmse.toFixed(3)}</td><td>${f.truth?f.truth.chamfer.toFixed(3):'—'}</td>`;tr.onclick=()=>{si=i;render()};rows.append(tr)});const f=c.fits[si],one=byId('one');base(one,c);if(!f){byId('details').textContent='没有可显示的成功拟合';return}one.append(el('polyline',{points:pts(f.route),class:'route'}));drawFit(one,f,si);for(const primitive of f.primitives){const controls=primitive.controls;if(primitive.kind==='cubic'){one.append(el('polyline',{points:pts(controls),class:'handle'}))}for(const p of controls)one.append(el('circle',{cx:p[0],cy:p[1],r:.65,class:'control'}))}if(byId('truth').checked&&f.truth)one.append(el('polyline',{points:pts(f.truth.points),class:'truth'}));byId('details').textContent=JSON.stringify({strokeIndex:f.strokeIndex,feature:f.feature,leafId:f.leafId,componentPath:f.componentPath,commands:f.commands,primitives:f.primitives.map(p=>({command:p.command,kind:p.kind,controls:p.controls})),fitRmse:f.fitRmse,maximumError:f.maximumError,compressionRatio:f.compressionRatio,truth:hasTruth?(byId('truth').checked?f.truth:'隐藏'):'未提供'},null,2)}byId('case').onchange=e=>{ci=e.target.selectedIndex;si=0;render()};byId('prev').onclick=()=>{ci=(ci-1+CASES.length)%CASES.length;si=0;render()};byId('next').onclick=()=>{ci=(ci+1)%CASES.length;si=0;render()};byId('truth').onchange=render;render();</script>"""
 
 _ORACLE_ENHANCEMENT = r"""<script>
 const renderWithoutOracle=render;
@@ -814,7 +887,7 @@ render=function(){
   const summary=byId('summary');
   summary.firstChild.insertAdjacentHTML(
     'afterend',
-    `　真值自身最小拟合 ${metric(c.meanOracleRmse)}`
+    c.truthAvailable===false?'　人工有向真值未提供':`　真值自身最小拟合 ${metric(c.meanOracleRmse)}`
   );
   const refinements=(c.leafRouteRefinements||[]).filter(item=>item.changed);
   if(refinements.length){
@@ -839,12 +912,12 @@ const summaryCard=byId('summary').closest('section');
 const overview=document.createElement('section');
 overview.className='card wide';
 overview.innerHTML=`<h2 style="font-size:14px;margin:0 0 6px">跨案例盲测摘要（点击切换）</h2>
-  <table><thead><tr><th>字源</th><th>candidate</th><th>成功笔画</th><th>真值 Chamfer</th><th>骨架残差</th><th>盲拟合 RMSE</th></tr></thead><tbody></tbody></table>`;
+  <table><thead><tr><th>字源</th><th>candidate</th><th>成功笔画</th><th>真值 Chamfer（若有）</th><th>骨架残差</th><th>盲拟合 RMSE</th></tr></thead><tbody></tbody></table>`;
 summaryCard.after(overview);
 const overviewBody=overview.querySelector('tbody');
 CASES.forEach((c,index)=>{
   const row=document.createElement('tr');
-  row.innerHTML=`<td>${c.unicode} ${c.character} · ${c.source}</td><td>${c.candidateGlyphId}</td><td>${c.fits.length}/${c.truthStrokeCount}</td><td>${metric(c.meanTruthChamfer)}</td><td>${(100*c.residualFraction).toFixed(1)}%</td><td>${metric(c.meanFitRmse)}</td>`;
+  row.innerHTML=`<td>${c.unicode} ${c.character} · ${c.source}</td><td>${c.candidateGlyphId}</td><td>${c.fits.length}/${c.expectedStrokeCount??c.truthStrokeCount}</td><td>${c.truthAvailable===false?'未提供':metric(c.meanTruthChamfer)}</td><td>${(100*c.residualFraction).toFixed(1)}%</td><td>${metric(c.meanFitRmse)}</td>`;
   row.onclick=()=>{ci=index;si=0;render()};
   overviewBody.append(row);
 });
@@ -949,6 +1022,13 @@ render();
 })();
 </script>"""
 
+_QUERY_CASE_ENHANCEMENT = r"""<script>
+const requestedCase=Number(new URLSearchParams(location.search).get('case'));
+if(Number.isInteger(requestedCase)&&requestedCase>=0&&requestedCase<CASES.length){
+  ci=requestedCase;si=0;render();
+}
+</script>"""
+
 
 def render_primitive_fit_audit(cases: list[dict]) -> str:
     if not cases:
@@ -960,4 +1040,5 @@ def render_primitive_fit_audit(cases: list[dict]) -> str:
         + _ORACLE_ENHANCEMENT
         + _OVERVIEW_ENHANCEMENT
         + _IDS_SEGMENTATION_ENHANCEMENT
+        + _QUERY_CASE_ENHANCEMENT
     )
