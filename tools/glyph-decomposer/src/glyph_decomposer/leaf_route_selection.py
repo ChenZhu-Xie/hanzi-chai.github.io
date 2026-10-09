@@ -13,7 +13,12 @@ from .leaf_alignment import (
     LeafAlignment,
     alignment_ids_cost,
 )
-from .primitive_route import enumerate_primitive_routes, select_joint_routes
+from .primitive_route import (
+    JointRouteSolution,
+    Pixel,
+    enumerate_primitive_routes,
+    select_joint_routes,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,69 @@ class LeafRouteRefinement:
     original_route_score: float | None
     selected_route_score: float | None
     evaluated_count: int
+
+
+@dataclass(frozen=True)
+class LeafRouteGlobalRefinement:
+    component_path: tuple[int, ...]
+    original: LeafAlignment
+    selected: LeafAlignment
+    baseline_score: float
+    selected_score: float
+    evaluated_count: int
+    locked_paths: tuple[tuple[int, ...], ...]
+
+    @property
+    def changed(self) -> bool:
+        return self.original != self.selected
+
+
+def _avoids_locked_segments(
+    route: tuple[Pixel, ...],
+    locked_pixels: frozenset[Pixel],
+    *,
+    maximum_shared_run: int = 3,
+) -> bool:
+    """Allow contact with locked leaves, but never travel along their ink."""
+    shared_run = 0
+    for pixel in route:
+        if pixel in locked_pixels:
+            shared_run += 1
+            if shared_run > maximum_shared_run:
+                return False
+        else:
+            shared_run = 0
+    return True
+
+
+def _select_refinement_trial(
+    original: LeafAlignment,
+    baseline: JointRouteSolution,
+    trials: tuple[tuple[LeafAlignment, JointRouteSolution], ...],
+    *,
+    maximum_ids_regression: float = 0.05,
+) -> tuple[LeafAlignment, JointRouteSolution]:
+    """Accept only a strict whole-glyph improvement with no safety regression."""
+    eligible = tuple(
+        (alignment, solution)
+        for alignment, solution in trials
+        if solution.score < baseline.score - 1e-9
+        and solution.repeated_pixel_count <= baseline.repeated_pixel_count
+        and solution.ids_structure_cost
+        <= baseline.ids_structure_cost + maximum_ids_regression
+    )
+    if not eligible:
+        return original, baseline
+    return min(
+        eligible,
+        key=lambda item: (
+            item[1].score,
+            item[1].repeated_pixel_count,
+            item[1].residual_pixel_count,
+            item[0].score,
+            item[0].bounds,
+        ),
+    )
 
 
 def _refinement_shortlist(
@@ -122,3 +190,170 @@ def refine_suspicious_leaf_alignments(
             )
         )
     return selected, tuple(refinements)
+
+
+def refine_low_confidence_leaf_routes(
+    skeleton: np.ndarray,
+    candidate: CandidateGraph,
+    pools: dict[tuple[int, ...], tuple[LeafAlignment, ...]],
+    selected_alignments: dict[tuple[int, ...], LeafAlignment],
+    alternatives_by_stroke: tuple[tuple, ...],
+    joint: JointRouteSolution,
+    *,
+    shortest_path_cache: dict | None = None,
+    route_enumerator=enumerate_primitive_routes,
+    alignment_score_trigger: float = 3.0,
+    route_score_trigger: float = 5.0,
+    joint_relation_trigger: float = 10.0,
+    joint_repeated_pixel_trigger: int = 8,
+    maximum_locked_shared_run: int = 3,
+    shortlist_limit: int = 16,
+    maximum_refined_leaves: int = 1,
+) -> tuple[
+    dict[tuple[int, ...], LeafAlignment],
+    tuple[tuple, ...],
+    JointRouteSolution,
+    tuple[LeafRouteGlobalRefinement, ...],
+]:
+    """Re-open weak leaves while keeping confident routes reserved.
+
+    Locked routes remain singleton alternatives. A target leaf may touch them
+    at a junction, but a route that follows their ink for a sustained run is
+    excluded. A replacement is accepted only by whole-glyph joint scoring.
+    """
+    if (
+        joint.stroke_relation_cost < joint_relation_trigger
+        and joint.repeated_pixel_count < joint_repeated_pixel_trigger
+    ):
+        return selected_alignments, alternatives_by_stroke, joint, ()
+    strokes_by_path: dict[tuple[int, ...], tuple] = {}
+    for path in selected_alignments:
+        strokes_by_path[path] = tuple(
+            stroke for stroke in candidate.strokes if stroke.component_path == path
+        )
+    routes_by_index = {route.stroke_index: route for route in joint.routes}
+
+    def severity(path: tuple[int, ...]) -> tuple[float, float, tuple[int, ...]]:
+        route_score = max(
+            (routes_by_index[stroke.index].score for stroke in strokes_by_path[path]),
+            default=0.0,
+        )
+        return (-route_score, -selected_alignments[path].score, path)
+
+    suspicious = sorted(
+        (
+            path
+            for path, alignment in selected_alignments.items()
+            if alignment.score >= alignment_score_trigger
+            or any(
+                routes_by_index[stroke.index].score >= route_score_trigger
+                for stroke in strokes_by_path[path]
+            )
+        ),
+        key=severity,
+    )[:maximum_refined_leaves]
+    current_alignments = dict(selected_alignments)
+    current_alternatives = list(alternatives_by_stroke)
+    current_joint = joint
+    refinements = []
+    for path in suspicious:
+        original = current_alignments[path]
+        baseline_score = current_joint.score
+        current_routes = {route.stroke_index: route for route in current_joint.routes}
+        locked_routes = tuple(
+            route
+            for route in current_joint.routes
+            if candidate.strokes[route.stroke_index].component_path != path
+        )
+        locked_pixels = frozenset(
+            pixel for route in locked_routes for pixel in route.pixels
+        )
+        locked_paths = tuple(
+            sorted(
+                {
+                    candidate.strokes[route.stroke_index].component_path
+                    for route in locked_routes
+                }
+            )
+        )
+        shortlist = [original]
+        for alignment in pools[path]:
+            if alignment in shortlist:
+                continue
+            if not (0.8 <= alignment.scale_x <= 1.7):
+                continue
+            if not (0.8 <= alignment.scale_y <= 1.7):
+                continue
+            shortlist.append(alignment)
+            if len(shortlist) == shortlist_limit:
+                break
+
+        trials = []
+        trial_alternatives = {}
+        for alignment in shortlist:
+            target_alternatives = {}
+            for stroke in strokes_by_path[path]:
+                alternatives = route_enumerator(
+                    skeleton,
+                    candidate,
+                    stroke,
+                    leaf_alignment=alignment,
+                    shortest_path_cache=shortest_path_cache,
+                )
+                alternatives = tuple(
+                    route
+                    for route in alternatives
+                    if _avoids_locked_segments(
+                        route.pixels,
+                        locked_pixels,
+                        maximum_shared_run=maximum_locked_shared_run,
+                    )
+                )
+                if not alternatives:
+                    break
+                target_alternatives[stroke.index] = alternatives
+            if len(target_alternatives) != len(strokes_by_path[path]):
+                continue
+            proposed = tuple(
+                target_alternatives[stroke.index]
+                if stroke.component_path == path
+                else (current_routes[stroke.index],)
+                for stroke in candidate.strokes
+            )
+            routed = select_joint_routes(
+                proposed,
+                int(skeleton.sum()),
+                candidate=candidate,
+                beam_width=100,
+                local_score_slack=6.0,
+            )
+            if routed is None:
+                continue
+            trials.append((alignment, routed))
+            trial_alternatives[alignment] = target_alternatives
+
+        selected, selected_joint = _select_refinement_trial(
+            original, current_joint, tuple(trials)
+        )
+        if selected != original:
+            current_alignments[path] = selected
+            for stroke_index, alternatives in trial_alternatives[selected].items():
+                current_alternatives[stroke_index] = alternatives
+            current_joint = selected_joint
+        refinements.append(
+            LeafRouteGlobalRefinement(
+                path,
+                original,
+                selected,
+                baseline_score,
+                selected_joint.score,
+                len(trials),
+                locked_paths,
+            )
+        )
+    return (
+        current_alignments,
+        tuple(current_alternatives),
+        current_joint,
+        tuple(refinements),
+    )

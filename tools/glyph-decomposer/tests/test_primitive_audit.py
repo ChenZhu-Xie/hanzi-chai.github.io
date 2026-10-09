@@ -249,6 +249,13 @@ def test_primitive_report_contains_component_and_recursive_ids_views():
     assert 'id="ids-tree"' in html
 
 
+def test_primitive_report_describes_global_leaf_refinement():
+    html = render_primitive_fit_audit([{"unicode": "U+83AB"}])
+
+    assert "整字冲突重拟合" in html
+    assert "leafGlobalRouteRefinements" in html
+
+
 def test_load_blind_case_specs_accepts_array_and_normalizes_unicode(tmp_path):
     source = tmp_path / "blind.json"
     source.write_text(

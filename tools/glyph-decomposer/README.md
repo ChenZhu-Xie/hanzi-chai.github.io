@@ -96,6 +96,15 @@ tree whose node thumbnails contain the strokes currently owned by that
 subtree. Human annotation paths remain confined to the optional after-the-fact
 truth overlay and metrics.
 
+When the first whole-glyph route solve exposes a strong conflict (sustained
+same-leaf retracing or a large verified stroke-relation cost), the audit locks
+the other leaf routes and reopens only the most suspicious leaf. Candidate
+routes may touch locked ink at short junctions but may not travel along it. A
+new leaf boundary is accepted only if the complete glyph score improves while
+repeated ink does not increase and recursive IDS ordering does not regress.
+Healthy joint solutions skip this expensive second pass. The HTML summary
+reports the old/new boundary, whole-glyph score, and locked component paths.
+
 For genuinely unseen sources whose upstream glyph/IDS decomposition is known
 but which have no directed human annotation, replace `--annotations` with a
 metadata-only input:

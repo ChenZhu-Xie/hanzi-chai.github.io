@@ -25,7 +25,10 @@ from .candidate_graph import (
 )
 from .grammar import GlyphRepository
 from .leaf_alignment import search_leaf_alignments, select_joint_leaf_alignments
-from .leaf_route_selection import refine_suspicious_leaf_alignments
+from .leaf_route_selection import (
+    refine_low_confidence_leaf_routes,
+    refine_suspicious_leaf_alignments,
+)
 from .multiscale import certify_multiscale
 from .pdf_svg import export_page_svg, extract_cell_geometry, find_cell, parse_cells
 from .primitive_fit import fit_stroke_primitives, resample_polyline, symmetric_chamfer
@@ -625,6 +628,23 @@ def build_primitive_fit_cases(
         joint = select_joint_routes(
             alternatives_by_stroke, int(skeleton.sum()), candidate=candidate
         )
+        if joint is not None:
+            (
+                selected_leaf_alignments,
+                alternatives_by_stroke,
+                joint,
+                global_leaf_refinements,
+            ) = refine_low_confidence_leaf_routes(
+                skeleton,
+                candidate,
+                leaf_alignment_pools,
+                selected_leaf_alignments,
+                alternatives_by_stroke,
+                joint,
+                shortest_path_cache=shortest_path_cache,
+            )
+        else:
+            global_leaf_refinements = ()
         selected_by_stroke = (
             {route.stroke_index: route for route in joint.routes} if joint else {}
         )
@@ -766,6 +786,19 @@ def build_primitive_fit_cases(
                 }
                 for item in leaf_refinements
             ],
+            "leafGlobalRouteRefinements": [
+                {
+                    "componentPath": list(item.component_path),
+                    "originalBounds": list(item.original.bounds),
+                    "selectedBounds": list(item.selected.bounds),
+                    "baselineScore": item.baseline_score,
+                    "selectedScore": item.selected_score,
+                    "evaluatedCount": item.evaluated_count,
+                    "lockedPaths": [list(path) for path in item.locked_paths],
+                    "changed": item.changed,
+                }
+                for item in global_leaf_refinements
+            ],
             "leafPoolRefinements": list(pool_refinements),
             "certificates": {
                 "topology": topology_certificate.certified,
@@ -895,6 +928,15 @@ render=function(){
       'beforeend',
       `<br><span class="note">叶框逐笔复核：${refinements.map(item=>
         `path ${JSON.stringify(item.componentPath)}，${metric(item.originalRouteScore)} → ${metric(item.selectedRouteScore)}，复核 ${item.evaluatedCount} 个框`
+      ).join('；')}</span>`
+    );
+  }
+  const globalRefinements=(c.leafGlobalRouteRefinements||[]).filter(item=>item.changed);
+  if(globalRefinements.length){
+    summary.insertAdjacentHTML(
+      'beforeend',
+      `<br><span class="note">整字冲突重拟合：${globalRefinements.map(item=>
+        `path ${JSON.stringify(item.componentPath)}，整字分数 ${metric(item.baselineScore)} → ${metric(item.selectedScore)}，边界 ${JSON.stringify(item.originalBounds.map(x=>+x.toFixed(1)))} → ${JSON.stringify(item.selectedBounds.map(x=>+x.toFixed(1)))}，锁定 ${item.lockedPaths.map(path=>JSON.stringify(path)).join('、')}`
       ).join('；')}</span>`
     );
   }
