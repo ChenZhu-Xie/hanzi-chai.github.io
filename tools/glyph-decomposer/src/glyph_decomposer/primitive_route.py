@@ -219,6 +219,74 @@ def _single_curve_direction_compatible(
     return cosine >= minimum_cosine
 
 
+def _single_curve_turn_compatible(
+    fit: FittedStroke,
+    grammar: StrokeGrammar,
+    *,
+    sample_count: int = 33,
+) -> bool:
+    """Reject a materially inflected 捺/平捺 centreline.
+
+    Brush outline details can widen or taper a stroke, but the directed main
+    path of a 捺 keeps turning to one side. Tiny fitted sign changes are
+    tolerated because a least-squares cubic over a pixel skeleton can put its
+    controls just across the chord. Controls well onto opposite sides of the
+    chord, or a very long control polygon, identify a real S-shaped detour
+    assembled from unrelated skeleton branches.
+    """
+    if grammar.feature not in {"捺", "平捺"} or grammar.commands != ("c",):
+        return True
+    if len(fit.primitives) != 1 or fit.primitives[0].kind != "cubic":
+        return False
+    controls = np.asarray(fit.primitives[0].controls, dtype=float)
+    if controls.shape != (4, 2):
+        return False
+    span = controls.max(axis=0) - controls.min(axis=0)
+    tolerance = max(1e-6, 1e-3 * float(np.dot(span, span)))
+    signs = set()
+    for t in np.linspace(0.0, 1.0, sample_count):
+        u = 1.0 - t
+        first = 3 * (
+            u * u * (controls[1] - controls[0])
+            + 2 * u * t * (controls[2] - controls[1])
+            + t * t * (controls[3] - controls[2])
+        )
+        second = 6 * (
+            u * (controls[2] - 2 * controls[1] + controls[0])
+            + t * (controls[3] - 2 * controls[2] + controls[1])
+        )
+        signed_curvature = float(
+            first[0] * second[1] - first[1] * second[0]
+        )
+        if signed_curvature > tolerance:
+            signs.add(1)
+        elif signed_curvature < -tolerance:
+            signs.add(-1)
+    if len(signs) <= 1:
+        return True
+    chord = controls[3] - controls[0]
+    chord_length = float(np.linalg.norm(chord))
+    if chord_length <= 1e-9:
+        return False
+    signed_control_distances = tuple(
+        float(
+            chord[0] * (control - controls[0])[1]
+            - chord[1] * (control - controls[0])[0]
+        )
+        / chord_length
+        for control in controls[1:3]
+    )
+    opposite_sides = signed_control_distances[0] * signed_control_distances[1] < 0
+    material_crossing = opposite_sides and min(
+        abs(value) for value in signed_control_distances
+    ) > 0.1 * chord_length
+    control_polygon_length = float(
+        np.linalg.norm(np.diff(controls, axis=0), axis=1).sum()
+    )
+    material_detour = control_polygon_length > 1.5 * chord_length
+    return not (material_crossing or material_detour)
+
+
 def _has_interior_same_leaf_contact(
     candidate: CandidateGraph, stroke: CandidateStroke
 ) -> bool:
@@ -495,6 +563,8 @@ def enumerate_primitive_routes(
             if interior_contact and not _single_curve_direction_compatible(
                 fit.fitted_path, grammar, minimum_cosine=0.85
             ):
+                continue
+            if not _single_curve_turn_compatible(fit, grammar):
                 continue
             score, endpoint, guide, length, direction, region = _route_score(
                 route,

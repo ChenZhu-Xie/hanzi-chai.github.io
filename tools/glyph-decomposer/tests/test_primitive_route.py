@@ -4,10 +4,12 @@ import pytest
 from glyph_decomposer.candidate_graph import compile_candidate_graph
 from glyph_decomposer.grammar import GlyphRepository
 from glyph_decomposer.leaf_alignment import LeafAlignment
+from glyph_decomposer.primitive_fit import FittedPrimitive, FittedStroke
 from glyph_decomposer.primitive_route import (
     PrimitiveRoute,
     _endpoint_candidates,
     _single_curve_direction_compatible,
+    _single_curve_turn_compatible,
     enumerate_primitive_routes,
     select_joint_routes,
 )
@@ -60,6 +62,46 @@ def test_single_curve_direction_is_a_hard_stroke_grammar_constraint():
     assert not _single_curve_direction_compatible(
         ((10, 10), (2, 20)), grammar, candidate, minimum_cosine=0.85
     )
+
+
+def _cubic_fit(controls):
+    primitive = FittedPrimitive(
+        "c",
+        "cubic",
+        tuple(controls),
+        (controls[0], controls[-1]),
+        0,
+        1,
+        0.0,
+    )
+    return FittedStroke(
+        ("c",),
+        (primitive,),
+        (controls[0], controls[-1]),
+        (controls[0], controls[-1]),
+        0.0,
+        0.0,
+        4,
+        1.0,
+    )
+
+
+def test_nak_stroke_rejects_an_s_shaped_cubic_but_accepts_one_way_turn():
+    grammar = canonical_stroke_grammar("捺", ("c",))
+    one_way = _cubic_fit(((0, 0), (0, 4), (4, 9), (10, 10)))
+    numerical_wobble = _cubic_fit(((0, 0), (3, 3.2), (7, 6.8), (10, 10)))
+    inflected = _cubic_fit(((0, 0), (10, 0), (0, 10), (10, 10)))
+
+    assert _single_curve_turn_compatible(one_way, grammar)
+    assert _single_curve_turn_compatible(numerical_wobble, grammar)
+    assert not _single_curve_turn_compatible(inflected, grammar)
+
+
+def test_single_curve_turn_rule_is_specific_to_nak_family():
+    grammar = canonical_stroke_grammar("点", ("c",))
+    inflected = _cubic_fit(((0, 0), (10, 0), (0, 10), (10, 10)))
+
+    assert _single_curve_turn_compatible(inflected, grammar)
 
 
 def test_primitive_route_enumeration_is_ranked_and_truth_free():
@@ -456,4 +498,3 @@ def test_joint_selection_preserves_same_leaf_intersection_position():
     assert solution is not None
     assert solution.routes[1].pixels == horizontal(50).pixels
     assert solution.stroke_relation_cost < 0.1
-
