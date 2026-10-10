@@ -631,7 +631,10 @@ def build_primitive_fit_cases(
             for stroke in candidate.strokes
         )
         joint = select_joint_routes(
-            alternatives_by_stroke, int(skeleton.sum()), candidate=candidate
+            alternatives_by_stroke,
+            int(skeleton.sum()),
+            candidate=candidate,
+            allow_constraint_fallback=True,
         )
         if joint is not None:
             (

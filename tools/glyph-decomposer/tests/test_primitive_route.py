@@ -17,6 +17,7 @@ from glyph_decomposer.primitive_route import (
     _single_curve_turn_compatible,
     _single_line_direction_compatible,
     _terminal_compound_direction_compatible,
+    _terminal_direction_is_semantically_complete,
     _terminal_hook_direction_compatible,
     enumerate_primitive_routes,
     select_joint_routes,
@@ -64,9 +65,7 @@ def test_endpoint_candidates_always_reserve_real_skeleton_terminals():
         | {(y, 15) for y in range(5, 16)}
     )
 
-    selected = _endpoint_candidates(
-        component, np.asarray((5.0, 10.0)), 1.0, count=1
-    )
+    selected = _endpoint_candidates(component, np.asarray((5.0, 10.0)), 1.0, count=1)
 
     assert (10, 2) in selected
 
@@ -93,9 +92,10 @@ def test_direction_complete_terminal_need_not_be_a_whole_graph_terminal():
     component = frozenset((10, x) for x in range(2, 23))
     route = tuple((10, x) for x in range(2, 11))
 
-    assert _endpoint_completion_measure(
-        component, route, graph, graph.strokes[0]
-    ) == (1, 8.0)
+    assert _endpoint_completion_measure(component, route, graph, graph.strokes[0]) == (
+        1,
+        8.0,
+    )
     assert _endpoint_completion_measure(
         component,
         route,
@@ -277,7 +277,7 @@ def test_horizontal_fall_cannot_stop_after_its_horizontal_prefix():
     )
 
 
-def _route_with_fit(fit, score):
+def _route_with_fit(fit, score, *, length_cost=0.0):
     return PrimitiveRoute(
         stroke_index=0,
         pixels=((0, 0), (0, 1)),
@@ -285,7 +285,7 @@ def _route_with_fit(fit, score):
         score=score,
         endpoint_cost=0.0,
         guide_cost=0.0,
-        length_cost=0.0,
+        length_cost=length_cost,
         direction_cost=0.0,
         region_cost=0.0,
         placement_confidence=0.0,
@@ -304,11 +304,57 @@ def test_plausible_observed_hook_route_precedes_semantic_completion():
     )
 
     selected = _prefer_observed_routes(
-        (_route_with_fit(synthesized, 1.0), _route_with_fit(observed, 4.0))
+        (_route_with_fit(synthesized, 1.0), _route_with_fit(observed, 4.0)),
+        grammar,
     )
 
     assert len(selected) == 1
     assert selected[0].fit.semantic_completion is None
+
+
+def test_plain_stroke_does_not_bypass_graph_endpoint_completion():
+    grammar = canonical_stroke_grammar("横", ("h",))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    fit = _multi_primitive_fit(grammar.commands, (horizontal,))
+
+    assert not _terminal_direction_is_semantically_complete(fit, grammar)
+
+
+def test_synthesized_hook_does_not_bypass_graph_endpoint_completion():
+    grammar = canonical_stroke_grammar("横钩", ("h",))
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    false_extension = _line_primitive("l", (10, 0), (14, 1), 1)
+    synthesized = _complete_terminal_hook(
+        _multi_primitive_fit(grammar.commands, (horizontal, false_extension)), grammar
+    )
+
+    assert not _terminal_direction_is_semantically_complete(synthesized, grammar)
+
+
+def test_local_observed_hook_does_not_replace_a_complete_backbone():
+    grammar = canonical_stroke_grammar("横钩", ("h",))
+    short_horizontal = _line_primitive("h", (0, 0), (2, 0), 0)
+    observed_hook = _line_primitive("l", (2, 0), (0, 3), 1)
+    local_cap = _multi_primitive_fit(
+        grammar.commands,
+        (short_horizontal, observed_hook),
+    )
+    long_horizontal = _line_primitive("h", (0, 0), (20, 0), 0)
+    false_extension = _line_primitive("l", (20, 0), (24, 1), 1)
+    completed = _complete_terminal_hook(
+        _multi_primitive_fit(grammar.commands, (long_horizontal, false_extension)),
+        grammar,
+    )
+
+    selected = _prefer_observed_routes(
+        (
+            _route_with_fit(local_cap, 1.0, length_cost=1.8),
+            _route_with_fit(completed, 2.0, length_cost=0.1),
+        ),
+        grammar,
+    )
+
+    assert selected == (_route_with_fit(completed, 2.0, length_cost=0.1),)
 
 
 def _cubic_fit(controls):
@@ -733,6 +779,70 @@ def test_joint_selection_never_reuses_a_long_segment_inside_one_leaf():
     assert solution.repeated_pixel_count == 0
 
 
+def test_joint_selection_can_recover_a_strict_route_filtered_by_hook_preference():
+    graph = compile_candidate_graph(
+        GlyphRepository(
+            [
+                {
+                    "id": 1,
+                    "type": "component",
+                    "strokes": [
+                        {
+                            "feature": "横",
+                            "start": [10, 25],
+                            "curveList": [{"command": "h", "parameterList": [80]}],
+                        },
+                        {
+                            "feature": "横钩",
+                            "start": [10, 75],
+                            "curveList": [
+                                {"command": "h", "parameterList": [70]},
+                                {"command": "l", "parameterList": [-8, 8]},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        ),
+        1,
+    )
+    horizontal = _line_primitive("h", (0, 0), (10, 0), 0)
+    first_fit = _multi_primitive_fit(("h",), (horizontal,))
+    full_hook = _multi_primitive_fit(
+        ("h", "l"),
+        (horizontal, _line_primitive("l", (10, 0), (7, 4), 1)),
+    )
+    local_cap = _multi_primitive_fit(
+        ("h", "l"),
+        (
+            _line_primitive("h", (0, 0), (2, 0), 0),
+            _line_primitive("l", (2, 0), (0, 3), 1),
+        ),
+    )
+    occupied = tuple((5, x) for x in range(1, 12))
+    distinct = tuple((12, x) for x in range(1, 6))
+    first = PrimitiveRoute(
+        0, occupied, first_fit, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1
+    )
+    preferred_but_blocked = PrimitiveRoute(
+        1, occupied, full_hook, 1.0, 0.0, 0.0, 0.1, 0.0, 0.0, 1.0, 2
+    )
+    filtered_but_strict = PrimitiveRoute(
+        1, distinct, local_cap, 2.0, 0.0, 0.0, 1.8, 0.0, 0.0, 1.0, 2
+    )
+
+    solution = select_joint_routes(
+        ((first,), (preferred_but_blocked, filtered_but_strict)),
+        len(set(occupied) | set(distinct)),
+        candidate=graph,
+        free_contact_pixels=0,
+    )
+
+    assert solution is not None
+    assert solution.routes[1] == filtered_but_strict
+    assert solution.repeated_pixel_count == 0
+
+
 def test_joint_selection_never_reuses_a_long_segment_across_leaves():
     graph = compile_candidate_graph(
         GlyphRepository(
@@ -798,13 +908,14 @@ def test_joint_selection_never_reuses_a_long_segment_across_leaves():
         int(skeleton.sum()),
         candidate=graph,
         free_contact_pixels=0,
+        allow_constraint_fallback=True,
     )
 
     assert solution is not None
     assert solution.routes[1].pixels == distinct.pixels
 
 
-def test_joint_selection_returns_none_when_a_leaf_can_only_retrace_itself():
+def test_joint_selection_penalizes_retrace_when_it_is_the_only_solution():
     graph = compile_candidate_graph(
         GlyphRepository(
             [
@@ -838,12 +949,17 @@ def test_joint_selection_returns_none_when_a_leaf_can_only_retrace_itself():
         1, template.pixels, template.fit, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1
     )
 
-    assert (
-        select_joint_routes(
-            ((first,), (retrace,)), int(skeleton.sum()), candidate=graph
-        )
-        is None
+    solution = select_joint_routes(
+        ((first,), (retrace,)),
+        int(skeleton.sum()),
+        candidate=graph,
+        free_contact_pixels=0,
+        allow_constraint_fallback=True,
     )
+
+    assert solution is not None
+    assert solution.routes == (first, retrace)
+    assert solution.repeated_pixel_count == len(retrace.pixels)
 
 
 def test_joint_selection_respects_recursive_ids_order():

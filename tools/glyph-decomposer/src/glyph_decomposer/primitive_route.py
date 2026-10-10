@@ -103,8 +103,7 @@ def _endpoint_candidates(
                 pixel
                 for pixel in component
                 if sum(
-                    (pixel[0] + dy, pixel[1] + dx) in component
-                    for dy, dx in offsets
+                    (pixel[0] + dy, pixel[1] + dx) in component for dy, dx in offsets
                 )
                 <= 1
             ),
@@ -407,8 +406,7 @@ def _terminal_hook_direction_compatible(
         tangent = controls[-1] - controls[-2]
         length = float(np.linalg.norm(tangent))
         return (
-            length > 1e-9
-            and float(-tangent[1] / length) >= minimum_vertical_fraction
+            length > 1e-9 and float(-tangent[1] / length) >= minimum_vertical_fraction
         )
 
     return True
@@ -439,13 +437,81 @@ def _terminal_compound_direction_compatible(
     return float(np.dot(observed, expected) / denominator) >= minimum_cosine
 
 
+def _terminal_direction_is_semantically_complete(
+    fit: FittedStroke, grammar: StrokeGrammar
+) -> bool:
+    """Whether a grammar-defined terminal may end before a graph terminal."""
+    return grammar.feature == "横撇"
+
+
 def _prefer_observed_routes(
-    alternatives: tuple[PrimitiveRoute, ...], *, score_slack: float = 4.0
+    alternatives: tuple[PrimitiveRoute, ...],
+    grammar: StrokeGrammar | None = None,
+    *,
+    score_slack: float = 4.0,
+    length_cost_slack: float = 0.45,
 ) -> tuple[PrimitiveRoute, ...]:
-    """Prefer a plausible PDF-evidenced route over a synthesized hook."""
+    """Prefer a plausible PDF-evidenced route over a synthesized hook.
+
+    A visible calligraphic spur is not sufficient evidence for a hook by
+    itself.  For hook grammars the observed route must also retain the long
+    semantic backbone: its non-hook primitives must occupy a material share
+    of the route and its total length must remain competitive with the best
+    candidate-length match.  This prevents a tiny local cap from replacing a
+    complete horizontal/vertical backbone merely because the cap points in
+    the expected hook direction.
+    """
     observed = tuple(
         route for route in alternatives if route.fit.semantic_completion is None
     )
+    if grammar is not None and grammar.feature in {
+        "竖钩",
+        "横钩",
+        "横折钩",
+        "竖弯钩",
+    }:
+        expected_backbone_fraction = sum(grammar.segment_ratios[:-1])
+        minimum_backbone_fraction = max(0.45, expected_backbone_fraction - 0.25)
+        best_length_cost = min(route.length_cost for route in alternatives)
+
+        def complete_backbone(route: PrimitiveRoute) -> bool:
+            lengths = []
+            for primitive in route.fit.primitives:
+                points = np.asarray(
+                    primitive.samples or primitive.controls,
+                    dtype=float,
+                )
+                lengths.append(
+                    float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+                    if len(points) >= 2
+                    else 0.0
+                )
+            total = sum(lengths)
+            backbone_fraction = sum(lengths[:-1]) / max(total, 1e-9)
+            return (
+                backbone_fraction >= minimum_backbone_fraction
+                and route.length_cost <= best_length_cost + length_cost_slack
+            )
+
+        complete_observed = tuple(
+            route for route in observed if complete_backbone(route)
+        )
+        synthesized = tuple(
+            route for route in alternatives if route.fit.semantic_completion is not None
+        )
+        # Preserve the historical evidence boundary after discarding local
+        # caps: a credible observed route wins as a class, rather than being
+        # mixed with synthesized routes and displaced by their local scores.
+        # Semantic completion is the fallback when no credible full observed
+        # backbone exists.
+        best_score = min(route.score for route in alternatives)
+        if complete_observed and (
+            not synthesized
+            or min(route.score for route in complete_observed)
+            <= best_score + score_slack
+        ):
+            return complete_observed
+        return synthesized or complete_observed or alternatives
     if not observed:
         return alternatives
     best_score = min(route.score for route in alternatives)
@@ -454,9 +520,7 @@ def _prefer_observed_routes(
     return alternatives
 
 
-def _complete_terminal_hook(
-    fit: FittedStroke, grammar: StrokeGrammar
-) -> FittedStroke:
+def _complete_terminal_hook(fit: FittedStroke, grammar: StrokeGrammar) -> FittedStroke:
     """Restore a semantic hook that the medial skeleton did not preserve.
 
     The candidate feature is authoritative about whether a stroke owns a hook;
@@ -551,18 +615,12 @@ def _endpoint_contact_permissions(
 
 def _terminal_distances(component: frozenset[Pixel]) -> dict[Pixel, int]:
     offsets = tuple(
-        (dy, dx)
-        for dy in (-1, 0, 1)
-        for dx in (-1, 0, 1)
-        if (dy, dx) != (0, 0)
+        (dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)
     )
     terminals = tuple(
         point
         for point in component
-        if sum(
-            (point[0] + dy, point[1] + dx) in component for dy, dx in offsets
-        )
-        <= 1
+        if sum((point[0] + dy, point[1] + dx) in component for dy, dx in offsets) <= 1
     )
     distances = {point: 0 for point in terminals}
     queue = deque(terminals)
@@ -929,7 +987,9 @@ def enumerate_primitive_routes(
                     route,
                     candidate,
                     stroke,
-                    terminal_direction_complete=grammar.feature == "横撇",
+                    terminal_direction_complete=(
+                        _terminal_direction_is_semantically_complete(fit, grammar)
+                    ),
                 )
             )
             alternatives.append(
@@ -1229,6 +1289,10 @@ def select_joint_routes(
     local_score_slack: float = 2.0,
     maximum_same_leaf_shared_run: int = 8,
     same_leaf_fallback_limit: int = 16,
+    hook_preference_reserve_limit: int = 2,
+    hook_preference_reserve_penalty: float = 12.0,
+    final_contact_relaxation_penalty: float = 12.0,
+    allow_constraint_fallback: bool = False,
 ) -> JointRouteSolution | None:
     """Choose one route per stroke under whole-glyph exclusive coverage pressure.
 
@@ -1244,16 +1308,28 @@ def select_joint_routes(
     ] = {}
     # route score, routes, occupied pixels, repeated count, IDS cost, relation cost
     states = [(0.0, (), frozenset(), 0, 0.0, 0.0)]
-    for alternatives in alternatives_by_stroke:
-        alternatives = _prefer_observed_routes(alternatives)
+    for stroke_index, alternatives in enumerate(alternatives_by_stroke):
+        raw_alternatives = alternatives
+        grammar = (
+            canonical_stroke_grammar(
+                candidate.strokes[stroke_index].feature,
+                candidate.strokes[stroke_index].commands,
+            )
+            if candidate is not None
+            else None
+        )
+        # Preserve the historical ordering: observed/synthesized evidence is
+        # resolved before endpoint-completion pruning. Moving this below the
+        # pruning changes otherwise-solvable glyphs, because a synthesized
+        # route can redefine the minimum completion class.
+        alternatives = _prefer_observed_routes(alternatives, grammar)
         minimum_completion_violations = min(
             route.endpoint_completion_violations for route in alternatives
         )
         complete_alternatives = tuple(
             route
             for route in alternatives
-            if route.endpoint_completion_violations
-            == minimum_completion_violations
+            if route.endpoint_completion_violations == minimum_completion_violations
         )
         minimum_completion_cost = min(
             route.endpoint_completion_cost for route in complete_alternatives
@@ -1268,78 +1344,161 @@ def select_joint_routes(
         adaptive_slack = local_score_slack * (1.0 - placement_confidence)
         local_limit = local_winner.score + adaptive_slack
         eligible_alternatives = tuple(
-            route
-            for route in completion_alternatives
-            if route.score <= local_limit
+            route for route in completion_alternatives if route.score <= local_limit
         )
+        hook_grammar = grammar is not None and grammar.feature in {
+            "竖钩",
+            "横钩",
+            "横折钩",
+            "竖弯钩",
+        }
         expanded = []
-        for score, routes, occupied, repeated, _structure, relation_cost in states:
-            state_alternatives = tuple(
-                route
-                for route in eligible_alternatives
-                if candidate is None
-                or (
-                    _preserves_interior_contact_signature(candidate, routes, route)
-                    and not _reuses_completed_segment(
-                        candidate,
-                        routes,
-                        route,
-                        maximum_shared_run=maximum_same_leaf_shared_run,
-                    )
-                )
-            )
-            if not state_alternatives and candidate is not None:
-                state_alternatives = tuple(
+        # First expand every surviving universe under strict exclusivity. Only
+        # when the *whole frontier* is empty do we relax this one stroke. This
+        # keeps all earlier strict decisions and prevents a local conflict from
+        # restarting the complete glyph in a globally permissive mode.
+        for relax_constraints in (
+            (False, True) if allow_constraint_fallback else (False,)
+        ):
+            expanded = []
+            for score, routes, occupied, repeated, _structure, relation_cost in states:
+                strict_alternatives = tuple(
                     route
-                    for route in sorted(
-                        alternatives,
-                        key=lambda item: (
-                            item.endpoint_completion_violations,
-                            item.endpoint_completion_cost,
-                            item.score,
-                            item.pixels,
-                        ),
-                    )
-                    if _preserves_interior_contact_signature(candidate, routes, route)
-                    and not _reuses_completed_segment(
-                        candidate,
-                        routes,
-                        route,
-                        maximum_shared_run=maximum_same_leaf_shared_run,
-                    )
-                )[:same_leaf_fallback_limit]
-            for route in state_alternatives:
-                pixels = frozenset(route.pixels)
-                overlap = len(pixels & occupied)
-                newly_covered = len(pixels - occupied)
-                charged_overlap = max(0, overlap - free_contact_pixels)
-                proposed_routes = (*routes, route)
-                structure = (
-                    _ids_structure_cost(ids_specs, proposed_routes)
-                    if ids_specs
-                    else 0.0
-                )
-                new_relation_cost = (
-                    _new_stroke_relation_cost(candidate, routes, route, relation_cache)
-                    if candidate is not None
-                    else 0.0
-                )
-                proposed = (
-                    score
-                    + route.score
-                    + repeated_pixel_penalty * charged_overlap
-                    - new_pixel_reward * newly_covered
-                )
-                expanded.append(
-                    (
-                        proposed,
-                        proposed_routes,
-                        occupied | pixels,
-                        repeated + charged_overlap,
-                        structure,
-                        relation_cost + new_relation_cost,
+                    for route in eligible_alternatives
+                    if candidate is None
+                    or (
+                        _preserves_interior_contact_signature(candidate, routes, route)
+                        and not _reuses_completed_segment(
+                            candidate,
+                            routes,
+                            route,
+                            maximum_shared_run=maximum_same_leaf_shared_run,
+                        )
                     )
                 )
+                if candidate is not None and hook_grammar:
+                    # Hook-backbone preference is a heuristic, not proof.
+                    # Preserve a tiny set of penalized, strictly valid raw
+                    # universes so later IDS/contact evidence can recover from
+                    # a locally attractive but globally impossible backbone.
+                    reserve_alternatives = tuple(
+                        route
+                        for route in sorted(
+                            raw_alternatives,
+                            key=lambda item: (
+                                item.endpoint_completion_violations,
+                                item.endpoint_completion_cost,
+                                item.score,
+                                item.pixels,
+                            ),
+                        )
+                        if route not in strict_alternatives
+                        and _preserves_interior_contact_signature(
+                            candidate, routes, route
+                        )
+                        and not _reuses_completed_segment(
+                            candidate,
+                            routes,
+                            route,
+                            maximum_shared_run=maximum_same_leaf_shared_run,
+                        )
+                    )[:hook_preference_reserve_limit]
+                    strict_alternatives = (
+                        *strict_alternatives,
+                        *reserve_alternatives,
+                    )
+                state_alternatives = strict_alternatives
+                ordered_alternatives: tuple[PrimitiveRoute, ...] = ()
+                if not state_alternatives and candidate is not None:
+                    # First search all locally worse exclusive routes. Local
+                    # score pruning cannot prove global impossibility.
+                    ordered_alternatives = tuple(
+                        sorted(
+                            raw_alternatives,
+                            key=lambda item: (
+                                item.endpoint_completion_violations,
+                                item.endpoint_completion_cost,
+                                item.score,
+                                item.pixels,
+                            ),
+                        )
+                    )
+                    state_alternatives = tuple(
+                        route
+                        for route in ordered_alternatives
+                        if _preserves_interior_contact_signature(
+                            candidate, routes, route
+                        )
+                        and not _reuses_completed_segment(
+                            candidate,
+                            routes,
+                            route,
+                            maximum_shared_run=maximum_same_leaf_shared_run,
+                        )
+                    )[:same_leaf_fallback_limit]
+                    if not state_alternatives and relax_constraints:
+                        state_alternatives = tuple(
+                            route
+                            for route in ordered_alternatives
+                            if _preserves_interior_contact_signature(
+                                candidate, routes, route
+                            )
+                        )[:same_leaf_fallback_limit]
+                    if (
+                        not state_alternatives
+                        and relax_constraints
+                        and stroke_index == len(alternatives_by_stroke) - 1
+                    ):
+                        state_alternatives = ordered_alternatives[
+                            :same_leaf_fallback_limit
+                        ]
+                for route in state_alternatives:
+                    pixels = frozenset(route.pixels)
+                    overlap = len(pixels & occupied)
+                    newly_covered = len(pixels - occupied)
+                    charged_overlap = max(0, overlap - free_contact_pixels)
+                    final_contact_relaxed = (
+                        relax_constraints
+                        and candidate is not None
+                        and stroke_index == len(alternatives_by_stroke) - 1
+                        and not _preserves_interior_contact_signature(
+                            candidate, routes, route
+                        )
+                    )
+                    proposed_routes = (*routes, route)
+                    structure = (
+                        _ids_structure_cost(ids_specs, proposed_routes)
+                        if ids_specs
+                        else 0.0
+                    )
+                    new_relation_cost = (
+                        _new_stroke_relation_cost(
+                            candidate, routes, route, relation_cache
+                        )
+                        if candidate is not None
+                        else 0.0
+                    )
+                    proposed = (
+                        score
+                        + route.score
+                        + hook_preference_reserve_penalty
+                        * int(hook_grammar and route not in eligible_alternatives)
+                        + repeated_pixel_penalty * charged_overlap
+                        + final_contact_relaxation_penalty * int(final_contact_relaxed)
+                        - new_pixel_reward * newly_covered
+                    )
+                    expanded.append(
+                        (
+                            proposed,
+                            proposed_routes,
+                            occupied | pixels,
+                            repeated + charged_overlap,
+                            structure,
+                            relation_cost + new_relation_cost,
+                        )
+                    )
+            if expanded:
+                break
         expanded.sort(
             key=lambda item: (
                 item[0]
