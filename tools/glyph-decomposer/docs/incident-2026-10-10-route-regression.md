@@ -66,3 +66,28 @@
 
 下一轮不应继续在事故现场叠规则。应从 `78b6748` 建立固定的 18 字源门禁；
 把“全局 no-reuse 放宽”和“完整 hook 主干”拆成两个独立、小提交，逐项比较。
+
+## 封存后复核：纯净 `78b6748` 的真实基线
+
+事故现场封存并推送后，仓库切回本地与远程均指向 `78b6748` 的
+`feat/deterministic-glyph-decomposer`，在干净工作树上重新生成同一组 18 字源。
+结果证明此前名为 baseline/current 的若干 HTML 是在带未提交改动的工作树中生成，
+不能作为该 commit 的可重现结果。
+
+纯净 `78b6748` 的实际结果为：
+
+- 18 个字源中 10 个完成全部笔画，8 个直接得到 0/N；
+- 0/N：U+6418-G、U+6424-J、U+6485-J、U+64CF-H、U+64EC-T、
+  U+66DA-J、U+66DA-N、U+6726-J；
+- U+808E-T 虽为 6/6，但 residual 371、repeated 2、Chamfer 6.339；
+- 六个 blind case 均完成 N/N；
+- 四组耗时约为 221、185、600、445 秒；事故现场对应为 411、245、784、451 秒；
+- 该提交的 targeted test 为 27 passed in 1.18s。
+
+纯净基线 HTML 生成于：
+`artifacts/deterministic-decomposer/primitive-fit-baseline-78b6748-18.html`
+（本地 artifact，不提交）。
+
+这说明事故并非单纯“后期修坏了一个原本完整的 18/18 模型”。准确描述应为：
+`78b6748` 本身存在大量真实 0/N；未提交修复确实救回其中多数案例，但在缺少固定回归门禁、
+阶段性 commit 和 artifact provenance 的情况下，又引入重复路径、质量退化和新的 0/N。
