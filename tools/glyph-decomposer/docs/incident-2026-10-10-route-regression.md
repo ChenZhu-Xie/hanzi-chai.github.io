@@ -91,3 +91,6 @@
 这说明事故并非单纯“后期修坏了一个原本完整的 18/18 模型”。准确描述应为：
 `78b6748` 本身存在大量真实 0/N；未提交修复确实救回其中多数案例，但在缺少固定回归门禁、
 阶段性 commit 和 artifact provenance 的情况下，又引入重复路径、质量退化和新的 0/N。
+
+更早阶段的逐 commit 重跑见
+[`benchmark-history-18-sources.md`](benchmark-history-18-sources.md)。
