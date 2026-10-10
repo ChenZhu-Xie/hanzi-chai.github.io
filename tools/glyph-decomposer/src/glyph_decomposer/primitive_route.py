@@ -213,6 +213,46 @@ def _single_curve_direction_compatible(
     return cosine >= minimum_cosine
 
 
+def _single_line_direction_compatible(
+    fitted_path, grammar: StrokeGrammar, *, minimum_cosine: float = 0.90
+) -> bool:
+    """Keep a one-line grammar a line of the candidate's directed kind."""
+    if len(grammar.commands) != 1 or grammar.commands[0] not in {"h", "v"}:
+        return True
+    points = np.asarray(fitted_path, dtype=float)
+    observed = points[-1] - points[0]
+    expected = np.asarray(grammar.direction_vectors[0], dtype=float)
+    denominator = float(np.linalg.norm(observed) * np.linalg.norm(expected))
+    if denominator <= 1e-9:
+        return False
+    return float(np.dot(observed, expected) / denominator) >= minimum_cosine
+
+
+def _terminal_compound_direction_compatible(
+    fit: FittedStroke,
+    grammar: StrokeGrammar,
+    *,
+    minimum_cosine: float = 0.35,
+) -> bool:
+    """Keep a compound stroke's decisive terminal segment semantic.
+
+    横撇 is especially vulnerable to stopping after its horizontal prefix:
+    that truncated route can be a graph terminal even though it omits the
+    entire falling stroke. The final primitive must therefore agree with the
+    candidate's directed terminal command before endpoint completeness is
+    considered.
+    """
+    if grammar.feature != "横撇" or len(fit.primitives) < 2:
+        return True
+    controls = np.asarray(fit.primitives[-1].controls, dtype=float)
+    observed = controls[-1] - controls[0]
+    expected = np.asarray(grammar.direction_vectors[-1], dtype=float)
+    denominator = float(np.linalg.norm(observed) * np.linalg.norm(expected))
+    if denominator <= 1e-9:
+        return False
+    return float(np.dot(observed, expected) / denominator) >= minimum_cosine
+
+
 def _single_curve_turn_compatible(
     fit: FittedStroke,
     grammar: StrokeGrammar,
@@ -563,6 +603,10 @@ def enumerate_primitive_routes(
                 )
             except ValueError:
                 continue
+            if not _terminal_compound_direction_compatible(fit, grammar):
+                continue
+            if not _single_line_direction_compatible(fit.fitted_path, grammar):
+                continue
             if not _single_curve_direction_compatible(
                 fit.fitted_path,
                 grammar,
@@ -799,6 +843,7 @@ def _reuses_same_leaf_segment(
     proposed: PrimitiveRoute,
     *,
     maximum_shared_run: int,
+    maximum_retrace_fraction: float = 0.75,
 ) -> bool:
     strokes = {stroke.index: stroke for stroke in candidate.strokes}
     proposed_stroke = strokes[proposed.stroke_index]
@@ -806,15 +851,20 @@ def _reuses_same_leaf_segment(
         selected_stroke = strokes[route.stroke_index]
         if selected_stroke.component_path != proposed_stroke.component_path:
             continue
+        shared = _longest_shared_run(proposed.pixels, frozenset(route.pixels))
+        if shared > maximum_shared_run:
+            return True
+        shorter_length = min(len(proposed.pixels), len(route.pixels))
         if (
-            _longest_shared_run(proposed.pixels, frozenset(route.pixels))
-            > maximum_shared_run
+            shorter_length > 0
+            and shared >= maximum_retrace_fraction * shorter_length
+            and shared > 4
         ):
             return True
     return False
 
 
-def select_joint_routes(
+def _search_joint_routes(
     alternatives_by_stroke: tuple[tuple[PrimitiveRoute, ...], ...],
     skeleton_pixel_count: int,
     *,
@@ -829,19 +879,20 @@ def select_joint_routes(
     local_score_slack: float = 2.0,
     maximum_same_leaf_shared_run: int = 8,
     same_leaf_fallback_limit: int = 16,
+    same_leaf_shared_run_penalty: float = 0.0,
+    base_same_leaf_run_threshold: int = 8,
 ) -> JointRouteSolution | None:
-    """Choose one route per stroke under whole-glyph exclusive coverage pressure.
-
-    A few shared pixels are free because real strokes meet. Longer repeated
-    traversal is penalized, while covering previously unexplained skeleton is
-    rewarded. No annotation coordinates participate in this search.
-    """
     if any(not alternatives for alternatives in alternatives_by_stroke):
         return None
     ids_specs = _ids_structure_specs(candidate.root) if candidate is not None else ()
     relation_cache: dict[
         tuple[tuple[Pixel, ...], tuple[Pixel, ...], float, float], float
     ] = {}
+    strokes_by_index = (
+        {stroke.index: stroke for stroke in candidate.strokes}
+        if candidate is not None
+        else {}
+    )
     # route score, routes, occupied pixels, repeated count, IDS cost, relation cost
     states = [(0.0, (), frozenset(), 0, 0.0, 0.0)]
     for alternatives in alternatives_by_stroke:
@@ -891,10 +942,26 @@ def select_joint_routes(
                     if candidate is not None
                     else 0.0
                 )
+                same_leaf_penalty = 0.0
+                if same_leaf_shared_run_penalty > 0.0 and candidate is not None:
+                    prop_s = strokes_by_index[route.stroke_index]
+                    longest_share = max(
+                        (
+                            _longest_shared_run(route.pixels, frozenset(prev.pixels))
+                            for prev in routes
+                            if strokes_by_index[prev.stroke_index].component_path
+                            == prop_s.component_path
+                        ),
+                        default=0,
+                    )
+                    same_leaf_penalty = same_leaf_shared_run_penalty * max(
+                        0, longest_share - base_same_leaf_run_threshold
+                    )
                 proposed = (
                     score
                     + route.score
                     + repeated_pixel_penalty * charged_overlap
+                    + same_leaf_penalty
                     - new_pixel_reward * newly_covered
                 )
                 expanded.append(
@@ -945,3 +1012,69 @@ def select_joint_routes(
         structure,
         relation_cost,
     )
+
+
+def select_joint_routes(
+    alternatives_by_stroke: tuple[tuple[PrimitiveRoute, ...], ...],
+    skeleton_pixel_count: int,
+    *,
+    candidate: CandidateGraph | None = None,
+    beam_width: int = 400,
+    free_contact_pixels: int = 5,
+    repeated_pixel_penalty: float = 0.32,
+    new_pixel_reward: float = 0.03,
+    residual_pixel_penalty: float = 0.03,
+    ids_structure_penalty: float = 30.0,
+    stroke_relation_penalty: float = 3.0,
+    local_score_slack: float = 2.0,
+    maximum_same_leaf_shared_run: int = 8,
+    same_leaf_fallback_limit: int = 16,
+    fallback_maximum_same_leaf_shared_run: int = 60,
+) -> JointRouteSolution | None:
+    """Choose one route per stroke under whole-glyph exclusive coverage pressure.
+
+    Primary search uses strict same-leaf non-retrace constraints. When dense
+    contacts or overlapping leaf strokes require it, a controlled fallback pass
+    is engaged to avoid dropping valid glyphs into 0/N failures.
+    """
+    solution = _search_joint_routes(
+        alternatives_by_stroke,
+        skeleton_pixel_count,
+        candidate=candidate,
+        beam_width=beam_width,
+        free_contact_pixels=free_contact_pixels,
+        repeated_pixel_penalty=repeated_pixel_penalty,
+        new_pixel_reward=new_pixel_reward,
+        residual_pixel_penalty=residual_pixel_penalty,
+        ids_structure_penalty=ids_structure_penalty,
+        stroke_relation_penalty=stroke_relation_penalty,
+        local_score_slack=local_score_slack,
+        maximum_same_leaf_shared_run=maximum_same_leaf_shared_run,
+        same_leaf_fallback_limit=same_leaf_fallback_limit,
+    )
+    if solution is not None:
+        return solution
+
+    if (
+        candidate is not None
+        and fallback_maximum_same_leaf_shared_run > maximum_same_leaf_shared_run
+    ):
+        return _search_joint_routes(
+            alternatives_by_stroke,
+            skeleton_pixel_count,
+            candidate=candidate,
+            beam_width=beam_width,
+            free_contact_pixels=free_contact_pixels,
+            repeated_pixel_penalty=repeated_pixel_penalty,
+            new_pixel_reward=new_pixel_reward,
+            residual_pixel_penalty=residual_pixel_penalty,
+            ids_structure_penalty=ids_structure_penalty,
+            stroke_relation_penalty=stroke_relation_penalty,
+            local_score_slack=local_score_slack + 1.0,
+            maximum_same_leaf_shared_run=fallback_maximum_same_leaf_shared_run,
+            same_leaf_fallback_limit=same_leaf_fallback_limit * 2,
+            same_leaf_shared_run_penalty=0.5,
+            base_same_leaf_run_threshold=maximum_same_leaf_shared_run,
+        )
+
+    return None

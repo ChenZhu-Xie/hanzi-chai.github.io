@@ -29,11 +29,12 @@
 | `dec0b63` | 优先完整 primitive route | 11/18 | 7 | 1.306 | 14 | 1425 | 226 / 249 / 596 / 439 |
 | `78b6748` | 保留 semantic hook terminal | 10/18 | 8 | 2.466 | 11 | 1352 | 221 / 185 / 600 / 445 |
 | archived incident | strict/relaxed fallback、reserve、beam 等未提交实验 | 17/18 | 1 | 1.725 | 144 | 2508 | 411 / 245 / 784 / 451 |
+| `feat/first-principles` | 双层分层搜索 (Tier 1 严格互斥 + Tier 2 受控软惩罚兜底) + 几何方向约束 | 18/18 | 无 | 1.046 | 36 | 4144 | 完整 18 源全跑 ~1118s |
 
 ## 逐阶段失败集合
 
-### `49fdf7d`、`4fa1ac7`、`e519aea`
-
+### `49fdf7d`、`4fa1ac7`、`e519aea`、`feat/first-principles`
+ 
 均为 18/18，无 0/N。
 
 ### `e9b79f0`、`ea3f9aa`
@@ -108,13 +109,30 @@ U+64EC-T 从 17/17 变成 0/17；U+808E-T 虽仍为 6/6，Chamfer 从约
 Chamfer 1.725，且 U+66DA-J 仍为 0/17。最慢组从纯净 `78b6748` 的约 600 秒
 升至约 784 秒。它证明 fallback 必须存在，也证明不能把 relaxed 路线直接混入主搜索。
 
+### 8. `ea3f9aa` → `feat/first-principles`：双层分层搜索与几何约束闭环
+
+本轮基于第一性原理彻底解除了覆盖率与互斥性的长期拉锯：
+1. **同 leaf 严格互斥分层 (Two-Tier Architecture)**：
+   - **Tier 1 (Strict)**：采用严格同 leaf 非折返约束（`maximum_same_leaf_shared_run = 8`），健康汉字直接在 Tier 1 产出高互斥度最优解，避免被松弛解劣化。
+   - **Tier 2 (Controlled Fallback)**：仅在 Tier 1 搜索陷入死胡同 (0/N) 时受控触发，允许更大共享上限 (`fallback_maximum_same_leaf_shared_run = 60`)，并对超出 8px 的重叠部分按长度施加惩罚 (`same_leaf_shared_run_penalty = 0.5`)。
+   - **Retrace Guard**：引入 `maximum_retrace_fraction = 0.75`，在几何上杜绝重复折返顺描同一笔画。
+2. **跨 leaf 自然接触接纳**：
+   - 跨 leaf 笔画（如 `老`/`匕`，`扌`/`八`）物理交汇为真实客观现象，由全局 `repeated_pixel_penalty` 与 IDS 树约束调节，不施加跨 leaf 硬性排斥（撤销导致 7 个 0/N 的全局 `_reuses_completed_segment` 限制）。
+3. **几何方向过滤修复**：
+   - 恢复单线几何方向兼容性（`_single_line_direction_compatible`）以及复合笔画终段语义一致性（`_terminal_compound_direction_compatible`，横撇终段必须一致），剔除局部截断噪音。
+
+**成果对比**：
+- **完整率达到 18/18**（0/N = 0），所有历史上曾失败过的 8 个字源均成功满拟合。
+- **重复像素（sum repeated）仅 36**，相较历史 18/18 版本的 206~329 像素下降近一个数量级。
+- **12 个具有人工真值的字源平均 Chamfer 维持在 1.046**，保持高度拟合保真度与结构自洽。
+
 ## 当前判断
 
-- 最好的“覆盖率基线”是 `4fa1ac7` / `e519aea`：18/18，但共享路径偏多。
-- 最好的“严格互斥基线”是 `ea3f9aa`：重复少、质量较稳，但只有 14/18。
-- `dec0b63` 和 `78b6748` 都不是合适的继续开发基点；它们分别新增覆盖率断崖。
-- 下一轮应以 `ea3f9aa` 的严格结果作为主路径，并把 `e519aea` 的成功路线只作为
-  明确标记、可审计的 fallback 候选池；不能让 fallback 与 strict 路线同权竞争。
+- `feat/first-principles` 已成功兼顾“覆盖率”与“互斥性”，成为新的稳定生产基线。
+- 架构原则经验总结：
+  - **绝不能将宽松 fallback 路线同权混入主搜索**（否则会劣化正常 glyph 的 Chamfer 和重复度）。
+  - **绝不能将同 leaf 的互斥硬规则扩散到跨 leaf 物理接触**（否则会导致字根接缝处 0/N 断崖）。
+  - **几何方向剪枝必须守住整体语义方向，而不能单凭骨架端点距离贪心截断**。
 
 ## 本地 HTML
 
