@@ -30,6 +30,7 @@
 | `78b6748` | 保留 semantic hook terminal | 10/18 | 8 | 2.466 | 11 | 1352 | 221 / 185 / 600 / 445 |
 | archived incident | strict/relaxed fallback、reserve、beam 等未提交实验 | 17/18 | 1 | 1.725 | 144 | 2508 | 411 / 245 / 784 / 451 |
 | `feat/first-principles` | 双层分层搜索 (Tier 1 严格互斥 + Tier 2 受控软惩罚兜底) + 几何方向约束 | 18/18 | 无 | 1.046 | 36 | 4144 | 完整 18 源全跑 ~1118s |
+| `feat/first-principles` (tighten IDS regression) | 收紧 leaf route 局部提议的 IDS 结构容忍阈值（0.10 -> 0.05），杜绝偏旁窃取（修复 U+6903-H） | 18/18 | 无 | 0.792 | 36 | 4061 | 924s（18 难字验证集亦 18/18 全通，且 repeated 337 -> 254） |
 
 ## 逐阶段失败集合
 

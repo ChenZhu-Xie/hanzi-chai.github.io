@@ -132,6 +132,7 @@ def refine_suspicious_leaf_alignments(
     solution: JointLeafAlignmentSolution,
     *,
     shortest_path_cache: dict | None = None,
+    maximum_ids_regression: float = 0.05,
 ) -> tuple[dict[tuple[int, ...], LeafAlignment], tuple[LeafRouteRefinement, ...]]:
     """Validate suspicious shrunken leaves using cheap, real stroke routing."""
     selected = {item.component_path: item for item in solution.alignments}
@@ -154,7 +155,7 @@ def refine_suspicious_leaf_alignments(
             # Leaf-local routing may fit well by stealing a dense neighbouring
             # component. Preserve the structural validity established by the
             # preceding joint solve.
-            if proposed_structure > baseline_structure + 0.10:
+            if proposed_structure > baseline_structure + maximum_ids_regression:
                 continue
             alternatives = tuple(
                 enumerate_primitive_routes(
