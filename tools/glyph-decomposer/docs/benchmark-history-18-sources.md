@@ -31,6 +31,7 @@
 | archived incident | strict/relaxed fallback、reserve、beam 等未提交实验 | 17/18 | 1 | 1.725 | 144 | 2508 | 411 / 245 / 784 / 451 |
 | `feat/first-principles` | 双层分层搜索 (Tier 1 严格互斥 + Tier 2 受控软惩罚兜底) + 几何方向约束 | 18/18 | 无 | 1.046 | 36 | 4144 | 完整 18 源全跑 ~1118s |
 | `feat/first-principles` (tighten IDS regression) | 收紧 leaf route 局部提议的 IDS 结构容忍阈值（0.10 -> 0.05），杜绝偏旁窃取（修复 U+6903-H） | 18/18 | 无 | 0.792 | 36 | 4061 | 924s（18 难字验证集亦 18/18 全通，且 repeated 337 -> 254） |
+| `feat/first-principles` (cross-stroke mutual exclusion + offset prior) | 引入 offset 先验防偏旁漂移、跨笔画持续段互斥（>8px）、撇弦向约束与 ⿸ 左翼 IDS 结构约束（彻底修复 U+6903-H、U+7740-J、U+9A30-K） | 18/18 | 无 | 0.792 | 36 | 4061 | 18 难字验证集 repeated 从 254 骤降至 70（降幅超 72%），全部 18/18 满分拟合 |
 
 ## 逐阶段失败集合
 

@@ -177,11 +177,15 @@ def _direction_cost(route: np.ndarray, grammar: StrokeGrammar) -> float:
     window = min(5, len(route) - 1)
     start_vector = route[window] - route[0]
     end_vector = route[-1] - route[-1 - window]
-    return _angle_cost(start_vector, np.asarray(grammar.direction_vectors[0])) + (
+    cost = _angle_cost(start_vector, np.asarray(grammar.direction_vectors[0])) + (
         _angle_cost(end_vector, np.asarray(grammar.direction_vectors[-1]))
         if len(grammar.commands) > 1
         else 0.0
     )
+    if grammar.commands == ("c",) and len(route) >= 3:
+        chord = route[-1] - route[0]
+        cost += 0.5 * _angle_cost(chord, np.asarray(grammar.direction_vectors[0]))
+    return cost
 
 
 def _single_curve_direction_compatible(
@@ -210,7 +214,8 @@ def _single_curve_direction_compatible(
     if denominator <= 1e-9:
         return False
     cosine = float(np.dot(chord, expected) / denominator)
-    return cosine >= minimum_cosine
+    effective_min = max(minimum_cosine, 0.88) if grammar.feature == "撇" else minimum_cosine
+    return cosine >= effective_min
 
 
 def _single_line_direction_compatible(
@@ -845,12 +850,7 @@ def _reuses_same_leaf_segment(
     maximum_shared_run: int,
     maximum_retrace_fraction: float = 0.75,
 ) -> bool:
-    strokes = {stroke.index: stroke for stroke in candidate.strokes}
-    proposed_stroke = strokes[proposed.stroke_index]
     for route in selected:
-        selected_stroke = strokes[route.stroke_index]
-        if selected_stroke.component_path != proposed_stroke.component_path:
-            continue
         shared = _longest_shared_run(proposed.pixels, frozenset(route.pixels))
         if shared > maximum_shared_run:
             return True
@@ -944,13 +944,10 @@ def _search_joint_routes(
                 )
                 same_leaf_penalty = 0.0
                 if same_leaf_shared_run_penalty > 0.0 and candidate is not None:
-                    prop_s = strokes_by_index[route.stroke_index]
                     longest_share = max(
                         (
                             _longest_shared_run(route.pixels, frozenset(prev.pixels))
                             for prev in routes
-                            if strokes_by_index[prev.stroke_index].component_path
-                            == prop_s.component_path
                         ),
                         default=0,
                     )

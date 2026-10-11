@@ -132,7 +132,7 @@ def refine_suspicious_leaf_alignments(
     solution: JointLeafAlignmentSolution,
     *,
     shortest_path_cache: dict | None = None,
-    maximum_ids_regression: float = 0.05,
+    maximum_ids_regression: float = 0.005,
 ) -> tuple[dict[tuple[int, ...], LeafAlignment], tuple[LeafRouteRefinement, ...]]:
     """Validate suspicious shrunken leaves using cheap, real stroke routing."""
     selected = {item.component_path: item for item in solution.alignments}

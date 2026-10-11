@@ -170,7 +170,12 @@ def search_leaf_alignments(
                     )
                     if not _inside_canvas(bounds):
                         continue
-                    score = _score_points(normalized, bounds, distances) + scale_penalty
+                    offset_penalty = 0.02 * math.hypot(offset_x, offset_y)
+                    score = (
+                        _score_points(normalized, bounds, distances)
+                        + scale_penalty
+                        + offset_penalty
+                    )
                     transformed = _transformed_points(normalized, bounds)
                     height, width = skeleton.shape
                     xs = np.clip(
@@ -218,6 +223,14 @@ def search_leaf_alignments(
         bucketed.setdefault(signature, hypothesis)
     ordered = sorted(bucketed.values(), key=lambda item: (item.score, item.bounds))
     selected: list[LeafAlignment] = []
+    near_origin = [
+        hypothesis
+        for hypothesis in ordered
+        if math.hypot(hypothesis.offset_x, hypothesis.offset_y) <= 12
+    ]
+    for hypothesis in near_origin[:2]:
+        if _diverse(hypothesis, selected):
+            selected.append(hypothesis)
     for hypothesis in ordered:
         if _diverse(hypothesis, selected):
             selected.append(hypothesis)
@@ -245,21 +258,26 @@ def _alignment_ids_specs(candidate: CandidateGraph, leaf_paths):
             else ()
         )
         for operator, first_child, second_child in pairs:
-            output.append(
-                (
-                    operator,
-                    frozenset(
-                        path
-                        for path in leaf_paths
-                        if path[: len(first_child.path)] == first_child.path
-                    ),
-                    frozenset(
-                        path
-                        for path in leaf_paths
-                        if path[: len(second_child.path)] == second_child.path
-                    ),
-                )
+            first_set = frozenset(
+                path
+                for path in leaf_paths
+                if path[: len(first_child.path)] == first_child.path
             )
+            second_set = frozenset(
+                path
+                for path in leaf_paths
+                if path[: len(second_child.path)] == second_child.path
+            )
+            output.append((operator, first_set, second_set))
+            if operator == "⿸" and len(first_child.children) > 0:
+                for sub in first_child.children:
+                    sub_set = frozenset(
+                        path
+                        for path in leaf_paths
+                        if path[: len(sub.path)] == sub.path
+                    )
+                    if sub.bounds[2] <= second_child.bounds[0] + 5.0 and sub_set and second_set:
+                        output.append(("⿰", sub_set, second_set))
         for child in node.children:
             visit(child)
 
