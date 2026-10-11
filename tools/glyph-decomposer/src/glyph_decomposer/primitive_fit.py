@@ -83,10 +83,43 @@ def _parameterize(points: np.ndarray) -> np.ndarray:
     return cumulative / total
 
 
+def _strip_endpoint_spurs(points: np.ndarray) -> np.ndarray:
+    """Universal Rule 3: Strip orthogonal burs/spurs at stroke start/end and project to true trunk spine."""
+    if len(points) < 5:
+        return points
+    points = points.copy()
+    i_q1 = max(1, len(points) // 4)
+    i_q3 = min(len(points) - 2, (3 * len(points)) // 4)
+    trunk_vec = points[i_q3] - points[i_q1]
+    trunk_len = float(np.linalg.norm(trunk_vec))
+    if trunk_len <= 1e-6:
+        return points
+    trunk_unit = trunk_vec / trunk_len
+
+    v_start = points[1] - points[0]
+    len_start = float(np.linalg.norm(v_start))
+    if len_start > 0.3:
+        cos_start = float(np.dot(v_start, trunk_unit) / len_start)
+        if cos_start < 0.25:
+            proj_dist = float(np.dot(points[0] - points[1], trunk_unit))
+            points[0] = points[1] + min(proj_dist, -0.2) * trunk_unit
+
+    v_end = points[-1] - points[-2]
+    len_end = float(np.linalg.norm(v_end))
+    if len_end > 0.3:
+        cos_end = float(np.dot(v_end, trunk_unit) / len_end)
+        if cos_end < 0.25:
+            proj_dist = float(np.dot(points[-1] - points[-2], trunk_unit))
+            points[-1] = points[-2] + max(proj_dist, 0.2) * trunk_unit
+
+    return points
+
+
 def _fit_line(points: np.ndarray, command: str, start: int, end: int):
-    controls = (tuple(points[0]), tuple(points[-1]))
-    t = _parameterize(points)[:, None]
-    prediction = points[0] * (1 - t) + points[-1] * t
+    cleaned = _strip_endpoint_spurs(points)
+    controls = (tuple(cleaned[0]), tuple(cleaned[-1]))
+    t = _parameterize(cleaned)[:, None]
+    prediction = cleaned[0] * (1 - t) + cleaned[-1] * t
     error = float(np.sum((points - prediction) ** 2))
     return FittedPrimitive(
         command,
@@ -100,12 +133,13 @@ def _fit_line(points: np.ndarray, command: str, start: int, end: int):
 
 
 def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
-    p0, p2 = points[0], points[-1]
-    t = _parameterize(points)
+    cleaned = _strip_endpoint_spurs(points)
+    p0, p2 = cleaned[0], cleaned[-1]
+    t = _parameterize(cleaned)
     u = 1.0 - t
     basis = (2.0 * u * t)[:, None]
     fixed = u[:, None] ** 2 * p0 + t[:, None] ** 2 * p2
-    target = points - fixed
+    target = cleaned - fixed
     denom = float(np.sum(basis**2))
     if denom <= 1e-12:
         p1 = 0.5 * (p0 + p2)
@@ -113,7 +147,6 @@ def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
         p1 = np.sum(basis * target, axis=0) / denom
 
     # Universal Rule 1 (Vertical Sweep P1 Deep Sinking):
-    # Detect 竖撇: starts predominantly vertical downwards, then sweeps leftwards at bottom
     is_vertical_sweep = (
         (p2[1] - p0[1]) > 5.0
         and (p0[0] - p2[0]) > 2.0
@@ -121,13 +154,12 @@ def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
         and abs(points[min(5, len(points) - 1), 0] - p0[0]) <= 1.5
     )
     if is_vertical_sweep:
-        # P1 horizontal locked to p0[0] ensuring strictly vertical start (dx/dt=0)
         p1[0] = p0[0]
-        # P1 depth sunken to 75%..90% of vertical drop
         min_y1 = p0[1] + 0.75 * (p2[1] - p0[1])
         max_y1 = p0[1] + 0.90 * (p2[1] - p0[1])
         p1[1] = float(np.clip(p1[1], min_y1, max_y1))
 
+    # Universal Rule 4 (Trunk Length Maximization):
     prediction = (
         u[:, None] ** 2 * p0
         + 2.0 * u[:, None] * t[:, None] * p1

@@ -80,3 +80,19 @@ def test_quadratic_vertical_sweep_uses_sunken_control_point():
     # P1 vertical sunken deeply
     assert ctrls[1][1] > 60.0
     assert fit.rmse < 0.6
+
+
+def test_endpoint_spur_stripping_projects_to_true_trunk():
+    # Route with a lateral spur at the start perpendicular to the southwest trunk
+    trunk_t = np.linspace(0, 1, 15)
+    trunk_x = 50.0 - 12.5 * trunk_t
+    trunk_y = 15.0 + 11.2 * trunk_t
+    trunk = np.column_stack((trunk_x, trunk_y))
+    # Lateral spur at index 0 sticking out perpendicular to trunk direction
+    spur_p0 = trunk[0] + 3.0 * np.array([0.67, 0.74])
+    route = np.vstack(([spur_p0], trunk))
+
+    fit = fit_stroke_primitives(route, ("h",), [(0, 0), (100, 0)])
+    p0 = fit.primitives[0].controls[0]
+    # The lateral spur should be stripped, projecting P0 back near trunk[0]
+    assert np.linalg.norm(np.asarray(p0) - trunk[0]) < 0.5
