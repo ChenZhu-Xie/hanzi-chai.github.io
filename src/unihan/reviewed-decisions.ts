@@ -534,6 +534,12 @@ export const REVIEWED_SOURCE_DECISIONS: ReviewedSourceDecision[] = [
   { unicode: 0x6418, source: "T", referenceId: 9313, replacementId: 127551 },
   { unicode: 0x6461, source: "J", referenceId: 7368, replacementId: 46403 },
   { unicode: 0x6478, source: "J", referenceId: 7695, replacementId: 7695 },
+  ...(["H", "T"] as const).map((source) => ({
+    unicode: 0x6478,
+    source,
+    referenceId: 7695,
+    replacementId: 127177,
+  })),
   { unicode: 0x64ec, source: "T", referenceId: 5201, replacementId: 128254 },
   { unicode: 0x655a, source: "T", referenceId: 1028, replacementId: 1028 },
 ].map((decision) => ({ ...decision, provenance: "manual" }));
