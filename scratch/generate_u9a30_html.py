@@ -3,6 +3,12 @@ from pathlib import Path
 
 data = json.loads(Path("scratch/u9a30_annotation_data.json").read_text(encoding="utf-8"))
 
+claimed_total = data["claimed_total"]
+total_pts = data["total_pts"]
+cov_pct = f"{claimed_total / total_pts * 100:.1f}%"
+unclaimed_count = len(data["unclaimed_indices"])
+red_pct = f"{(633 - unclaimed_count) / 633 * 100:.0f}%"
+
 html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -739,7 +745,7 @@ html_content = f"""<!DOCTYPE html>
       <div class="glyph-badge">騰</div>
       <div class="title-group">
         <h1>U+9A30 騰 · K (KSX-133032) <span class="tag tag-success">视觉模型标注</span> <span class="tag tag-danger">算法病灶对照</span></h1>
-        <p>20 笔全要素时空切片逐笔标注 · 骨架解释覆盖率 85.5% (1466 / 1714 点) · 攻克 633 巨额残余翻车重灾区</p>
+        <p>20 笔全要素时空切片逐笔标注 · 骨架解释覆盖率 {cov_pct} ({claimed_total} / {total_pts} 点) · 攻克 633 巨额残余翻车重灾区</p>
       </div>
     </div>
     <div class="header-right">
@@ -748,12 +754,12 @@ html_content = f"""<!DOCTYPE html>
         <span class="lbl">正字笔画数</span>
       </div>
       <div class="stat-pill">
-        <span class="val">85.5%</span>
+        <span class="val">{cov_pct}</span>
         <span class="lbl">骨架解释覆盖率</span>
       </div>
       <div class="stat-pill">
-        <span class="val">633 → 248</span>
-        <span class="lbl">残差点剧减 61%</span>
+        <span class="val">633 → {unclaimed_count}</span>
+        <span class="lbl">残差点剧减 {red_pct}</span>
       </div>
     </div>
   </header>
