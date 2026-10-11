@@ -59,3 +59,24 @@ def test_two_cubics_use_seven_unique_control_points():
     assert fit.primitives[0].controls[-1] == fit.primitives[1].controls[0]
     assert fit.control_point_count == 7
     assert fit.rmse < 0.5
+
+
+def test_quadratic_vertical_sweep_uses_sunken_control_point():
+    # Vertical sweep route: drops straight down from (17.6, 15.5) then sweeps to (9.0, 87.5)
+    t = np.linspace(0, 1, 17)
+    p0 = np.array([17.6, 15.5])
+    p1 = np.array([17.6, 78.0])
+    p2 = np.array([9.0, 87.5])
+    route = (1 - t[:, None]) ** 2 * p0 + 2 * (1 - t[:, None]) * t[:, None] * p1 + t[:, None] ** 2 * p2
+
+    fit = fit_stroke_primitives(route, ("q",), route)
+
+    assert [item.kind for item in fit.primitives] == ["quadratic"]
+    assert fit.control_point_count == 3
+    ctrls = fit.primitives[0].controls
+    assert len(ctrls) == 3
+    # P1 horizontal locked to P0 horizontal
+    assert abs(ctrls[1][0] - ctrls[0][0]) < 1e-3
+    # P1 vertical sunken deeply
+    assert ctrls[1][1] > 60.0
+    assert fit.rmse < 0.6

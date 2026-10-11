@@ -23,7 +23,10 @@ class StrokeGrammar:
 
     @property
     def control_point_count(self) -> int:
-        return 1 + sum(3 if command in {"c", "z"} else 1 for command in self.commands)
+        return 1 + sum(
+            3 if command in {"c", "z"} else 2 if command in {"q"} else 1
+            for command in self.commands
+        )
 
 
 def _grammar(feature, commands, vectors, ratios, tool):
@@ -42,6 +45,7 @@ _GRAMMARS = {
     "竖": _grammar("竖", "v", ((0, 1),), (1,), "line"),
     "提": _grammar("提", "l", ((1, -0.45),), (1,), "line"),
     "撇": _grammar("撇", "c", ((-0.55, 1),), (1,), "bezier"),
+    "竖撇": _grammar("竖撇", "q", ((-0.4, 1),), (1,), "bezier"),
     "平撇": _grammar("平撇", "c", ((-1, 0.25),), (1,), "bezier"),
     "捺": _grammar("捺", "c", ((0.75, 1),), (1,), "bezier"),
     "平捺": _grammar("平捺", "c", ((1, 0.35),), (1,), "bezier"),

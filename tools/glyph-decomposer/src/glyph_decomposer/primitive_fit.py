@@ -15,8 +15,9 @@ import numpy as np
 
 Point = tuple[float, float]
 
-_SAMPLES_PER_COMMAND = {"h": 1, "v": 1, "l": 1, "c": 16, "z": 16, "a": 24}
+_SAMPLES_PER_COMMAND = {"h": 1, "v": 1, "l": 1, "q": 16, "c": 16, "z": 16, "a": 24}
 _LINE_COMMANDS = frozenset(("h", "v", "l"))
+_QUADRATIC_COMMANDS = frozenset(("q",))
 _CUBIC_COMMANDS = frozenset(("c", "z"))
 
 
@@ -91,6 +92,52 @@ def _fit_line(points: np.ndarray, command: str, start: int, end: int):
         command,
         "line",
         controls,
+        tuple(map(tuple, prediction)),
+        start,
+        end,
+        error,
+    )
+
+
+def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
+    p0, p2 = points[0], points[-1]
+    t = _parameterize(points)
+    u = 1.0 - t
+    basis = (2.0 * u * t)[:, None]
+    fixed = u[:, None] ** 2 * p0 + t[:, None] ** 2 * p2
+    target = points - fixed
+    denom = float(np.sum(basis**2))
+    if denom <= 1e-12:
+        p1 = 0.5 * (p0 + p2)
+    else:
+        p1 = np.sum(basis * target, axis=0) / denom
+
+    # Universal Rule 1 (Vertical Sweep P1 Deep Sinking):
+    # Detect 竖撇: starts predominantly vertical downwards, then sweeps leftwards at bottom
+    is_vertical_sweep = (
+        (p2[1] - p0[1]) > 5.0
+        and (p0[0] - p2[0]) > 2.0
+        and len(points) >= 4
+        and abs(points[min(5, len(points) - 1), 0] - p0[0]) <= 1.5
+    )
+    if is_vertical_sweep:
+        # P1 horizontal locked to p0[0] ensuring strictly vertical start (dx/dt=0)
+        p1[0] = p0[0]
+        # P1 depth sunken to 75%..90% of vertical drop
+        min_y1 = p0[1] + 0.75 * (p2[1] - p0[1])
+        max_y1 = p0[1] + 0.90 * (p2[1] - p0[1])
+        p1[1] = float(np.clip(p1[1], min_y1, max_y1))
+
+    prediction = (
+        u[:, None] ** 2 * p0
+        + 2.0 * u[:, None] * t[:, None] * p1
+        + t[:, None] ** 2 * p2
+    )
+    error = float(np.sum((points - prediction) ** 2))
+    return FittedPrimitive(
+        command,
+        "quadratic",
+        tuple(map(tuple, (p0, p1, p2))),
         tuple(map(tuple, prediction)),
         start,
         end,
@@ -190,6 +237,8 @@ def _fit_arc(points: np.ndarray, command: str, start: int, end: int):
 def _fit_segment(points: np.ndarray, command: str, start: int, end: int):
     if command in _LINE_COMMANDS:
         return _fit_line(points, command, start, end)
+    if command in _QUADRATIC_COMMANDS:
+        return _fit_quadratic(points, command, start, end)
     if command in _CUBIC_COMMANDS:
         return _fit_cubic(points, command, start, end)
     if command == "a":
@@ -235,6 +284,14 @@ def _sample_primitive(primitive: FittedPrimitive, count: int = 101) -> np.ndarra
     if primitive.kind == "line":
         t = np.linspace(0.0, 1.0, count)[:, None]
         return controls[0] * (1 - t) + controls[1] * t
+    if primitive.kind == "quadratic":
+        t = np.linspace(0.0, 1.0, count)[:, None]
+        u = 1.0 - t
+        return (
+            u**2 * controls[0]
+            + 2.0 * u * t * controls[1]
+            + t**2 * controls[2]
+        )
     if primitive.kind == "cubic":
         t = np.linspace(0.0, 1.0, count)
         u = 1 - t
