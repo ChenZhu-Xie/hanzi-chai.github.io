@@ -486,3 +486,62 @@ def symmetric_chamfer(first, second) -> float:
     first_distance = _distances_to_polyline(first_values, second_values)
     second_distance = _distances_to_polyline(second_values, first_values)
     return float((first_distance.mean() + second_distance.mean()) / 2)
+
+
+def compute_stroke_overlap_penalty(
+    first_path,
+    second_path,
+    distance_threshold: float = 1.2,
+    discrete_crossing_span_max: float = 2.5,
+    tangent_collinear_threshold: float = 0.85,
+) -> float:
+    """Universal Rule 6: Discrete Crossing Permission & Collinear Overlap Penalty.
+
+    In Hanzi topology, strokes may cross transversally at 1 or more discrete intersection points
+    (e.g., horizontal crossing vertical or diagonal strokes in '十', '天', '木') with ZERO penalty.
+    Only when two distinct strokes share a continuous collinear segment (tangent vectors aligned
+    and points running along the same corridor for an extended span > discrete_crossing_span_max)
+    is a penalty applied proportional to the shared segment length.
+    """
+    first = np.asarray(first_path, dtype=float)
+    second = np.asarray(second_path, dtype=float)
+    if len(first) < 2 or len(second) < 2:
+        return 0.0
+
+    distances = _distances_to_polyline(first, second)
+    close_mask = distances <= distance_threshold
+    if not np.any(close_mask):
+        return 0.0
+
+    diffs = np.diff(close_mask.astype(int))
+    starts = np.where(diffs == 1)[0] + 1
+    if close_mask[0]:
+        starts = np.r_[0, starts]
+    ends = np.where(diffs == -1)[0]
+    if close_mask[-1]:
+        ends = np.r_[ends, len(close_mask) - 1]
+
+    total_collinear_overlap = 0.0
+    for s_idx, e_idx in zip(starts, ends):
+        cluster = first[s_idx : e_idx + 1]
+        _, cluster_length = _lengths(cluster)
+
+        if cluster_length > discrete_crossing_span_max:
+            v_cluster = cluster[-1] - cluster[0]
+            len_c = float(np.linalg.norm(v_cluster))
+            if len_c > 1e-6:
+                u_cluster = v_cluster / len_c
+                center = 0.5 * (cluster[0] + cluster[-1])
+                sec_diff = np.diff(second, axis=0)
+                sec_lens = np.linalg.norm(sec_diff, axis=1)
+                valid_segs = sec_lens > 1e-6
+                if np.any(valid_segs):
+                    sec_units = sec_diff[valid_segs] / sec_lens[valid_segs][:, None]
+                    sec_mids = 0.5 * (second[:-1][valid_segs] + second[1:][valid_segs])
+                    dists_to_mids = np.linalg.norm(sec_mids - center, axis=1)
+                    best_seg = int(np.argmin(dists_to_mids))
+                    cos_align = abs(float(np.dot(u_cluster, sec_units[best_seg])))
+                    if cos_align >= tangent_collinear_threshold:
+                        total_collinear_overlap += float(cluster_length - discrete_crossing_span_max)
+
+    return float(total_collinear_overlap)
