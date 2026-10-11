@@ -115,12 +115,40 @@ def _strip_endpoint_spurs(points: np.ndarray) -> np.ndarray:
     return points
 
 
+def _truncate_void_gaps(points: np.ndarray, max_gap: float = 2.5) -> np.ndarray:
+    """Universal Rule 5: Skeleton Corridor Continuity & Void Gap Barrier Rule.
+    If route samples in terminal regions jump across a void gap (> max_gap and > 3.0 * median_step),
+    truncate the disconnected outlier segment to prevent cross-stroke annexation.
+    """
+    if len(points) < 5:
+        return points
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    med_step = float(np.median(steps)) if len(steps) > 0 else 1.0
+    thresh = max(max_gap, 3.0 * med_step)
+
+    # Check tail: look for gaps in the last 25% of points
+    tail_start = max(1, int(len(points) * 0.75))
+    gap_indices_tail = np.where(steps[tail_start:] > thresh)[0]
+    if len(gap_indices_tail) > 0:
+        cut_idx = tail_start + gap_indices_tail[0] + 1
+        points = points[:cut_idx]
+
+    # Check head: look for gaps in the first 25% of points
+    head_end = max(1, int(len(points) * 0.25))
+    gap_indices_head = np.where(steps[:head_end] > thresh)[0]
+    if len(gap_indices_head) > 0:
+        cut_idx = gap_indices_head[-1] + 1
+        points = points[cut_idx:]
+
+    return points
+
+
 def _fit_line(points: np.ndarray, command: str, start: int, end: int):
-    cleaned = _strip_endpoint_spurs(points)
+    cleaned = _strip_endpoint_spurs(_truncate_void_gaps(points))
     controls = (tuple(cleaned[0]), tuple(cleaned[-1]))
     t = _parameterize(cleaned)[:, None]
     prediction = cleaned[0] * (1 - t) + cleaned[-1] * t
-    error = float(np.sum((points - prediction) ** 2))
+    error = float(np.sum((cleaned - prediction) ** 2))
     return FittedPrimitive(
         command,
         "line",
@@ -133,7 +161,7 @@ def _fit_line(points: np.ndarray, command: str, start: int, end: int):
 
 
 def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
-    cleaned = _strip_endpoint_spurs(points)
+    cleaned = _strip_endpoint_spurs(_truncate_void_gaps(points))
     p0, p2 = cleaned[0], cleaned[-1]
     t = _parameterize(cleaned)
     u = 1.0 - t
@@ -165,7 +193,7 @@ def _fit_quadratic(points: np.ndarray, command: str, start: int, end: int):
         + 2.0 * u[:, None] * t[:, None] * p1
         + t[:, None] ** 2 * p2
     )
-    error = float(np.sum((points - prediction) ** 2))
+    error = float(np.sum((cleaned - prediction) ** 2))
     return FittedPrimitive(
         command,
         "quadratic",

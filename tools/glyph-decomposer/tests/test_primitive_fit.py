@@ -96,3 +96,21 @@ def test_endpoint_spur_stripping_projects_to_true_trunk():
     p0 = fit.primitives[0].controls[0]
     # The lateral spur should be stripped, projecting P0 back near trunk[0]
     assert np.linalg.norm(np.asarray(p0) - trunk[0]) < 0.5
+
+
+def test_void_gap_truncation_prevents_cross_stroke_annexation():
+    # Horizontal stroke trunk from x=45 to x=80 with continuous 0.5px steps
+    trunk_x = np.linspace(45.0, 79.7, 70)
+    trunk_y = np.full_like(trunk_x, 24.6)
+    trunk = np.column_stack((trunk_x, trunk_y))
+
+    # An alien stroke tail at x=86.0 (separated by a 6.3px void gap)
+    alien_tail = np.array([[86.0, 24.6], [86.4, 24.6]])
+    contaminated_route = np.vstack((trunk, alien_tail))
+
+    fit = fit_stroke_primitives(contaminated_route, ("h",), [(45.0, 24.6), (80.0, 24.6)])
+    p1 = fit.primitives[0].controls[1]
+    # P1 should truncate at trunk end (79.7), never leaping across the gap to 86.4
+    assert 79.0 <= p1[0] <= 80.5
+    assert fit.maximum_error > 5.0
+
