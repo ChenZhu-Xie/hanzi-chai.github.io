@@ -125,10 +125,82 @@
        - 错误的 Candidate 会导致错误的字拆部件与部件拆笔画，最终无法收敛或收敛到低骨架覆盖率 + 恶性残差；
        - 正确的 Candidate 则引导出正确的自底向上逐笔吸附，最终自然收敛到高骨架覆盖率（95.2%+）与超高分拟合！
 
+### 规律 8：全局低拟合诊断与同类不同形兄弟部件逆向诱导律（Global Low-Fitness Diagnosis & Inverse Allomorphic Sibling Component Induction Law）
+
+> **这是汉拆算法辅助拆分灵魂的最后那块拼图（The Soul Puzzle Piece of Hanzi Decomposition）。**
+
+#### 1. 全景病灶剖析：当所有 Candidate 的覆盖率 / Fit 分均不高时，可能存在哪些情况？
+
+当面对一个未解析字源，若候选集 $\mathcal{C} = \{C_1, C_2, \dots, C_m\}$ 中**每一个 Candidate 的全局骨架覆盖率均极低（如 $<70\%$）且/或拟合代价极大（$\text{RMSE} \gg 1.5\text{px}$）**，算法不应盲目报错或强行指派低分错误模板，而应依据以下 4 类第一性原理病灶进行结构化诊断：
+
+1. **状况 A：底层骨架提取与二值化病灶（Low-Level Skeletonization / Preprocessing Artifacts）**
+   - 字符图像存在严重断墨、飞白，或墨迹润胀导致笔画大面积假粘连、假空洞环路，导致细化出来的骨架在物理世界中已经丢失了真实主干或产生了畸变拓扑。
+2. **状况 B：字形规范与历史字源异体冲突（Orthographic Standard / Glyphic Variant Mismatch）**
+   - 字源字形遵循了特定国家/历史规范（如日韩 KS/JIS 规范、传承旧字形），而 Candidate 库仅收录了现代通用大陆规范（G 源）。例如：“户”首笔点 vs 首横；“青”下底月 vs 円；“兑”上部八 vs 丷；“角”中竖穿透底横 vs 不穿透。
+3. **状况 C：IDS 宏观拓扑树层级失配或歧义（IDS Tree Hierarchy Misalignment）**
+   - 宏观 IDS 描述树存在歧义或拆解层次不完备（如两层嵌套顺序颠倒，或穿插结构被强行硬套为嵌套结构，将非连续部件强行并合为一），导致各部件区域在宏观上严重相互交叠，无法找到合法的一维或二维拓扑分割线。
+4. **状况 D（最核心、最普遍、也是 Upstream 目前最大的人工痛点）：同类但不同形的“兄弟部件（Allomorphic Sibling Components）”缺失！**
+   - **部件异形体（Allomorphic Sibling Components）的汉字构形本质**：
+     汉字在空间排布中遵循“随体诘屈、避让穿插、因地制宜”的动态美学原则。同一个部件（同一个字理原子/IDS 符号），在不同构形环境下会演化出完全不同的物理拓扑与笔画形态：
+     - **位置诱导变形**：左偏旁 vs 右偏旁 vs 顶盖 vs 底座 vs 包围框。
+       - 例如 **馬**：独体为“馬”（四点底）；作左旁（如“騎”）底横变提、竖折折钩极窄；作底座（如“篤/騰/驚”）横向展宽、底横平平甚至连笔；
+       - 例如 **月**：作左偏旁为竖撇（首笔深潜弯向西南）；作右部（如“明/朝”）首笔为直竖；作下部为“肉月”或底横搭接变化；
+       - 例如 **足** $\to$ **⻊**（捺变提）；**手** $\to$ **扌**；**水** $\to$ **氵** / **氺**；**火** $\to$ **灬**；**心** $\to$ **忄** / **⺗**；**车** $\to$ **車**底横变提；
+     - **行笔简化与连笔兄弟部件**：如“草字头”的三笔连横形（艹） vs 四笔分离形（艹） vs 两个十；“示/衣”的横撇变横竖点；“食”字旁与“飠”；“网”与“罒”；
+     - **微拓扑兄弟部件**：出头 vs 不出头（如“由”与“田”）；相交穿透 vs 接触（如“天”与“夭”）；末笔钩 vs 提 vs 点。
+   - **Upstream（汉拆）的人工瓶颈**：
+     目前 upstream 维护者在日常人工审核汉字拆分时，耗费最大心力的正是：**当现有部件库对某个字匹配不上时，人工用肉眼去识别到底是哪个部件在形态上与库里既有部件不同，然后人工在数据库中“新增设一个同类但不同形的兄弟部件”，并手工画出/输入它的新笔画几何！**
+     这是典型的“人工填补封闭世界假设（Closed-World Assumption）与开放字形演化之间的鸿沟”。
+
+---
+
+#### 2. 核心突破：将闭环残差评估升维为主动兄弟部件逆向诱导引擎
+
+如果算法仅仅能评估“已有 candidate 好不好”，那算法依然是一个“被动的裁判”。而一旦将**“笔画作为试金石的双向闭环残差评估律”**升级为**“基于未解释残差的主动兄弟部件逆向诱导引擎（Inverse Allomorphic Sibling Component Induction Engine）”**，算法就直接升维为**“自动化辅助汉字拆分的智能导师”**！
+
+- **核心洞见：残差即指纹（Residual is Topological Fingerprint）**：
+  未解释骨架残差不是“垃圾”，它是新兄弟部件在物理世界留下的真实高保真拓扑指纹！当一个部件在库中缺少对应形态时，真实的笔画走廊依然完整烙印在未被认领的骨架中。
+
+#### 3. 兄弟部件逆向诱导算法工作流（Five-Stage Sibling Induction Pipeline）
+
+1. **阶段 1：互补残差归因与故障部件定位（Complementary Residual Attribution & Fault Localization）**
+   - 在所有低分候选树中，执行**局部自洽最大覆盖（Local Consensus Max-Cover）**：
+     识别出在全字中**已经被高置信度解释并闭环封闭的部件集** $\mathcal{C}_{\text{closed}}$（例如在“騰”中，月部 512 点、八部 114 点、天部 440 点已被完全封闭，置信度 $>99\%$）。
+   - 提取全局未解释残差骨架 $\mathcal{S}_{\text{residual}} = \mathcal{S}_{\text{raw}} \setminus \bigcup_{C \in \mathcal{C}_{\text{closed}}} \text{Claimed}(C)$。
+   - 将残差点集 $\mathcal{S}_{\text{residual}}$ 的质心、空间包围盒以及与已闭环部件的相对拓扑方位，与 IDS 宏观指向进行对齐，**确定性锁定未闭合的目标部件 $C_{\text{target}}$（如在天部下方、月部右侧，残差 553 点完全吻合馬部的宏观拓扑指向！）**。
+
+2. **阶段 2：残差走廊物理拓扑逆向蒸馏（Inverse Physical Topology Distillation via Rules 1..7）**
+   - 在残差骨架 $\mathcal{S}_{\text{residual}}$ 内，依据字理笔顺先验，顺次应用 Universal Rules 1..7（去毛刺真起点、主干全长最大化、真空断层隔离、离散相交零惩罚、首笔锚定与双尺度递推）；
+   - **直接从残差像素中提取出一条条真实的、高保真物理主干几何链 $\mathcal{T}_{\text{induced}} = [s_1, s_2, \dots, s_k]$**！
+
+3. **阶段 3：兄弟部件变异类型学判定（Allomorphic Mutation Typology Analysis）**
+   - 与部件库中已有的 base component $C_{\text{base}}$ 比对，精确量化变异模式：
+     - **拓扑变异（Topology Mutation）**：笔画数变异（如四点底连笔化为横，4 笔变 1 笔）；
+     - **几何变异（Geometry Mutation）**：横向拉宽比突变（如高宽比从 $2:1$ 突变为 $1:1.6$ 扁平底座）；
+     - **端点变异（Terminal Mutation）**：左下端出头、提化或平化。
+
+4. **阶段 4：虚拟兄弟部件全字自洽性闭环验证（Closed-Loop Virtual Acceptance Testing）**
+   - 将重构出的 $\mathcal{T}_{\text{induced}}$ 包装为虚拟候选部件 $\widetilde{C}_{\text{sibling}}$；
+   - 挂载入候选树合成全新 Candidate $C^* = (\mathcal{C}_{\text{closed}} \cup \{\widetilde{C}_{\text{sibling}}\})$，重新运行全字确定性求解器：
+     - 验证全字骨架覆盖率是否从 $\le 65\%$ **瞬间跃迁至 $\ge 95\%$**；
+     - 验证全字平均 RMSE 是否控制在 $\le 0.8\text{px}$，且残差率降至 $<5\%$；
+     - **若验证通过，判定该虚拟部件为数学唯一自洽解！**
+
+5. **阶段 5：Upstream 辅助拆分推荐包自动生成（Assisted Curation Packet Generation）**
+   - 自动生成标准化 JSON/SVG 数据包，输出包括：
+     - 基础部件标识（Base Component ID）、建议兄弟变体命名（Proposed Sibling Name）；
+     - 变异类型与原因诊断（Mutation Type & Rationale）；
+     - 归一化矢量笔画坐标数据（SVG / Polyline / Bezier Commands）；
+     - 覆盖率跃迁与残差收敛曲线证据包。
+   - **Upstream 人工维护者仅需一键 Review & Accept，即可将新兄弟部件收入全局字库！**
+
 ---
 
 ## 6. 产出物归档
 
 - 交互式时空片段页面：`artifacts/deterministic-decomposer/stroke-annotation-u9a30-k.html`
+- 前 11 笔构建实测检验页面：`artifacts/deterministic-decomposer/strokes-01-to-11-u9a30.html`
 - 标注数据 JSON：`scratch/u9a30_annotation_data.json`
 - 标注生成脚本：`scratch/fit_u9a30_strokes.py`、`scratch/generate_u9a30_html.py`
+- 兄弟部件逆向诱导模块：`tools/glyph-decomposer/src/glyph_decomposer/sibling_induction.py`
+- 兄弟部件单元测试：`tools/glyph-decomposer/tests/test_sibling_induction.py`
