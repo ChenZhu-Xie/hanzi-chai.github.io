@@ -23,9 +23,9 @@ bh = by1 - by0
 def ring_to_d(ring):
     coords = list(ring.coords)
     if not coords: return ""
-    d = f"M {(coords[0][0]-bx0)/bw*100:.2f},{(coords[0][1]-by0)/bh*100:.2f}"
+    d = f"M {coords[0][0]:.2f},{coords[0][1]:.2f}"
     for c in coords[1:]:
-        d += f" L {(c[0]-bx0)/bw*100:.2f},{(c[1]-by0)/bh*100:.2f}"
+        d += f" L {c[0]:.2f},{c[1]:.2f}"
     d += " Z"
     return d
 
