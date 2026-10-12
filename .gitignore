@@ -39,3 +39,4 @@ package/hanzi-chai/src/data
 __pycache__/
 /test-results/
 .verysync/
+.verysyncignore
