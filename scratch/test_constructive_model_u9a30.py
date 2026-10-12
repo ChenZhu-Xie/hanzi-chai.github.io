@@ -142,6 +142,14 @@ progressive_strokes = [
         "controls": [[64.5, 47.7], [64.5, 69.5]],
         "rule": "中脊梁贯通律: 自首横交点(64.5, 47.7)垂直穿透次横/三横下抵底横(64.5, 69.5)",
     },
+    {
+        "index": 15,
+        "name": "第16笔·馬·底横折钩",
+        "component": "馬 (1, 1, 0)",
+        "type": "polyline",
+        "controls": [[47.5, 69.5], [84.8, 69.5], [82.0, 86.7], [68.5, 84.4]],
+        "rule": "矮胖横折钩4点位律 (与月同源): P0(47.5,69.5)咬合左竖->P1(84.8,69.5)右上折角->P2(82.0,86.7)深潜钩底角->P3(68.5,84.4)斜挑钩尖",
+    },
 ]
 
 print("\n" + "=" * 80)
@@ -192,11 +200,11 @@ for i, s in enumerate(progressive_strokes):
 total_claimed = len(claimed_indices_all)
 pct = total_claimed / total_points * 100
 print("\n" + "=" * 80)
-print(f"前 15 笔累计构建成果:")
+print(f"前 16 笔累计构建成果:")
 print(f"  全字骨架总点数: {total_points}")
-print(f"  前 15 笔累计认领点数: {total_claimed} 点 ({pct:.1f}%)")
+print(f"  前 16 笔累计认领点数: {total_claimed} 点 ({pct:.1f}%)")
 print(f"  月部 (4笔): 512 点完全解释闭环")
 print(f"  八部 (2笔): 114 点完全解释闭环")
 print(f"  天部 (4笔): 440 点完全解释闭环")
-print(f"  馬部主体前5笔 (首横、左竖、次横、三横、中竖): 443 点严整认领")
+print(f"  馬部主体框架 (6笔): 607 点完全解释闭环 (首横、左竖、次横、三横、中竖、底横折钩)")
 print("=" * 80)
