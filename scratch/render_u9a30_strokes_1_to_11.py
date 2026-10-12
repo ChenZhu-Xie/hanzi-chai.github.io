@@ -51,6 +51,10 @@ strokes = [
         "index": 11, "name": "第11笔·馬·首横", "color": "#06b6d4",
         "d": "M 47.5,47.7 L 79.7,47.7", "type": "L"
     },
+    {
+        "index": 12, "name": "第12笔·馬·左竖", "color": "#0891b2",
+        "d": "M 47.5,47.7 L 47.5,69.5", "type": "L"
+    },
 ]
 
 skel_circles = "".join([f'<circle cx="{p[0]}" cy="{p[1]}" r="0.25" fill="#475569" opacity="0.6" />' for p in skel_pixels])
@@ -149,8 +153,8 @@ html_content = f"""<!DOCTYPE html>
 </head>
 <body>
   <div class="header">
-    <h1>U+9A30 騰 · K 至第 12 笔（馬·左竖）之前 Progressive 实测检验</h1>
-    <span class="badge">双尺度拓扑解耦验证 · 11 笔全部高保真拟合</span>
+    <h1>U+9A30 騰 · K 前 12 笔 Progressive 实测检验（含馬·左竖）</h1>
+    <span class="badge">双尺度拓扑解耦验证 · 12 笔全部高保真拟合</span>
   </div>
 
   <div class="container">
@@ -161,12 +165,12 @@ html_content = f"""<!DOCTYPE html>
         {stroke_svgs}
       </svg>
       <div style="margin-top: 12px; font-size: 12px; color: #64748b;">
-        灰色点：原始字源骨架像素 (1,714 点) | 彩色线段：新模型严格依笔顺递推构建出的前 11 笔真实主干
+        灰色点：原始字源骨架像素 (1,714 点) | 彩色线段：新模型严格依笔顺递推构建出的前 12 笔真实主干
       </div>
     </div>
 
     <div class="legend">
-      <h3 style="font-size: 16px; margin-bottom: 4px; color: #38bdf8;">自底向上前 11 笔拟合清单 (Strokes 01..11)</h3>
+      <h3 style="font-size: 16px; margin-bottom: 4px; color: #38bdf8;">自底向上前 12 笔拟合清单 (Strokes 01..12)</h3>
 """
 
 for s in strokes:
