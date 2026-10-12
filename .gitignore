@@ -38,3 +38,4 @@ package/hanzi-chai/src/data
 /artifacts/
 __pycache__/
 /test-results/
+.verysync/

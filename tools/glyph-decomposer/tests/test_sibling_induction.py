@@ -2,14 +2,16 @@ import numpy as np
 import pytest
 
 from glyph_decomposer.sibling_induction import (
+    AuditStatus,
     CandidateFitnessReport,
     DiagnosisCause,
+    HumanInterventionAction,
     diagnose_global_candidate_failure,
     induce_sibling_component_from_residual,
 )
 
 
-def test_diagnose_global_failure_identifies_missing_sibling():
+def test_diagnose_global_failure_identifies_missing_sibling_and_flags_audit():
     # Simulate a scenario where all candidates have low global coverage (<70%)
     # but components (0,) [月], (1,0) [龹] are cleanly closed, while (1,1) [馬] fails.
     reports = [
@@ -37,11 +39,17 @@ def test_diagnose_global_failure_identifies_missing_sibling():
         ),
     ]
 
-    cause, faulty_path, summary = diagnose_global_candidate_failure(reports)
+    result = diagnose_global_candidate_failure(reports)
 
-    assert cause == DiagnosisCause.ALLOMORPHIC_SIBLING_MISSING
-    assert faulty_path == (1, 1)
-    assert "coherent residual points" in summary
+    # 1. Verify cause is missing sibling
+    assert result.primary_cause == DiagnosisCause.ALLOMORPHIC_SIBLING_MISSING
+    assert result.faulty_component_path == (1, 1)
+    assert result.is_sibling_missing_prior is True
+
+    # 2. Verify mandatory human audit flagging and default pre-filled action
+    assert result.audit_status == AuditStatus.NEEDS_HUMAN_AUDIT
+    assert result.recommended_action == HumanInterventionAction.APPROVE_SIBLING_COMPONENT
+    assert "coherent residual points" in result.summary
 
 
 def test_diagnose_global_failure_identifies_ids_malformation_when_no_closure():
@@ -58,11 +66,14 @@ def test_diagnose_global_failure_identifies_ids_malformation_when_no_closure():
         )
     ]
 
-    cause, faulty_path, summary = diagnose_global_candidate_failure(reports)
+    result = diagnose_global_candidate_failure(reports)
 
-    assert cause == DiagnosisCause.IDS_HIERARCHY_MALFORMATION
-    assert faulty_path is None
-    assert "IDS tree hierarchy" in summary
+    assert result.primary_cause == DiagnosisCause.IDS_HIERARCHY_MALFORMATION
+    assert result.faulty_component_path is None
+    # Even in non-sibling failures, mandatory human review must be queued!
+    assert result.audit_status == AuditStatus.NEEDS_HUMAN_AUDIT
+    assert result.recommended_action == HumanInterventionAction.ADJUST_IDS_HIERARCHY
+    assert "Mandatory human review queued" in result.summary
 
 
 def test_induce_sibling_component_from_residual_computes_flat_base_variant():
@@ -85,7 +96,13 @@ def test_induce_sibling_component_from_residual_computes_flat_base_variant():
     assert proposal.residual_point_count == len(residual_pixels)
     assert proposal.expected_coverage_gain == pytest.approx(len(residual_pixels) / 1714.0)
     assert proposal.confidence > 0.90
+    assert proposal.audit_status == AuditStatus.NEEDS_HUMAN_AUDIT
+    assert proposal.recommended_action == HumanInterventionAction.APPROVE_SIBLING_COMPONENT
 
     packet = proposal.to_curation_packet()
     assert packet["proposalType"] == "PROPOSE_NEW_SIBLING_COMPONENT"
-    assert packet["mutationType"] == "FLAT_BASE_LIGATURE_VARIANT"
+    assert packet["auditStatus"] == "needs_human_audit"
+    assert packet["recommendedAction"] == "approve_sibling_component"
+    assert "availableHumanClassifications" in packet
+    assert "approve_sibling_component" in packet["availableHumanClassifications"]
+    assert "flag_skeleton_artifact" in packet["availableHumanClassifications"]
