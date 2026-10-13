@@ -1,0 +1,92 @@
+// ==============================================================================
+// VerySync (微力同步) 过滤规则 - hanzi-chai.github.io_fork 专项目录
+// 策略: 过滤巨大前端与Python依赖(~930MB)；放行并保护 .local 标注核心数据；保护 Git 锁
+// ==============================================================================
+
+// ------------------------------------------------------------------------------
+// 1. Git 多端并发安全保护（保留仓库与提交历史，排除锁与瞬态工作态）
+// ------------------------------------------------------------------------------
+**/.git/*.lock
+**/.git/index.lock
+**/.git/COMMIT_EDITMSG
+**/.git/TAG_EDITMSG
+**/.git/FETCH_HEAD
+**/.git/ORIG_HEAD
+**/.git/rebase-apply
+**/.git/rebase-merge
+.git/*.lock
+.git/index.lock
+.git/COMMIT_EDITMSG
+
+// ------------------------------------------------------------------------------
+// 2. Node.js / 前端依赖与构建产物 (过滤约 731 MB node_modules + 34 MB dist)
+// ------------------------------------------------------------------------------
+(?d)node_modules
+(?d)dist
+(?d)dist-ssr
+(?d).next
+(?d).turbo
+(?d).cache
+(?d).wrangler
+(?d)coverage
+(?d)test-results
+
+// ------------------------------------------------------------------------------
+// 3. Python 运行环境与解析器缓存 (tools/glyph-decomposer: 约 202 MB .venv)
+// ------------------------------------------------------------------------------
+(?d)__pycache__
+(?d)*.py[cod]
+(?d)*$py.class
+(?d).venv
+(?d)venv
+(?d).pytest_cache
+(?d).ruff_cache
+
+// ------------------------------------------------------------------------------
+// 4. 环境敏感配置与编辑器缓存 (防止本地环境变量被覆盖)
+// ------------------------------------------------------------------------------
+(?d).env
+(?d).dev.vars
+(?d).idea
+(?d).vscode/chrome
+(?d)*.swp
+(?d)*.swn
+(?d)*.swo
+(?d)*~
+(?d)*.tmp
+(?d)*.log
+(?d)npm-debug.log*
+(?d)yarn-debug.log*
+(?d)yarn-error.log*
+(?d)pnpm-debug.log*
+// ------------------------------------------------------------------------------
+// 通用编辑器单机状态与本地临时文件隔离（防止双端抢锁与窗口/光标覆盖）
+// ------------------------------------------------------------------------------
+// 1. Sublime Text (保留 .sublime-project，严防单机窗口/光标覆盖)
+(?d)*.sublime-workspace
+
+// 2. VS Code / Cursor / Zed / Helix / JetBrains / Visual Studio 单机缓存与本地状态
+(?d).vscode/chrome
+(?d).vscode/ipch
+(?d).vscode/.browse.*
+(?d).vscode/*.log
+(?d).cursor/cache
+(?d).cursor/state
+(?d).zed/settings.local.json
+(?d).helix/*.local.toml
+(?d).helix/*.log
+(?d).idea
+(?d)*.suo
+(?d)*.user
+(?d)*.userosv
+(?d)*.sln.docstates
+
+// 3. Vim / Neovim / 交换文件 / 临时文本 / Office 独占锁
+(?d)*.swp
+(?d)*.swn
+(?d)*.swo
+(?d)*~
+(?d).netrwhist
+(?d)~$*
+(?d)*.tmp
+(?d)*.bak
