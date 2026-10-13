@@ -2,6 +2,7 @@ import numpy as np
 
 from glyph_decomposer.primitive_fit import (
     compute_stroke_overlap_penalty,
+    fit_compound_turn_hook_polyline,
     fit_stroke_primitives,
 )
 
@@ -149,4 +150,63 @@ def test_collinear_segment_overlap_incurs_penalty():
     # Collinear shared segment: penalty must be strictly positive and proportional to length
     penalty = compute_stroke_overlap_penalty(base, shared)
     assert penalty > 20.0
+
+
+def test_compound_turn_hook_tall_moon():
+    # Tall/slim Moon (月) stroke 02 turn-hook (H/W > 5.0)
+    p0 = np.array([17.6, 15.0])
+    p1 = np.array([31.25, 14.8])
+    p2 = np.array([31.25, 85.65])
+    p3 = np.array([17.0, 82.4])
+
+    t1 = np.linspace(0, 1, 20)
+    seg1 = (1 - t1[:, None]) * p0 + t1[:, None] * p1
+    t2 = np.linspace(0, 1, 50)
+    seg2 = (1 - t2[:, None]) * p1 + t2[:, None] * p2
+    t3 = np.linspace(0, 1, 15)
+    seg3 = (1 - t3[:, None]) * p2 + t3[:, None] * p3
+    route = np.vstack((seg1, seg2[1:], seg3[1:]))
+
+    controls, rmse = fit_compound_turn_hook_polyline(route)
+
+    assert len(controls) == 4
+    # P0: lead start
+    assert np.allclose(controls[0], [17.6, 15.0], atol=0.1)
+    # P1: top-right corner
+    assert np.allclose(controls[1], [31.25, 14.8], atol=0.5)
+    # P2: deep plunge basin
+    assert np.allclose(controls[2], [31.25, 85.65], atol=0.1)
+    # P3: hook apex
+    assert np.allclose(controls[3], [17.0, 82.4], atol=0.1)
+    assert rmse < 0.2
+
+
+def test_compound_turn_hook_squat_horse():
+    # Squat/wide Horse (馬) bottom turn-hook (H/W < 0.5)
+    p0 = np.array([47.5, 69.5])
+    p1 = np.array([84.8, 69.5])
+    p2 = np.array([82.0, 86.7])
+    p3 = np.array([68.5, 84.4])
+
+    t1 = np.linspace(0, 1, 30)
+    seg1 = (1 - t1[:, None]) * p0 + t1[:, None] * p1
+    t2 = np.linspace(0, 1, 20)
+    seg2 = (1 - t2[:, None]) * p1 + t2[:, None] * p2
+    t3 = np.linspace(0, 1, 15)
+    seg3 = (1 - t3[:, None]) * p2 + t3[:, None] * p3
+    route = np.vstack((seg1, seg2[1:], seg3[1:]))
+
+    controls, rmse = fit_compound_turn_hook_polyline(route)
+
+    assert len(controls) == 4
+    # P0: horizontal lead-in from left vertical
+    assert np.allclose(controls[0], [47.5, 69.5], atol=0.1)
+    # P1: top-right corner
+    assert np.allclose(controls[1], [84.8, 69.5], atol=0.5)
+    # P2: deepest hook basin corner
+    assert np.allclose(controls[2], [82.0, 86.7], atol=0.1)
+    # P3: terminal hook apex pointing northwest
+    assert np.allclose(controls[3], [68.5, 84.4], atol=0.1)
+    assert rmse < 0.2
+
 

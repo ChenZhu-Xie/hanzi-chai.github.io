@@ -545,3 +545,63 @@ def compute_stroke_overlap_penalty(
                         total_collinear_overlap += float(cluster_length - discrete_crossing_span_max)
 
     return float(total_collinear_overlap)
+
+
+def fit_compound_turn_hook_polyline(
+    route_points,
+) -> tuple[tuple[Point, Point, Point, Point], float]:
+    """Universal Rule 9: Homologous Compound Turn-Hook 4-Point Polyline Law.
+
+    Fits a compound turn-hook stroke (横折钩 / 乛钩 / 乙类折笔) via 4 canonical topological anchors:
+      P0 (Lead-in start) -> P1 (Top-right corner) -> P2 (Deepest basin sinking point) -> P3 (Hook apex)
+
+    This applies homomorphically across varying aspect ratios:
+      - Tall/Slim turn-hooks (e.g., 月, 門, 同, 司, aspect ratio H/W > 2.0)
+      - Squat/Wide turn-hooks (e.g., 馬, 鳥, 烏, 包, aspect ratio H/W <= 0.6)
+
+    Guarantees:
+      1. P1 (Corner): Maximizes perpendicular chord deviation between P0 and P2, capturing
+         the sharp turn without rounding or early clipping.
+      2. P2 (Deep Plunge Basin): Plunges along the vertical/slanted rail to the absolute local
+         basin bottom (argmax y in SVG space), strictly preventing premature truncation at
+         internal stroke crossings or nominal box boundaries.
+      3. P3 (Hook Apex): Follows the terminal trajectory backwards/upwards along the hook
+         spine to the apex, strictly forbidding horizontal projection across non-skeleton void gaps.
+    """
+    route = np.asarray(route_points, dtype=float)
+    if len(route) < 4:
+        raise ValueError("route must contain at least 4 points for compound turn-hook fitting")
+
+    route_clean = _truncate_void_gaps(route)
+    p0 = route_clean[0]
+    p3 = route_clean[-1]
+
+    # P2: Deepest basin point (maximum y in screen/SVG coordinates)
+    i_p2 = int(np.argmax(route_clean[:, 1]))
+    p2 = route_clean[i_p2]
+
+    # P1: Corner between P0 and P2 (maximum perpendicular deviation from P0-P2 chord)
+    sub = route_clean[: i_p2 + 1]
+    chord_vec = p2 - p0
+    chord_len = float(np.linalg.norm(chord_vec))
+    if chord_len > 1e-6:
+        chord_u = chord_vec / chord_len
+        perp_dists = np.abs(
+            (sub[:, 0] - p0[0]) * chord_u[1] - (sub[:, 1] - p0[1]) * chord_u[0]
+        )
+        i_p1 = int(np.argmax(perp_dists))
+        p1 = sub[i_p1]
+    else:
+        p1 = sub[len(sub) // 2]
+
+    controls = (
+        (float(p0[0]), float(p0[1])),
+        (float(p1[0]), float(p1[1])),
+        (float(p2[0]), float(p2[1])),
+        (float(p3[0]), float(p3[1])),
+    )
+    polyline = np.asarray(controls, dtype=float)
+    distances = _distances_to_polyline(route_clean, polyline)
+    rmse = float(np.sqrt(np.mean(distances**2)))
+    return controls, rmse
+
